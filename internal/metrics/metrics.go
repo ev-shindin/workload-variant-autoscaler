@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	llmdOptv1alpha1 "github.com/llm-d-incubation/workload-variant-autoscaler/api/v1alpha1"
+	"github.com/llm-d-incubation/workload-variant-autoscaler/internal/constants"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -19,31 +20,31 @@ var (
 func InitMetrics(registry prometheus.Registerer) error {
 	replicaScalingTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
-			Name: "inferno_replica_scaling_total",
+			Name: constants.InfernoReplicaScalingTotal,
 			Help: "Total number of replica scaling operations",
 		},
-		[]string{"variant_name", "namespace", "direction", "reason"},
+		[]string{constants.LabelVariantName, constants.LabelNamespace, constants.LabelDirection, constants.LabelReason},
 	)
 	desiredReplicas = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Name: "inferno_desired_replicas",
+			Name: constants.InfernoDesiredReplicas,
 			Help: "Desired number of replicas for each variant",
 		},
-		[]string{"variant_name", "namespace", "accelerator_type"},
+		[]string{constants.LabelVariantName, constants.LabelNamespace, constants.LabelAcceleratorType},
 	)
 	currentReplicas = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Name: "inferno_current_replicas",
+			Name: constants.InfernoCurrentReplicas,
 			Help: "Current number of replicas for each variant",
 		},
-		[]string{"variant_name", "namespace", "accelerator_type"},
+		[]string{constants.LabelVariantName, constants.LabelNamespace, constants.LabelAcceleratorType},
 	)
 	desiredRatio = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Name: "inferno_desired_ratio",
+			Name: constants.InfernoDesiredRatio,
 			Help: "Ratio of the desired number of replicas and the current number of replicas for each variant",
 		},
-		[]string{"variant_name", "namespace", "accelerator_type"},
+		[]string{constants.LabelVariantName, constants.LabelNamespace, constants.LabelAcceleratorType},
 	)
 
 	// Register metrics with the registry
@@ -83,10 +84,10 @@ func NewMetricsEmitter() *MetricsEmitter {
 // EmitReplicaScalingMetrics emits metrics related to replica scaling
 func (m *MetricsEmitter) EmitReplicaScalingMetrics(ctx context.Context, va *llmdOptv1alpha1.VariantAutoscaling, direction, reason string) error {
 	labels := prometheus.Labels{
-		"variant_name": va.Name,
-		"namespace":    va.Namespace,
-		"direction":    direction,
-		"reason":       reason,
+		constants.LabelVariantName: va.Name,
+		constants.LabelNamespace:   va.Namespace,
+		constants.LabelDirection:   direction,
+		constants.LabelReason:      reason,
 	}
 
 	// These operations are local and should never fail, but we handle errors for debugging
@@ -101,9 +102,9 @@ func (m *MetricsEmitter) EmitReplicaScalingMetrics(ctx context.Context, va *llmd
 // EmitReplicaMetrics emits current and desired replica metrics
 func (m *MetricsEmitter) EmitReplicaMetrics(ctx context.Context, va *llmdOptv1alpha1.VariantAutoscaling, current, desired int32, acceleratorType string) error {
 	baseLabels := prometheus.Labels{
-		"variant_name":     va.Name,
-		"namespace":        va.Namespace,
-		"accelerator_type": acceleratorType,
+		constants.LabelVariantName:     va.Name,
+		constants.LabelNamespace:       va.Namespace,
+		constants.LabelAcceleratorType: acceleratorType,
 	}
 
 	// These operations are local and should never fail, but we handle errors for debugging
