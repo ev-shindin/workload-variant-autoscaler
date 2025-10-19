@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/llm-d-incubation/workload-variant-autoscaler/api/v1alpha1"
+	"github.com/llm-d-incubation/workload-variant-autoscaler/internal/constants"
 	gink "github.com/onsi/ginkgo/v2"
 	gom "github.com/onsi/gomega"
 	promAPI "github.com/prometheus/client_golang/api"
@@ -1086,19 +1087,19 @@ func GetInfernoReplicaMetrics(variantName, namespace, acceleratorType string) (c
 	labels := fmt.Sprintf(`variant_name="%s",exported_namespace="%s",accelerator_type="%s"`, variantName, namespace, acceleratorType)
 
 	// Query both metrics with retries
-	currentQuery := fmt.Sprintf(`inferno_current_replicas{%s}`, labels)
+	currentQuery := fmt.Sprintf(`%s{%s}`, constants.InfernoCurrentReplicas, labels)
 	currentReplicas, err = client.QueryWithRetry(ctx, currentQuery)
 	if err != nil {
 		return 0, 0, 0, fmt.Errorf("failed to query current replicas: %w", err)
 	}
 
-	desiredQuery := fmt.Sprintf(`inferno_desired_replicas{%s}`, labels)
+	desiredQuery := fmt.Sprintf(`%s{%s}`, constants.InfernoDesiredReplicas, labels)
 	desiredReplicas, err = client.QueryWithRetry(ctx, desiredQuery)
 	if err != nil {
 		return 0, 0, 0, fmt.Errorf("failed to query desired replicas: %w", err)
 	}
 
-	desiredRatioQuery := fmt.Sprintf(`inferno_desired_ratio{%s}`, labels)
+	desiredRatioQuery := fmt.Sprintf(`%s{%s}`, constants.InfernoDesiredRatio, labels)
 	desiredRatio, err = client.QueryWithRetry(ctx, desiredRatioQuery)
 	if err != nil {
 		return 0, 0, 0, fmt.Errorf("failed to query desired ratio: %w", err)

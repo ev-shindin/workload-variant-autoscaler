@@ -31,6 +31,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha1 "github.com/llm-d-incubation/workload-variant-autoscaler/api/v1alpha1"
+	"github.com/llm-d-incubation/workload-variant-autoscaler/internal/constants"
 )
 
 var _ = Describe("ShareGPT Scale-Up Test", Ordered, func() {
@@ -70,7 +71,7 @@ var _ = Describe("ShareGPT Scale-Up Test", Ordered, func() {
 		Expect(hpa.Spec.ScaleTargetRef.Name).To(Equal(deployment), "HPA should target the correct deployment")
 		Expect(hpa.Spec.Metrics).To(HaveLen(1), "HPA should have one metric")
 		Expect(hpa.Spec.Metrics[0].Type).To(Equal(autoscalingv2.ExternalMetricSourceType), "HPA should use external metrics")
-		Expect(hpa.Spec.Metrics[0].External.Metric.Name).To(Equal("inferno_desired_replicas"), "HPA should use inferno_desired_replicas metric")
+		Expect(hpa.Spec.Metrics[0].External.Metric.Name).To(Equal(constants.InfernoDesiredReplicas), "HPA should use inferno_desired_replicas metric")
 	})
 
 	It("should verify external metrics API is accessible", func() {
@@ -79,10 +80,10 @@ var _ = Describe("ShareGPT Scale-Up Test", Ordered, func() {
 			// Use raw API client to query external metrics
 			result, err := k8sClient.RESTClient().
 				Get().
-				AbsPath("/apis/external.metrics.k8s.io/v1beta1/namespaces/" + llmDNamespace + "/inferno_desired_replicas").
+				AbsPath("/apis/external.metrics.k8s.io/v1beta1/namespaces/" + llmDNamespace + "/" + constants.InfernoDesiredReplicas).
 				DoRaw(ctx)
 			g.Expect(err).NotTo(HaveOccurred(), "Should be able to query external metrics API")
-			g.Expect(string(result)).To(ContainSubstring("inferno_desired_replicas"), "Metric should be available")
+			g.Expect(string(result)).To(ContainSubstring(constants.InfernoDesiredReplicas), "Metric should be available")
 			g.Expect(string(result)).To(ContainSubstring(deployment), "Metric should be for the correct variant")
 		}, 2*time.Minute, 5*time.Second).Should(Succeed())
 	})
@@ -155,7 +156,7 @@ var _ = Describe("ShareGPT Scale-Up Test", Ordered, func() {
 
 			// The HPA should show a target value > 1 (indicating scale-up needed)
 			for _, metric := range hpa.Status.CurrentMetrics {
-				if metric.External != nil && metric.External.Metric.Name == "inferno_desired_replicas" {
+				if metric.External != nil && metric.External.Metric.Name == constants.InfernoDesiredReplicas {
 					currentValue := metric.External.Current.AverageValue
 					g.Expect(currentValue).NotTo(BeNil(), "Current metric value should not be nil")
 
