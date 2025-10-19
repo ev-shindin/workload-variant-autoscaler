@@ -2,8 +2,10 @@ package utils
 
 import (
 	"context"
+	"fmt"
 	"time"
 
+	"github.com/llm-d-incubation/workload-variant-autoscaler/internal/constants"
 	promv1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/prometheus/common/model"
 	corev1 "k8s.io/api/core/v1"
@@ -12,19 +14,40 @@ import (
 
 // The following utility functions are used to create Prometheus queries for testing
 func CreateArrivalQuery(modelID, namespace string) string {
-	return `sum(rate(vllm:request_success_total{model_name="` + modelID + `",namespace="` + namespace + `"}[1m])) * 60`
+	return fmt.Sprintf(`sum(rate(%s{%s="%s",%s="%s"}[1m])) * 60`,
+		constants.VLLMRequestSuccessTotal,
+		constants.LabelModelName, modelID,
+		constants.LabelNamespace, namespace)
 }
 
 func CreateTokenQuery(modelID, namespace string) string {
-	return `sum(rate(vllm:request_generation_tokens_sum{model_name="` + modelID + `",namespace="` + namespace + `"}[1m]))/sum(rate(vllm:request_generation_tokens_count{model_name="` + modelID + `",namespace="` + namespace + `"}[1m]))`
+	return fmt.Sprintf(`sum(rate(%s{%s="%s",%s="%s"}[1m]))/sum(rate(%s{%s="%s",%s="%s"}[1m]))`,
+		constants.VLLMRequestGenerationTokensSum,
+		constants.LabelModelName, modelID,
+		constants.LabelNamespace, namespace,
+		constants.VLLMRequestGenerationTokensCount,
+		constants.LabelModelName, modelID,
+		constants.LabelNamespace, namespace)
 }
 
 func CreateWaitQuery(modelID, namespace string) string {
-	return `sum(rate(vllm:request_queue_time_seconds_sum{model_name="` + modelID + `",namespace="` + namespace + `"}[1m]))/sum(rate(vllm:request_queue_time_seconds_count{model_name="` + modelID + `",namespace="` + namespace + `"}[1m]))`
+	return fmt.Sprintf(`sum(rate(%s{%s="%s",%s="%s"}[1m]))/sum(rate(%s{%s="%s",%s="%s"}[1m]))`,
+		constants.VLLMRequestQueueTimeSecondsSum,
+		constants.LabelModelName, modelID,
+		constants.LabelNamespace, namespace,
+		constants.VLLMRequestQueueTimeSecondsCount,
+		constants.LabelModelName, modelID,
+		constants.LabelNamespace, namespace)
 }
 
 func CreateITLQuery(modelID, namespace string) string {
-	return `sum(rate(vllm:time_per_output_token_seconds_sum{model_name="` + modelID + `",namespace="` + namespace + `"}[1m]))/sum(rate(vllm:time_per_output_token_seconds_count{model_name="` + modelID + `",namespace="` + namespace + `"}[1m]))`
+	return fmt.Sprintf(`sum(rate(%s{%s="%s",%s="%s"}[1m]))/sum(rate(%s{%s="%s",%s="%s"}[1m]))`,
+		constants.VLLMTimePerOutputTokenSecondsSum,
+		constants.LabelModelName, modelID,
+		constants.LabelNamespace, namespace,
+		constants.VLLMTimePerOutputTokenSecondsCount,
+		constants.LabelModelName, modelID,
+		constants.LabelNamespace, namespace)
 }
 
 // createAcceleratorUnitCostConfigMap creates the accelerator unitcost ConfigMap
