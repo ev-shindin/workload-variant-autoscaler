@@ -240,11 +240,13 @@ func (r *VariantAutoscalingReconciler) prepareVariantAutoscalings(
 		}
 		logger.Log.Info("Found SLO for model - ", "model: ", modelName, ", class: ", className, ", slo-tpot: ", entry.SLOTPOT, ", slo-ttft: ", entry.SLOTTFT)
 
-		for _, modelAcceleratorProfile := range va.Spec.ModelProfile.Accelerators {
-			if utils.AddModelAcceleratorProfileToSystemData(systemData, modelName, &modelAcceleratorProfile) != nil {
-				logger.Log.Error("variantAutoscaling bad model accelerator profile data, skipping optimization - ", "variantAutoscaling-name: ", va.Name)
-				continue
-			}
+		if err := utils.AddVariantProfileToSystemData(systemData,
+			modelName,
+			va.Spec.Accelerator,
+			va.Spec.AcceleratorCount,
+			&va.Spec.VariantProfile); err != nil {
+			logger.Log.Error(err, "failed to add variant profile to system data", "variantAutoscaling", va.Name)
+			continue
 		}
 
 		accName := va.Labels["inference.optimization/acceleratorName"]
@@ -272,6 +274,10 @@ func (r *VariantAutoscalingReconciler) prepareVariantAutoscalings(
 			logger.Log.Error(err, "unable to get variantAutoscaling for deployment - ", "deployment-name: ", deploy.Name, ", namespace: ", deploy.Namespace)
 			continue
 		}
+
+		// Validate and log the relationship between variant_name and variant_id
+		// This helps users understand the dual-identifier pattern used in Prometheus metrics
+		utils.ValidateVariantAutoscalingName(&updateVA)
 
 		// Set ownerReference early, before metrics validation, to ensure it's always set
 		// This ensures the VA will be garbage collected when the Deployment is deleted
@@ -314,13 +320,28 @@ func (r *VariantAutoscalingReconciler) prepareVariantAutoscalings(
 			continue
 		}
 
-		currentAllocation, err := collector.AddMetricsToOptStatus(ctx, &updateVA, deploy, acceleratorCostValFloat, r.PromAPI)
+		// Collect allocation info for this variant's deployment
+		variantID := updateVA.Spec.VariantID
+		accelerator := updateVA.Spec.Accelerator
+		allocation, err := collector.CollectAllocationForDeployment(variantID, accelerator, deploy, acceleratorCostValFloat)
 		if err != nil {
-			logger.Log.Error(err, "unable to fetch metrics, skipping this variantAutoscaling loop")
+			logger.Log.Error(err, "unable to collect allocation data, skipping this variantAutoscaling loop")
+			continue
+		}
+
+		// Collect aggregate metrics (shared across all variants of this model)
+		load, ttftAvg, itlAvg, err := collector.CollectAggregateMetrics(ctx, modelName, deploy.Namespace, r.PromAPI)
+		if err != nil {
+			logger.Log.Error(err, "unable to fetch aggregate metrics, skipping this variantAutoscaling loop")
 			// Don't update status here - will be updated in next reconcile when metrics are available
 			continue
 		}
-		updateVA.Status.CurrentAlloc = currentAllocation
+
+		// Update status with collected data
+		updateVA.Status.CurrentAllocs = []llmdVariantAutoscalingV1alpha1.Allocation{allocation}
+		updateVA.Status.Load = load
+		updateVA.Status.TTFTAverage = ttftAvg
+		updateVA.Status.ITLAverage = itlAvg
 
 		if err := utils.AddServerInfoToSystemData(systemData, &updateVA, className); err != nil {
 			logger.Log.Info("variantAutoscaling bad deployment server data, skipping optimization - ", "variantAutoscaling-name: ", updateVA.Name)
@@ -360,9 +381,16 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 		// Note: ownerReference is now set earlier in prepareVariantAutoscalings
 		// This ensures it's set even if metrics aren't available yet
 
-		updateVa.Status.CurrentAlloc = va.Status.CurrentAlloc
-		updateVa.Status.DesiredOptimizedAlloc = optimizedAllocation[va.Name]
+		updateVa.Status.CurrentAllocs = va.Status.CurrentAllocs
+		updateVa.Status.DesiredOptimizedAllocs = []llmdVariantAutoscalingV1alpha1.OptimizedAlloc{optimizedAllocation[va.Name]}
 		updateVa.Status.Actuation.Applied = false // No longer directly applying changes
+
+		// Populate PrimaryReplicas for safe kubectl output (prevents array index errors)
+		if len(updateVa.Status.CurrentAllocs) > 0 {
+			updateVa.Status.PrimaryReplicas = updateVa.Status.CurrentAllocs[0].NumReplicas
+		} else {
+			updateVa.Status.PrimaryReplicas = 0
+		}
 
 		// Copy existing conditions from updateList (includes MetricsAvailable condition set during preparation)
 		// This ensures we don't lose the MetricsAvailable condition when fetching fresh copy from API
@@ -370,13 +398,17 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 		updateVa.Status.Conditions = va.Status.Conditions
 
 		// Set OptimizationReady condition to True on successful optimization
+		var optimizedAlloc llmdVariantAutoscalingV1alpha1.OptimizedAlloc
+		if len(updateVa.Status.DesiredOptimizedAllocs) > 0 {
+			optimizedAlloc = updateVa.Status.DesiredOptimizedAllocs[0]
+		}
 		llmdVariantAutoscalingV1alpha1.SetCondition(&updateVa,
 			llmdVariantAutoscalingV1alpha1.TypeOptimizationReady,
 			metav1.ConditionTrue,
 			llmdVariantAutoscalingV1alpha1.ReasonOptimizationSucceeded,
 			fmt.Sprintf("Optimization completed: %d replicas on %s",
-				updateVa.Status.DesiredOptimizedAlloc.NumReplicas,
-				updateVa.Status.DesiredOptimizedAlloc.Accelerator))
+				optimizedAlloc.NumReplicas,
+				optimizedAlloc.Accelerator))
 
 		act := actuator.NewActuator(r.Client)
 

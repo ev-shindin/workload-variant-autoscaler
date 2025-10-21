@@ -11,13 +11,41 @@ type VariantAutoscalingSpec struct {
 	// +kubebuilder:validation:Required
 	ModelID string `json:"modelID"`
 
+	// VariantID uniquely identifies this variant (model + accelerator + acceleratorCount combination).
+	// This is a business identifier that may contain slashes, dots, and mixed case.
+	// Format: {modelID}-{accelerator}-{acceleratorCount}
+	// Example: "meta/llama-3.1-8b-A100-4"
+	//
+	// Note: VariantID (variant_id) is distinct from the VariantAutoscaling resource name (variant_name):
+	//   - variant_id (this field): Business identifier, may contain non-K8s-compliant characters
+	//   - variant_name (resource.Name): Kubernetes resource name (DNS-1123 compliant)
+	//
+	// Both identifiers are exposed as Prometheus labels for flexible querying:
+	//   - Use variant_name to query by Kubernetes resource (typically matches Deployment name)
+	//   - Use variant_id to query by business identifier (model/variant naming)
+	//
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Pattern=`^.+-[A-Za-z0-9]+-[1-9][0-9]*$`
+	VariantID string `json:"variantID"`
+
+	// Accelerator specifies the accelerator type for this variant (e.g., "A100", "L40S").
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:Required
+	Accelerator string `json:"accelerator"`
+
+	// AcceleratorCount specifies the number of accelerator units per replica.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Required
+	AcceleratorCount int `json:"acceleratorCount"`
+
 	// SLOClassRef references the ConfigMap key containing Service Level Objective (SLO) configuration.
 	// +kubebuilder:validation:Required
 	SLOClassRef ConfigMapKeyRef `json:"sloClassRef"`
 
-	// ModelProfile provides resource and performance characteristics for the model variant.
+	// VariantProfile provides performance characteristics for this variant.
 	// +kubebuilder:validation:Required
-	ModelProfile ModelProfile `json:"modelProfile"`
+	VariantProfile VariantProfile `json:"variantProfile"`
 }
 
 // ConfigMapKeyRef references a specific key within a ConfigMap.
@@ -31,51 +59,59 @@ type ConfigMapKeyRef struct {
 	Key string `json:"key"`
 }
 
-// ModelProfile provides resource and performance characteristics for the model variant.
-type ModelProfile struct {
-	// Accelerators is a list of accelerator profiles for the model variant.
-	// +kubebuilder:validation:MinItems=1
-	Accelerators []AcceleratorProfile `json:"accelerators"`
+// VariantProfile provides performance characteristics for a specific variant.
+type VariantProfile struct {
+	// PerfParms specifies the prefill and decode parameters for TTFT and ITL models.
+	// +kubebuilder:validation:Required
+	PerfParms PerfParms `json:"perfParms"`
+
+	// MaxBatchSize is the maximum batch size supported by this variant.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Required
+	MaxBatchSize int `json:"maxBatchSize"`
 }
 
+// PerfParms contains performance parameters for the variant.
 type PerfParms struct {
-	// DecodeParms contains parameters for the decode phase (ITL calculation)
+	// DecodeParms contains parameters for the decode phase (ITL calculation).
 	// Expected keys: "alpha", "beta" for equation: itl = alpha + beta * maxBatchSize
 	// +kubebuilder:validation:MinProperties=1
 	DecodeParms map[string]string `json:"decodeParms"`
-	// PrefillParms contains parameters for the prefill phase (TTFT calculation)
+
+	// PrefillParms contains parameters for the prefill phase (TTFT calculation).
 	// Expected keys: "gamma", "delta" for equation: ttft = gamma + delta * tokens * maxBatchSize
 	// +kubebuilder:validation:MinProperties=1
 	PrefillParms map[string]string `json:"prefillParms"`
 }
 
-// AcceleratorProfile defines the configuration for an accelerator used in autoscaling.
-// It specifies the type and count of accelerator, as well as parameters for scaling behavior.
-type AcceleratorProfile struct {
-	// Acc specifies the type or name of the accelerator (e.g., GPU type).
-	// +kubebuilder:validation:MinLength=1
-	Acc string `json:"acc"`
-
-	// AccCount specifies the number of accelerator units to be used.
-	// +kubebuilder:validation:Minimum=1
-	AccCount int `json:"accCount"`
-
-	// PerParms specifies the prefill and decode parameters for ttft and itl models
-	PerfParms PerfParms `json:"perfParms"`
-
-	// MaxBatchSize is the maximum batch size supported by the accelerator.
-	// +kubebuilder:validation:Minimum=1
-	MaxBatchSize int `json:"maxBatchSize"`
-}
-
 // VariantAutoscalingStatus represents the current status of autoscaling for a variant,
-// including the current allocation, desired optimized allocation, and actuation status.
+// including aggregate load metrics, current allocations per variant, desired optimized allocations, and actuation status.
 type VariantAutoscalingStatus struct {
-	// CurrentAlloc specifies the current resource allocation for the variant.
-	CurrentAlloc Allocation `json:"currentAlloc,omitempty"`
+	// Load describes the aggregate workload characteristics across all variants for this model.
+	// Metrics are collected and aggregated from Prometheus across all deployments serving this modelID.
+	Load LoadProfile `json:"load,omitempty"`
 
-	// DesiredOptimizedAlloc indicates the target optimized allocation based on autoscaling logic.
-	DesiredOptimizedAlloc OptimizedAlloc `json:"desiredOptimizedAlloc,omitempty"`
+	// ITLAverage is the average inter-token latency aggregated across all variants.
+	// +kubebuilder:validation:Pattern=`^\d+(\.\d+)?$`
+	ITLAverage string `json:"itlAverage,omitempty"`
+
+	// TTFTAverage is the average time to first token aggregated across all variants.
+	// +kubebuilder:validation:Pattern=`^\d+(\.\d+)?$`
+	TTFTAverage string `json:"ttftAverage,omitempty"`
+
+	// PrimaryReplicas is a convenience field tracking replicas for the primary allocation.
+	// This field enables safe kubectl output and prevents array index errors.
+	// It mirrors CurrentAllocs[0].NumReplicas when available.
+	// +optional
+	PrimaryReplicas int `json:"primaryReplicas,omitempty"`
+
+	// CurrentAllocs specifies the current resource allocations for each variant (one per accelerator type).
+	// +optional
+	CurrentAllocs []Allocation `json:"currentAllocs,omitempty"`
+
+	// DesiredOptimizedAllocs indicates the target optimized allocations based on autoscaling logic.
+	// +optional
+	DesiredOptimizedAllocs []OptimizedAlloc `json:"desiredOptimizedAllocs,omitempty"`
 
 	// Actuation provides details about the actuation process and its current status.
 	Actuation ActuationStatus `json:"actuation,omitempty"`
@@ -89,8 +125,15 @@ type VariantAutoscalingStatus struct {
 	Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type"`
 }
 
-// Allocation describes the current resource allocation for a model variant.
+// Allocation describes the current resource allocation for a specific model variant.
+// Each allocation represents a single deployment with a specific accelerator type.
+// Aggregate metrics (Load, ITL, TTFT) are stored in VariantAutoscalingStatus.
 type Allocation struct {
+	// VariantID identifies which variant this allocation belongs to.
+	// Format: {modelID}-{accelerator}-{acceleratorCount}
+	// +kubebuilder:validation:MinLength=1
+	VariantID string `json:"variantID"`
+
 	// Accelerator is the type of accelerator currently allocated.
 	// +kubebuilder:validation:MinLength=1
 	Accelerator string `json:"accelerator"`
@@ -103,20 +146,9 @@ type Allocation struct {
 	// +kubebuilder:validation:Minimum=0
 	MaxBatch int `json:"maxBatch"`
 
-	// VariantCost is the cost associated with the current variant allocation.
+	// VariantCost is the cost associated with this specific variant allocation.
 	// +kubebuilder:validation:Pattern=`^\d+(\.\d+)?$`
 	VariantCost string `json:"variantCost"`
-
-	// ITLAverage is the average inter token latency for the current allocation.
-	// +kubebuilder:validation:Pattern=`^\d+(\.\d+)?$`
-	ITLAverage string `json:"itlAverage"`
-
-	// TTFTAverage is the average time to first token for the current allocation
-	// +kubebuilder:validation:Pattern=`^\d+(\.\d+)?$`
-	TTFTAverage string `json:"ttftAverage"`
-
-	// Load describes the workload characteristics for the current allocation.
-	Load LoadProfile `json:"load"`
 }
 
 // LoadProfile represents the configuration for workload characteristics,
@@ -139,8 +171,13 @@ type OptimizedAlloc struct {
 	// LastRunTime is the timestamp of the last optimization run.
 	LastRunTime metav1.Time `json:"lastRunTime,omitempty"`
 
+	// VariantID identifies which variant this optimized allocation belongs to.
+	// Format: {modelID}-{accelerator}-{acceleratorCount}
+	// +kubebuilder:validation:MinLength=1
+	VariantID string `json:"variantID"`
+
 	// Accelerator is the type of accelerator for the optimized allocation.
-	// +kubebuilder:validation:MinLength=2
+	// +kubebuilder:validation:MinLength=1
 	Accelerator string `json:"accelerator"`
 
 	// NumReplicas is the number of replicas for the optimized allocation.
@@ -158,9 +195,10 @@ type ActuationStatus struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:shortName=va
 // +kubebuilder:printcolumn:name="Model",type=string,JSONPath=".spec.modelID"
-// +kubebuilder:printcolumn:name="Accelerator",type=string,JSONPath=".status.currentAlloc.accelerator"
-// +kubebuilder:printcolumn:name="CurrentReplicas",type=integer,JSONPath=".status.currentAlloc.numReplicas"
-// +kubebuilder:printcolumn:name="Optimized",type=string,JSONPath=".status.desiredOptimizedAlloc.numReplicas"
+// +kubebuilder:printcolumn:name="Variant",type=string,JSONPath=".spec.variantID"
+// +kubebuilder:printcolumn:name="Accelerator",type=string,JSONPath=".spec.accelerator"
+// +kubebuilder:printcolumn:name="Replicas",type=integer,JSONPath=".status.primaryReplicas"
+// +kubebuilder:printcolumn:name="ArrivalRate",type=string,JSONPath=".status.load.arrivalRate"
 // +kubebuilder:printcolumn:name="MetricsReady",type=string,JSONPath=".status.conditions[?(@.type=='MetricsAvailable')].status"
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=".metadata.creationTimestamp"
 

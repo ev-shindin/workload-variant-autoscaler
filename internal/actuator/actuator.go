@@ -49,32 +49,63 @@ func (a *Actuator) getCurrentDeploymentReplicas(ctx context.Context, va *llmdOpt
 
 func (a *Actuator) EmitMetrics(ctx context.Context, VariantAutoscaling *llmdOptv1alpha1.VariantAutoscaling) error {
 	// Emit replica metrics with real-time data for external autoscalers
-	if VariantAutoscaling.Status.DesiredOptimizedAlloc.NumReplicas >= 0 {
+	// Check if we have desired allocations
+	if len(VariantAutoscaling.Status.DesiredOptimizedAllocs) == 0 {
+		logger.Log.Info("Skipping EmitReplicaMetrics for variantAutoscaling - no desired allocations", "variantAutoscaling-name", VariantAutoscaling.Name)
+		return nil
+	}
+
+	// Emit metrics for all allocations with variantID labels
+	for _, desiredAlloc := range VariantAutoscaling.Status.DesiredOptimizedAllocs {
+		if desiredAlloc.NumReplicas < 0 {
+			logger.Log.Info("Skipping EmitReplicaMetrics for allocation - NumReplicas is negative",
+				"variant-name", VariantAutoscaling.Name,
+				"variant-id", desiredAlloc.VariantID,
+				"namespace", VariantAutoscaling.Namespace)
+			continue
+		}
 
 		// Get real current replicas from Deployment (not stale VariantAutoscaling status)
 		currentReplicas, err := a.getCurrentDeploymentReplicas(ctx, VariantAutoscaling)
 		if err != nil {
 			logger.Log.Warn("Could not get current deployment replicas, using VariantAutoscaling status",
-				"error", err, "variant", VariantAutoscaling.Name)
-			currentReplicas = int32(VariantAutoscaling.Status.CurrentAlloc.NumReplicas) // fallback
+				"error", err,
+				"variant-name", VariantAutoscaling.Name,
+				"variant-id", desiredAlloc.VariantID,
+				"namespace", VariantAutoscaling.Namespace)
+			// fallback to current allocation matching this variantID
+			currentReplicas = 0
+			for _, currentAlloc := range VariantAutoscaling.Status.CurrentAllocs {
+				if currentAlloc.VariantID == desiredAlloc.VariantID {
+					currentReplicas = int32(currentAlloc.NumReplicas)
+					break
+				}
+			}
 		}
 
 		if err := a.MetricsEmitter.EmitReplicaMetrics(
 			ctx,
 			VariantAutoscaling,
-			currentReplicas, // Real current from Deployment
-			int32(VariantAutoscaling.Status.DesiredOptimizedAlloc.NumReplicas), // Inferno's optimization target
-			VariantAutoscaling.Status.DesiredOptimizedAlloc.Accelerator,
+			currentReplicas,                 // Real current from Deployment
+			int32(desiredAlloc.NumReplicas), // Inferno's optimization target
+			desiredAlloc.Accelerator,
+			desiredAlloc.VariantID, // Include variantID as label
 		); err != nil {
-			logger.Log.Error(err, "Failed to emit optimization signals for variantAutoscaling - ",
-				"variantAutoscaling-name: ", VariantAutoscaling.Name)
+			logger.Log.Error(err, "Failed to emit optimization signals for allocation",
+				"variant-name", VariantAutoscaling.Name,
+				"variant-id", desiredAlloc.VariantID,
+				"namespace", VariantAutoscaling.Namespace)
 			// Don't fail the reconciliation for metric emission errors
 			// Metrics are critical for HPA, but emission failures shouldn't break core functionality
-			return nil
+			continue
 		}
-		logger.Log.Debug("EmitReplicaMetrics completed for ", "variantAutoscaling-name: ", VariantAutoscaling.Name, ", current-replicas: ", VariantAutoscaling.Status.CurrentAlloc.NumReplicas, ", desired-replicas: ", VariantAutoscaling.Status.DesiredOptimizedAlloc.NumReplicas, ", accelerator: ", VariantAutoscaling.Status.DesiredOptimizedAlloc.Accelerator)
-		return nil
+		logger.Log.Debug("EmitReplicaMetrics completed for allocation",
+			"variant-name", VariantAutoscaling.Name,
+			"variant-id", desiredAlloc.VariantID,
+			"namespace", VariantAutoscaling.Namespace,
+			"current-replicas", currentReplicas,
+			"desired-replicas", desiredAlloc.NumReplicas,
+			"accelerator", desiredAlloc.Accelerator)
 	}
-	logger.Log.Info("Skipping EmitReplicaMetrics for variantAutoscaling - ", "variantAutoscaling-name: ", VariantAutoscaling.Name, " - NumReplicas is 0")
 	return nil
 }
