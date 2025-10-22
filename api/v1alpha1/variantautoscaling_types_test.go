@@ -61,10 +61,10 @@ func makeValidVA() *VariantAutoscaling {
 			TTFTAverage: "3.2",
 			DesiredOptimizedAllocs: []OptimizedAlloc{
 				{
-					LastRunTime:      metav1.NewTime(time.Unix(1730000000, 0).UTC()),
-					VariantID:        "model-123-A100-1",
-					Accelerator:      "A100",
-					NumReplicas:      2,
+					LastRunTime: metav1.NewTime(time.Unix(1730000000, 0).UTC()),
+					VariantID:   "model-123-A100-1",
+					Accelerator: "A100",
+					NumReplicas: 2,
 				},
 			},
 			Actuation: ActuationStatus{

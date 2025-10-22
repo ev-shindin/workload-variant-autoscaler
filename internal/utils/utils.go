@@ -314,6 +314,7 @@ func AddServerInfoToSystemData(
 // Adapter from inferno alloc solution to optimized alloc
 func CreateOptimizedAlloc(name string,
 	namespace string,
+	variantID string,
 	allocationSolution *infernoConfig.AllocationSolution) (*llmdVariantAutoscalingV1alpha1.OptimizedAlloc, error) {
 
 	serverName := FullName(name, namespace)
@@ -322,9 +323,13 @@ func CreateOptimizedAlloc(name string,
 	if allocationData, exists = allocationSolution.Spec[serverName]; !exists {
 		return nil, fmt.Errorf("server %s not found", serverName)
 	}
-	logger.Log.Debug("Setting accelerator name ", "Name ", allocationData.Accelerator, "allocationData ", allocationData)
+	logger.Log.Debug("Creating optimized allocation",
+		"variant-id", variantID,
+		"accelerator", allocationData.Accelerator,
+		"num-replicas", allocationData.NumReplicas)
 	optimizedAlloc := &llmdVariantAutoscalingV1alpha1.OptimizedAlloc{
 		LastRunTime: metav1.NewTime(time.Now()),
+		VariantID:   variantID,
 		Accelerator: allocationData.Accelerator,
 		NumReplicas: allocationData.NumReplicas,
 	}

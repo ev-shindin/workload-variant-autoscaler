@@ -2,8 +2,10 @@ package utils
 
 import (
 	"testing"
+	"time"
 
 	llmdVariantAutoscalingV1alpha1 "github.com/llm-d-incubation/workload-variant-autoscaler/api/v1alpha1"
+	infernoConfig "github.com/llm-d-incubation/workload-variant-autoscaler/pkg/config"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -232,6 +234,144 @@ func TestRealWorldExamples(t *testing.T) {
 					}
 				}
 			}
+		})
+	}
+}
+
+// TestCreateOptimizedAlloc verifies that CreateOptimizedAlloc correctly sets VariantID
+// from the parameter, matching the production code path in the optimizer.
+func TestCreateOptimizedAlloc(t *testing.T) {
+	tests := []struct {
+		name          string
+		vaName        string
+		vaNamespace   string
+		variantID     string
+		accelerator   string
+		numReplicas   int
+		expectError   bool
+		errorContains string
+	}{
+		{
+			name:        "valid allocation with variantID",
+			vaName:      "vllm-deployment",
+			vaNamespace: "default",
+			variantID:   "meta/llama-3.1-8b-A100-1",
+			accelerator: "A100",
+			numReplicas: 3,
+			expectError: false,
+		},
+		{
+			name:        "variantID with slashes",
+			vaName:      "test-deployment",
+			vaNamespace: "test-ns",
+			variantID:   "org/team/model-A100-4",
+			accelerator: "A100",
+			numReplicas: 2,
+			expectError: false,
+		},
+		{
+			name:        "simple variantID",
+			vaName:      "simple-va",
+			vaNamespace: "default",
+			variantID:   "model-A100-1",
+			accelerator: "A100",
+			numReplicas: 1,
+			expectError: false,
+		},
+		{
+			name:          "server not found in solution",
+			vaName:        "nonexistent",
+			vaNamespace:   "default",
+			variantID:     "test-A100-1",
+			accelerator:   "A100",
+			numReplicas:   1,
+			expectError:   true,
+			errorContains: "server nonexistent:default not found",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create allocation solution with the test data
+			allocationSolution := &infernoConfig.AllocationSolution{
+				Spec: map[string]infernoConfig.AllocationData{},
+			}
+
+			// Only add server to solution if we don't expect error
+			if !tt.expectError {
+				serverName := FullName(tt.vaName, tt.vaNamespace)
+				allocationSolution.Spec[serverName] = infernoConfig.AllocationData{
+					Accelerator: tt.accelerator,
+					NumReplicas: tt.numReplicas,
+					MaxBatch:    32,
+					Cost:        40.0,
+					ITLAverage:  50.0,
+					TTFTAverage: 500.0,
+				}
+			}
+
+			// Call CreateOptimizedAlloc
+			result, err := CreateOptimizedAlloc(tt.vaName, tt.vaNamespace, tt.variantID, allocationSolution)
+
+			// Check error expectations
+			if tt.expectError {
+				if err == nil {
+					t.Errorf("Expected error containing %q, but got nil", tt.errorContains)
+					return
+				}
+				if tt.errorContains != "" {
+					// Simple substring check
+					found := false
+					for i := 0; i <= len(err.Error())-len(tt.errorContains); i++ {
+						if err.Error()[i:i+len(tt.errorContains)] == tt.errorContains {
+							found = true
+							break
+						}
+					}
+					if !found {
+						t.Errorf("Expected error containing %q, got %q", tt.errorContains, err.Error())
+					}
+				}
+				return
+			}
+
+			// No error expected - verify result
+			if err != nil {
+				t.Errorf("Unexpected error: %v", err)
+				return
+			}
+
+			if result == nil {
+				t.Error("Result should not be nil")
+				return
+			}
+
+			// Verify VariantID is set correctly (this is the critical fix being tested)
+			if result.VariantID != tt.variantID {
+				t.Errorf("VariantID mismatch: got %q, expected %q", result.VariantID, tt.variantID)
+			}
+
+			// Verify other fields
+			if result.Accelerator != tt.accelerator {
+				t.Errorf("Accelerator mismatch: got %q, expected %q", result.Accelerator, tt.accelerator)
+			}
+
+			if result.NumReplicas != tt.numReplicas {
+				t.Errorf("NumReplicas mismatch: got %d, expected %d", result.NumReplicas, tt.numReplicas)
+			}
+
+			// Verify LastRunTime is set (should be recent)
+			if result.LastRunTime.Time.IsZero() {
+				t.Error("LastRunTime should be set")
+			}
+
+			timeSinceCreation := time.Since(result.LastRunTime.Time)
+			if timeSinceCreation > 5*time.Second {
+				t.Errorf("LastRunTime seems too old: %v ago", timeSinceCreation)
+			}
+
+			t.Logf("Success: Created OptimizedAlloc with variant_id=%q, accelerator=%q, replicas=%d",
+				result.VariantID, result.Accelerator, result.NumReplicas)
 		})
 	}
 }
