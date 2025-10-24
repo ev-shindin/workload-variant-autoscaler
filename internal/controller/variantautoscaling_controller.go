@@ -175,7 +175,14 @@ func (r *VariantAutoscalingReconciler) Reconcile(ctx context.Context, req ctrl.R
 
 	modelAnalyzer := analyzer.NewModelAnalyzer(system)
 	for _, s := range system.Servers() {
-		modelAnalyzeResponse := modelAnalyzer.AnalyzeModel(ctx, *vaMap[s.Name()])
+		// Safely get VA from map with nil check
+		va, ok := vaMap[s.Name()]
+		if !ok || va == nil {
+			logger.Log.Error(nil, "VA not found in map for server", "serverName", s.Name())
+			continue
+		}
+
+		modelAnalyzeResponse := modelAnalyzer.AnalyzeModel(ctx, *va)
 		if len(modelAnalyzeResponse.Allocations) == 0 {
 			logger.Log.Info("No potential allocations found for server - ", "serverName: ", s.Name())
 			continue
@@ -228,7 +235,7 @@ func (r *VariantAutoscalingReconciler) Reconcile(ctx context.Context, req ctrl.R
 		logger.Log.Debug("Optimized allocation entry - ", "key: ", key, ", value: ", value)
 	}
 
-	if err := r.applyOptimizedAllocations(ctx, updateList, optimizedAllocation); err != nil {
+	if err := r.applyOptimizedAllocations(ctx, updateList, optimizedAllocation, allAnalyzerResponses); err != nil {
 		// If we fail to apply optimized allocations, we log the error
 		// In next reconcile, the controller will retry.
 		logger.Log.Error(err, "failed to apply optimized allocations")
@@ -394,8 +401,12 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 	ctx context.Context,
 	updateList *llmdVariantAutoscalingV1alpha1.VariantAutoscalingList,
 	optimizedAllocation map[string]llmdVariantAutoscalingV1alpha1.OptimizedAlloc,
+	allAnalyzerResponses map[string]*interfaces.ModelAnalyzeResponse,
 ) error {
 	logger.Log.Debug("Optimization metrics emitted, starting to process variants - ", "variant_count: ", len(updateList.Items))
+
+	// Create metrics emitter for prediction metrics
+	metricsEmitter := metrics.NewMetricsEmitter()
 
 	for i := range updateList.Items {
 		va := &updateList.Items[i]
@@ -405,6 +416,43 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 			logger.Log.Debug("No optimized allocation found for variant - ", "variantAutoscaling-name: ", va.Name)
 			continue
 		}
+
+		// Emit prediction metrics for the SELECTED allocation only
+		// This is done AFTER optimization selects which accelerator to use
+		if analyzerResponse, found := allAnalyzerResponses[va.Name]; found && analyzerResponse != nil {
+			// Get the selected accelerator from the variant spec
+			selectedAccelerator := va.Spec.Accelerator
+
+			// Get the allocation data for the selected accelerator only
+			if acceleratorAlloc, acceleratorFound := analyzerResponse.Allocations[selectedAccelerator]; acceleratorFound {
+				if acceleratorAlloc != nil && acceleratorAlloc.Allocation != nil {
+					allocData := acceleratorAlloc.Allocation.AllocationData()
+
+					// Convert from milliseconds to seconds
+					ttftSeconds := float64(allocData.TTFTAverage) / 1000.0
+					itlSeconds := float64(allocData.ITLAverage) / 1000.0
+
+					// Emit metrics with correct VariantID (business ID, not Kubernetes UID)
+					if err := metricsEmitter.EmitPredictionMetrics(ctx, va, va.Spec.ModelID, ttftSeconds, itlSeconds, selectedAccelerator); err != nil {
+						logger.Log.Error(err, "Failed to emit prediction metrics",
+							"variantName", va.Name,
+							"modelID", va.Spec.ModelID,
+							"accelerator", selectedAccelerator)
+					} else {
+						logger.Log.Debug("Successfully emitted prediction metrics",
+							"variantName", va.Name,
+							"accelerator", selectedAccelerator,
+							"ttft_seconds", ttftSeconds,
+							"itl_seconds", itlSeconds)
+					}
+				}
+			} else {
+				logger.Log.Debug("No allocation found for selected accelerator",
+					"variantName", va.Name,
+					"accelerator", selectedAccelerator)
+			}
+		}
+
 		// Fetch the latest version from API server
 		var updateVa llmdVariantAutoscalingV1alpha1.VariantAutoscaling
 		if err := utils.GetVariantAutoscalingWithBackoff(ctx, r.Client, va.Name, va.Namespace, &updateVa); err != nil {

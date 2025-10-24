@@ -19,7 +19,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -326,8 +325,8 @@ var _ = Describe("Optimizer", Ordered, func() {
 
 			By("Performing optimization")
 			scaleToZeroConfigData := make(utils.ScaleToZeroConfigData)
-		scaleToZeroCache := collector.NewScaleToZeroMetricsCache()
-		optimizedAllocs, err := engine.Optimize(ctx, updateList, allAnalyzerResponses, &scaleToZeroConfigData, scaleToZeroCache)
+			scaleToZeroCache := collector.NewScaleToZeroMetricsCache()
+			optimizedAllocs, err := engine.Optimize(ctx, updateList, allAnalyzerResponses, &scaleToZeroConfigData, scaleToZeroCache)
 			Expect(err).NotTo(HaveOccurred(), "unable to perform model optimization")
 			Expect(len(optimizedAllocs)).To(Equal(len(updateList.Items)), "Expected optimized allocations for all VariantAutoscalings")
 			for key, value := range optimizedAllocs {
@@ -449,8 +448,8 @@ var _ = Describe("Optimizer", Ordered, func() {
 
 			By("Performing optimization")
 			scaleToZeroConfigData := make(utils.ScaleToZeroConfigData)
-		scaleToZeroCache := collector.NewScaleToZeroMetricsCache()
-		optimizedAllocs, err := engine.Optimize(ctx, updateList, allAnalyzerResponses, &scaleToZeroConfigData, scaleToZeroCache)
+			scaleToZeroCache := collector.NewScaleToZeroMetricsCache()
+			optimizedAllocs, err := engine.Optimize(ctx, updateList, allAnalyzerResponses, &scaleToZeroConfigData, scaleToZeroCache)
 			Expect(err).NotTo(HaveOccurred(), "unable to perform model optimization")
 			Expect(len(optimizedAllocs)).To(Equal(len(updateList.Items)), "Expected optimized allocations for all VariantAutoscalings")
 			for key, value := range optimizedAllocs {
