@@ -61,6 +61,14 @@ const (
 	// InfernoDesiredRatio is a gauge that tracks the ratio of desired to current replicas.
 	// Labels: variant_name, namespace, accelerator_type
 	InfernoDesiredRatio = "inferno_desired_ratio"
+
+	// InfernoPredictedTTFT is a gauge that tracks the predicted Time To First Token from ModelAnalyzer.
+	// Labels: model_name, variant_name, variant_id, namespace, accelerator_type
+	InfernoPredictedTTFT = "inferno_predicted_ttft_seconds"
+
+	// InfernoPredictedITL is a gauge that tracks the predicted Inter-Token Latency from ModelAnalyzer.
+	// Labels: model_name, variant_name, variant_id, namespace, accelerator_type
+	InfernoPredictedITL = "inferno_predicted_itl_seconds"
 )
 
 // Metric Label Names
