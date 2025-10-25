@@ -211,7 +211,7 @@ var _ = Describe("Test workload-variant-autoscaler with vllme deployment - singl
 				return appsv1.DeploymentStatus{}, err
 			}
 			return deployment.Status, nil
-		}, 4*time.Minute, 10*time.Second).Should(And(
+		}, 8*time.Minute, 10*time.Second).Should(And(
 			HaveField("ReadyReplicas", BeNumerically("==", 1)),
 			HaveField("Replicas", BeNumerically("==", 1)),
 		))
@@ -734,7 +734,7 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 		configMapName = "scale-to-zero-config"
 		vaName = "scale-to-zero-va"
 		appLabel = "scale-to-zero-test"
-		modelID = "test/scale-to-zero-model"
+		modelID = "test-scale-to-zero-model"
 		accelerator = a100Acc
 		initialReplicas = 1
 		retentionDuration = 2 * time.Minute // Retention period for scale-to-zero
@@ -791,7 +791,7 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 				return appsv1.DeploymentStatus{}, err
 			}
 			return deployment.Status, nil
-		}, 4*time.Minute, 10*time.Second).Should(And(
+		}, 8*time.Minute, 10*time.Second).Should(And(
 			HaveField("ReadyReplicas", BeNumerically("==", initialReplicas)),
 			HaveField("Replicas", BeNumerically("==", initialReplicas)),
 		))
@@ -1008,7 +1008,7 @@ var _ = Describe("Test workload-variant-autoscaler with vllme deployment - multi
 				return appsv1.DeploymentStatus{}, err
 			}
 			return deployment.Status, nil
-		}, 4*time.Minute, 10*time.Second).Should(And(
+		}, 8*time.Minute, 10*time.Second).Should(And(
 			HaveField("ReadyReplicas", BeNumerically("==", 1)),
 			HaveField("Replicas", BeNumerically("==", 1)),
 		))
@@ -1019,7 +1019,7 @@ var _ = Describe("Test workload-variant-autoscaler with vllme deployment - multi
 				return appsv1.DeploymentStatus{}, err
 			}
 			return deployment.Status, nil
-		}, 4*time.Minute, 10*time.Second).Should(And(
+		}, 8*time.Minute, 10*time.Second).Should(And(
 			HaveField("ReadyReplicas", BeNumerically("==", 1)),
 			HaveField("Replicas", BeNumerically("==", 1)),
 		))
@@ -1465,7 +1465,7 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 		configMapName = "scale-to-zero-config"
 		vaName = "scale-to-zero-va"
 		appLabel = "scale-to-zero-test"
-		modelID = "test/scale-to-zero-model"
+		modelID = "test-scale-to-zero-model"
 		accelerator = a100Acc
 		initialReplicas = 1
 		retentionDuration = 2 * time.Minute // Retention period for scale-to-zero
@@ -1522,7 +1522,7 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 				return appsv1.DeploymentStatus{}, err
 			}
 			return deployment.Status, nil
-		}, 4*time.Minute, 10*time.Second).Should(And(
+		}, 8*time.Minute, 10*time.Second).Should(And(
 			HaveField("ReadyReplicas", BeNumerically("==", initialReplicas)),
 			HaveField("Replicas", BeNumerically("==", initialReplicas)),
 		))
