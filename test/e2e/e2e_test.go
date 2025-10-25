@@ -781,6 +781,84 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 		err = crClient.Create(ctx, variantAutoscaling)
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to create VariantAutoscaling: %s", vaName))
 
+		By("verifying KEDA is installed")
+		Eventually(func(g Gomega) {
+			podList, err := k8sClient.CoreV1().Pods("keda-system").List(ctx, metav1.ListOptions{
+				LabelSelector: "app.kubernetes.io/name=keda-operator",
+			})
+			g.Expect(err).NotTo(HaveOccurred(), "Should be able to list KEDA pods")
+			g.Expect(podList.Items).NotTo(BeEmpty(), "KEDA operator should be running")
+			for _, pod := range podList.Items {
+				g.Expect(pod.Status.Phase).To(Equal(corev1.PodRunning), fmt.Sprintf("KEDA pod %s should be running", pod.Name))
+			}
+		}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("creating KEDA ScaledObject for deployment")
+		scaledObject := &unstructured.Unstructured{}
+		scaledObject.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "keda.sh",
+			Version: "v1alpha1",
+			Kind:    "ScaledObject",
+		})
+		scaledObject.SetName(deployName + "-scaler")
+		scaledObject.SetNamespace(namespace)
+		scaledObject.Object["spec"] = map[string]interface{}{
+			"scaleTargetRef": map[string]interface{}{
+				"apiVersion": "apps/v1",
+				"kind":       "Deployment",
+				"name":       deployName,
+			},
+			"pollingInterval": int64(5),
+			"cooldownPeriod":  int64(30),
+			"maxReplicaCount": int64(10),
+			"triggers": []interface{}{
+				map[string]interface{}{
+					"type": "prometheus",
+					"metadata": map[string]interface{}{
+						"serverAddress":       "https://kube-prometheus-stack-prometheus.workload-variant-autoscaler-monitoring.svc.cluster.local:9090",
+						"query":               fmt.Sprintf("inferno_desired_replicas{variant_name=\"%s\",namespace=\"%s\"}", vaName, namespace),
+						"threshold":           "1",
+						"activationThreshold": "0",
+						"metricType":          "AverageValue",
+						"unsafeSsl":           "true",
+					},
+				},
+			},
+		}
+		err = crClient.Create(ctx, scaledObject)
+		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to create ScaledObject: %s", deployName+"-scaler"))
+
+		By("waiting for KEDA ScaledObject to be ready")
+		Eventually(func(g Gomega) {
+			so := &unstructured.Unstructured{}
+			so.SetGroupVersionKind(schema.GroupVersionKind{
+				Group:   "keda.sh",
+				Version: "v1alpha1",
+				Kind:    "ScaledObject",
+			})
+			err := crClient.Get(ctx, client.ObjectKey{Name: deployName + "-scaler", Namespace: namespace}, so)
+			g.Expect(err).NotTo(HaveOccurred(), "Should be able to get ScaledObject")
+
+			// Check if ScaledObject has conditions and is ready
+			conditions, found, err := unstructured.NestedSlice(so.Object, "status", "conditions")
+			if err == nil && found {
+				for _, condition := range conditions {
+					condMap, ok := condition.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					condType, _, _ := unstructured.NestedString(condMap, "type")
+					condStatus, _, _ := unstructured.NestedString(condMap, "status")
+					if condType == "Ready" && condStatus == "True" {
+						_, _ = fmt.Fprintf(GinkgoWriter, "✓ KEDA ScaledObject is ready\n")
+						return
+					}
+				}
+			}
+			_, _ = fmt.Fprintf(GinkgoWriter, "Waiting for KEDA ScaledObject to be ready...\n")
+			g.Expect(found).To(BeTrue(), "ScaledObject should have conditions")
+		}, 3*time.Minute, 5*time.Second).Should(Succeed())
+
 		logf.SetLogger(zap.New(zap.WriteTo(GinkgoWriter), zap.UseDevMode(true)))
 	})
 
@@ -829,19 +907,19 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 				"Controller should set desiredReplicas to 0 after idle period")
 		}, 3*time.Minute, 10*time.Second).Should(Succeed())
 
-		By("verifying HPA scales deployment to 0 replicas")
+		By("verifying KEDA scales deployment to 0 replicas")
 		Eventually(func(g Gomega) {
 			deployment, err := k8sClient.AppsV1().Deployments(namespace).Get(ctx, deployName, metav1.GetOptions{})
 			g.Expect(err).NotTo(HaveOccurred(), "Should be able to get Deployment")
 
 			if deployment.Status.Replicas == 0 {
-				_, _ = fmt.Fprintf(GinkgoWriter, "✓ HPA successfully scaled deployment to 0 replicas\n")
+				_, _ = fmt.Fprintf(GinkgoWriter, "✓ KEDA successfully scaled deployment to 0 replicas\n")
 			} else {
 				_, _ = fmt.Fprintf(GinkgoWriter, "Current replicas: %d (expected 0)\n", deployment.Status.Replicas)
 			}
 
 			g.Expect(deployment.Status.Replicas).To(Equal(int32(0)),
-				"HPA should scale deployment to 0 replicas")
+				"KEDA should scale deployment to 0 replicas")
 			g.Expect(deployment.Status.ReadyReplicas).To(Equal(int32(0)),
 				"Deployment should have 0 ready replicas")
 		}, 5*time.Minute, 15*time.Second).Should(Succeed())
@@ -859,6 +937,19 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 	})
 
 	AfterAll(func() {
+		By("cleaning up KEDA ScaledObject")
+		scaledObject := &unstructured.Unstructured{}
+		scaledObject.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "keda.sh",
+			Version: "v1alpha1",
+			Kind:    "ScaledObject",
+		})
+		scaledObject.SetName(deployName + "-scaler")
+		scaledObject.SetNamespace(namespace)
+		err := crClient.Delete(ctx, scaledObject)
+		err = client.IgnoreNotFound(err)
+		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to delete ScaledObject: %s", deployName+"-scaler"))
+
 		By("cleaning up VariantAutoscaling resource")
 		variantAutoscaling := &v1alpha1.VariantAutoscaling{
 			ObjectMeta: metav1.ObjectMeta{
@@ -866,7 +957,7 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 				Namespace: namespace,
 			},
 		}
-		err := crClient.Delete(ctx, variantAutoscaling)
+		err = crClient.Delete(ctx, variantAutoscaling)
 		err = client.IgnoreNotFound(err)
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to delete VariantAutoscaling: %s", vaName))
 
@@ -1512,6 +1603,84 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 		err = crClient.Create(ctx, variantAutoscaling)
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to create VariantAutoscaling: %s", vaName))
 
+		By("verifying KEDA is installed")
+		Eventually(func(g Gomega) {
+			podList, err := k8sClient.CoreV1().Pods("keda-system").List(ctx, metav1.ListOptions{
+				LabelSelector: "app.kubernetes.io/name=keda-operator",
+			})
+			g.Expect(err).NotTo(HaveOccurred(), "Should be able to list KEDA pods")
+			g.Expect(podList.Items).NotTo(BeEmpty(), "KEDA operator should be running")
+			for _, pod := range podList.Items {
+				g.Expect(pod.Status.Phase).To(Equal(corev1.PodRunning), fmt.Sprintf("KEDA pod %s should be running", pod.Name))
+			}
+		}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("creating KEDA ScaledObject for deployment")
+		scaledObject := &unstructured.Unstructured{}
+		scaledObject.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "keda.sh",
+			Version: "v1alpha1",
+			Kind:    "ScaledObject",
+		})
+		scaledObject.SetName(deployName + "-scaler")
+		scaledObject.SetNamespace(namespace)
+		scaledObject.Object["spec"] = map[string]interface{}{
+			"scaleTargetRef": map[string]interface{}{
+				"apiVersion": "apps/v1",
+				"kind":       "Deployment",
+				"name":       deployName,
+			},
+			"pollingInterval": int64(5),
+			"cooldownPeriod":  int64(30),
+			"maxReplicaCount": int64(10),
+			"triggers": []interface{}{
+				map[string]interface{}{
+					"type": "prometheus",
+					"metadata": map[string]interface{}{
+						"serverAddress":       "https://kube-prometheus-stack-prometheus.workload-variant-autoscaler-monitoring.svc.cluster.local:9090",
+						"query":               fmt.Sprintf("inferno_desired_replicas{variant_name=\"%s\",namespace=\"%s\"}", vaName, namespace),
+						"threshold":           "1",
+						"activationThreshold": "0",
+						"metricType":          "AverageValue",
+						"unsafeSsl":           "true",
+					},
+				},
+			},
+		}
+		err = crClient.Create(ctx, scaledObject)
+		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to create ScaledObject: %s", deployName+"-scaler"))
+
+		By("waiting for KEDA ScaledObject to be ready")
+		Eventually(func(g Gomega) {
+			so := &unstructured.Unstructured{}
+			so.SetGroupVersionKind(schema.GroupVersionKind{
+				Group:   "keda.sh",
+				Version: "v1alpha1",
+				Kind:    "ScaledObject",
+			})
+			err := crClient.Get(ctx, client.ObjectKey{Name: deployName + "-scaler", Namespace: namespace}, so)
+			g.Expect(err).NotTo(HaveOccurred(), "Should be able to get ScaledObject")
+
+			// Check if ScaledObject has conditions and is ready
+			conditions, found, err := unstructured.NestedSlice(so.Object, "status", "conditions")
+			if err == nil && found {
+				for _, condition := range conditions {
+					condMap, ok := condition.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					condType, _, _ := unstructured.NestedString(condMap, "type")
+					condStatus, _, _ := unstructured.NestedString(condMap, "status")
+					if condType == "Ready" && condStatus == "True" {
+						_, _ = fmt.Fprintf(GinkgoWriter, "✓ KEDA ScaledObject is ready\n")
+						return
+					}
+				}
+			}
+			_, _ = fmt.Fprintf(GinkgoWriter, "Waiting for KEDA ScaledObject to be ready...\n")
+			g.Expect(found).To(BeTrue(), "ScaledObject should have conditions")
+		}, 3*time.Minute, 5*time.Second).Should(Succeed())
+
 		logf.SetLogger(zap.New(zap.WriteTo(GinkgoWriter), zap.UseDevMode(true)))
 	})
 
@@ -1560,19 +1729,19 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 				"Controller should set desiredReplicas to 0 after idle period")
 		}, 3*time.Minute, 10*time.Second).Should(Succeed())
 
-		By("verifying HPA scales deployment to 0 replicas")
+		By("verifying KEDA scales deployment to 0 replicas")
 		Eventually(func(g Gomega) {
 			deployment, err := k8sClient.AppsV1().Deployments(namespace).Get(ctx, deployName, metav1.GetOptions{})
 			g.Expect(err).NotTo(HaveOccurred(), "Should be able to get Deployment")
 
 			if deployment.Status.Replicas == 0 {
-				_, _ = fmt.Fprintf(GinkgoWriter, "✓ HPA successfully scaled deployment to 0 replicas\n")
+				_, _ = fmt.Fprintf(GinkgoWriter, "✓ KEDA successfully scaled deployment to 0 replicas\n")
 			} else {
 				_, _ = fmt.Fprintf(GinkgoWriter, "Current replicas: %d (expected 0)\n", deployment.Status.Replicas)
 			}
 
 			g.Expect(deployment.Status.Replicas).To(Equal(int32(0)),
-				"HPA should scale deployment to 0 replicas")
+				"KEDA should scale deployment to 0 replicas")
 			g.Expect(deployment.Status.ReadyReplicas).To(Equal(int32(0)),
 				"Deployment should have 0 ready replicas")
 		}, 5*time.Minute, 15*time.Second).Should(Succeed())
@@ -1590,6 +1759,19 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 	})
 
 	AfterAll(func() {
+		By("cleaning up KEDA ScaledObject")
+		scaledObject := &unstructured.Unstructured{}
+		scaledObject.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "keda.sh",
+			Version: "v1alpha1",
+			Kind:    "ScaledObject",
+		})
+		scaledObject.SetName(deployName + "-scaler")
+		scaledObject.SetNamespace(namespace)
+		err := crClient.Delete(ctx, scaledObject)
+		err = client.IgnoreNotFound(err)
+		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to delete ScaledObject: %s", deployName+"-scaler"))
+
 		By("cleaning up VariantAutoscaling resource")
 		variantAutoscaling := &v1alpha1.VariantAutoscaling{
 			ObjectMeta: metav1.ObjectMeta{
@@ -1597,7 +1779,7 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 				Namespace: namespace,
 			},
 		}
-		err := crClient.Delete(ctx, variantAutoscaling)
+		err = crClient.Delete(ctx, variantAutoscaling)
 		err = client.IgnoreNotFound(err)
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to delete VariantAutoscaling: %s", vaName))
 

@@ -57,6 +57,10 @@ const (
 
 	certmanagerVersion = "v1.16.3"
 	certmanagerURLTmpl = "https://github.com/cert-manager/cert-manager/releases/download/%s/cert-manager.yaml"
+
+	kedaVersion   = "2.16.1"
+	kedaHelmRepo  = "https://kedacore.github.io/charts"
+	kedaNamespace = "keda-system"
 )
 
 func warnError(err error) {
@@ -276,6 +280,70 @@ func IsCertManagerCRDsInstalled() bool {
 	}
 
 	return false
+}
+
+// InstallKEDA installs KEDA using Helm
+func InstallKEDA() error {
+	// Add Helm repo
+	cmd := exec.Command("helm", "repo", "add", "kedacore", kedaHelmRepo)
+	if _, err := Run(cmd); err != nil {
+		return fmt.Errorf("failed to add KEDA Helm repo: %w", err)
+	}
+
+	// Update Helm repos
+	cmd = exec.Command("helm", "repo", "update")
+	if _, err := Run(cmd); err != nil {
+		return fmt.Errorf("failed to update Helm repos: %w", err)
+	}
+
+	// Install KEDA
+	cmd = exec.Command("helm", "install", "keda", "kedacore/keda",
+		"--version", kedaVersion,
+		"--namespace", kedaNamespace,
+		"--create-namespace",
+		"--wait",
+		"--timeout", "5m",
+	)
+	if _, err := Run(cmd); err != nil {
+		return fmt.Errorf("failed to install KEDA: %w", err)
+	}
+
+	// Wait for KEDA operator to be ready
+	cmd = exec.Command("kubectl", "wait", "deployment/keda-operator",
+		"--for", "condition=Available",
+		"--namespace", kedaNamespace,
+		"--timeout", "5m",
+	)
+	if _, err := Run(cmd); err != nil {
+		return fmt.Errorf("KEDA operator did not become ready: %w", err)
+	}
+
+	return nil
+}
+
+// UninstallKEDA uninstalls KEDA
+func UninstallKEDA() {
+	cmd := exec.Command("helm", "uninstall", "keda", "--namespace", kedaNamespace)
+	if _, err := Run(cmd); err != nil {
+		fmt.Printf("Failed to uninstall KEDA: %v\n", err)
+	}
+
+	// Delete namespace
+	cmd = exec.Command("kubectl", "delete", "namespace", kedaNamespace, "--ignore-not-found=true")
+	if _, err := Run(cmd); err != nil {
+		fmt.Printf("Failed to delete KEDA namespace: %v\n", err)
+	}
+}
+
+// IsKEDAInstalled checks if KEDA is already installed
+func IsKEDAInstalled() bool {
+	// Check if KEDA CRDs are installed
+	cmd := exec.Command("kubectl", "get", "crd", "scaledobjects.keda.sh")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(output), "scaledobjects.keda.sh")
 }
 
 // LoadImageToKindClusterWithName loads a local docker image to the kind cluster
