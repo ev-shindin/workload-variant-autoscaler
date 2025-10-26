@@ -128,7 +128,6 @@ kubectl get --raw "/apis/external.metrics.k8s.io/v1beta1/namespaces/llm-d-sim/in
         "__name__": "inferno_desired_replicas",
         "accelerator_type": "A100",
         "endpoint": "https",
-        "exported_namespace": "llm-d-sim",
         "instance": "10.244.2.6:8443",
         "job": "workload-variant-autoscaler-controller-manager-metrics-service",
         "namespace": "workload-variant-autoscaler-system",
@@ -280,10 +279,10 @@ prometheus:
 
 rules:
   external:
-  - seriesQuery: 'inferno_desired_replicas{variant_name!="",exported_namespace!=""}'
+  - seriesQuery: 'inferno_desired_replicas{variant_name!="",namespace!=""}'
     resources:
       overrides:
-        exported_namespace: {resource: "namespace"}
+        namespace: {resource: "namespace"}
         variant_name: {resource: "deployment"}  
     name:
       matches: "^inferno_desired_replicas"

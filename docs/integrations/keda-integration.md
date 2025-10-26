@@ -301,7 +301,7 @@ spec:
       query: |
         inferno_desired_replicas{
           variant_name="vllme-deployment",
-          exported_namespace="llm-d-sim"
+          namespace="llm-d-sim"
         }
 
       # Scaling configuration for inferno_desired_replicas metric (integer values)

@@ -4,10 +4,10 @@ prometheus:
 
 rules:
   external:
-  - seriesQuery: 'inferno_desired_replicas{variant_name!="",exported_namespace!=""}'
+  - seriesQuery: 'inferno_desired_replicas{variant_name!="",namespace!=""}'
     resources:
       overrides:
-        exported_namespace: {resource: "namespace"}
+        namespace: {resource: "namespace"}
         variant_name: {resource: "deployment"}  
     name:
       matches: "^inferno_desired_replicas"
