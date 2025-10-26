@@ -115,12 +115,22 @@ func (engine *VariantAutoscalingsEngine) Optimize(ctx context.Context,
 			}
 		}
 
-		// Enforce maxReplicas bound
-		// Note: minReplicas is enforced during optimization via AddServerInfoToSystemData,
-		// which passes it as a constraint to the inferno optimizer.
-		// maxReplicas is enforced here as a post-processing step because the optimizer
-		// may not have a built-in maxReplicas constraint.
+		// Enforce replica bounds (minReplicas and maxReplicas)
+		// Note: Bounds must be enforced for both optimizer solutions and fallback values
+		minReplicas := utils.GetVariantMinReplicas(&va)
 		maxReplicas := utils.GetVariantMaxReplicas(&va)
+
+		// Enforce minReplicas
+		if optimizedAllocation.NumReplicas < minReplicas {
+			logger.Log.Info("Clamping replicas to minReplicas",
+				"variant", vaName,
+				"namespace", vaNamespace,
+				"optimized", optimizedAllocation.NumReplicas,
+				"minReplicas", minReplicas)
+			optimizedAllocation.NumReplicas = minReplicas
+		}
+
+		// Enforce maxReplicas
 		if maxReplicas > 0 && optimizedAllocation.NumReplicas > maxReplicas {
 			logger.Log.Info("Clamping replicas to maxReplicas",
 				"variant", vaName,
@@ -132,6 +142,11 @@ func (engine *VariantAutoscalingsEngine) Optimize(ctx context.Context,
 
 		optimizedAllocMap[vaName] = *optimizedAllocation
 	}
+
+	// Apply final scale-to-zero check after all bounds are enforced
+	// This handles variants that may have been skipped by optimizer or fallback logic
+	engine.applyFinalScaleToZeroCheck(ctx, &vaList, optimizedAllocMap, scaleToZeroConfigData, scaleToZeroCache)
+
 	return optimizedAllocMap, nil
 }
 
@@ -325,4 +340,80 @@ func (engine *VariantAutoscalingsEngine) selectCheapestVariant(
 	}
 
 	return cheapestVariant
+}
+
+// applyFinalScaleToZeroCheck applies scale-to-zero logic to the final optimized allocations
+// This is a post-processing step that runs after all bounds are enforced
+func (engine *VariantAutoscalingsEngine) applyFinalScaleToZeroCheck(
+	ctx context.Context,
+	vaList *llmdOptv1alpha1.VariantAutoscalingList,
+	optimizedAllocMap map[string]llmdOptv1alpha1.OptimizedAlloc,
+	scaleToZeroConfigData *utils.ScaleToZeroConfigData,
+	scaleToZeroCache *collector.ScaleToZeroMetricsCache,
+) {
+	// ctx is reserved for future use (tracing, cancellation, etc.)
+	_ = ctx
+
+	// Group variants by ModelID
+	estimatedModels := len(vaList.Items) / 2
+	if estimatedModels == 0 {
+		estimatedModels = 1
+	}
+	modelVariants := make(map[string][]*llmdOptv1alpha1.VariantAutoscaling, estimatedModels)
+	for i := range vaList.Items {
+		va := &vaList.Items[i]
+		modelID := va.Spec.ModelID
+		modelVariants[modelID] = append(modelVariants[modelID], va)
+	}
+
+	// Process each model
+	for modelID, variants := range modelVariants {
+		// Check scale-to-zero configuration
+		var scaleToZeroEnabled bool
+		if scaleToZeroConfigData == nil {
+			scaleToZeroEnabled = false
+		} else {
+			scaleToZeroEnabled = utils.IsScaleToZeroEnabled(*scaleToZeroConfigData, modelID)
+		}
+
+		// If scale-to-zero not enabled, skip
+		if !scaleToZeroEnabled {
+			continue
+		}
+
+		// Get total requests over retention period
+		totalRequests := 0.0
+		if scaleToZeroCache != nil {
+			if metrics, exists := scaleToZeroCache.Get(modelID); exists {
+				totalRequests = metrics.TotalRequestsOverRetentionPeriod
+			}
+		}
+
+		// If there are recent requests, skip
+		if totalRequests > 0 {
+			logger.Log.Debug("Skipping scale-to-zero: recent requests detected",
+				"modelID", modelID,
+				"totalRequests", totalRequests)
+			continue
+		}
+
+		// Scale all variants to zero (overrides minReplicas)
+		logger.Log.Info("Final scale-to-zero check: scaling all variants to zero",
+			"modelID", modelID,
+			"scaleToZeroEnabled", scaleToZeroEnabled,
+			"totalRequests", totalRequests)
+
+		for _, va := range variants {
+			if alloc, exists := optimizedAllocMap[va.Name]; exists {
+				if alloc.NumReplicas > 0 {
+					logger.Log.Info("Scaling variant to zero (final scale-to-zero check)",
+						"variant", va.Name,
+						"namespace", va.Namespace,
+						"previousReplicas", alloc.NumReplicas)
+					alloc.NumReplicas = 0
+					optimizedAllocMap[va.Name] = alloc
+				}
+			}
+		}
+	}
 }
