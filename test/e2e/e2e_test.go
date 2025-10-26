@@ -908,11 +908,21 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 		defer diagCancel()
 
 		allMetricsQuery := "inferno_desired_replicas"
-		_, allMetricsErr := diagClient.QueryWithRetry(diagCtx, allMetricsQuery)
+		allMetricsResult, allMetricsErr := diagClient.QueryPromWithLabels(diagCtx, allMetricsQuery)
 		if allMetricsErr != nil {
 			_, _ = fmt.Fprintf(GinkgoWriter, "⚠ No inferno_desired_replicas metrics found in Prometheus: %v\n", allMetricsErr)
 		} else {
-			_, _ = fmt.Fprintf(GinkgoWriter, "✓ Some inferno_desired_replicas metrics exist in Prometheus\n")
+			_, _ = fmt.Fprintf(GinkgoWriter, "✓ Found %d inferno_desired_replicas metric(s) in Prometheus:\n", len(allMetricsResult))
+			for i, result := range allMetricsResult {
+				_, _ = fmt.Fprintf(GinkgoWriter, "  Metric #%d: variant_name=%q, namespace=%q, exported_namespace=%q, accelerator_type=%q, variant_id=%q, value=%v\n",
+					i+1,
+					result.Metric["variant_name"],
+					result.Metric["namespace"],
+					result.Metric["exported_namespace"],
+					result.Metric["accelerator_type"],
+					result.Metric["variant_id"],
+					result.Value)
+			}
 		}
 
 		Eventually(func(g Gomega) {
@@ -1876,11 +1886,21 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 		defer diagCancel()
 
 		allMetricsQuery := "inferno_desired_replicas"
-		_, allMetricsErr := diagClient.QueryWithRetry(diagCtx, allMetricsQuery)
+		allMetricsResult, allMetricsErr := diagClient.QueryPromWithLabels(diagCtx, allMetricsQuery)
 		if allMetricsErr != nil {
 			_, _ = fmt.Fprintf(GinkgoWriter, "⚠ No inferno_desired_replicas metrics found in Prometheus: %v\n", allMetricsErr)
 		} else {
-			_, _ = fmt.Fprintf(GinkgoWriter, "✓ Some inferno_desired_replicas metrics exist in Prometheus\n")
+			_, _ = fmt.Fprintf(GinkgoWriter, "✓ Found %d inferno_desired_replicas metric(s) in Prometheus:\n", len(allMetricsResult))
+			for i, result := range allMetricsResult {
+				_, _ = fmt.Fprintf(GinkgoWriter, "  Metric #%d: variant_name=%q, namespace=%q, exported_namespace=%q, accelerator_type=%q, variant_id=%q, value=%v\n",
+					i+1,
+					result.Metric["variant_name"],
+					result.Metric["namespace"],
+					result.Metric["exported_namespace"],
+					result.Metric["accelerator_type"],
+					result.Metric["variant_id"],
+					result.Value)
+			}
 		}
 
 		Eventually(func(g Gomega) {

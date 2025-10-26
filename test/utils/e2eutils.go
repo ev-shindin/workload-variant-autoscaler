@@ -1149,6 +1149,47 @@ func isPermanentPrometheusError(err error) bool {
 	return false
 }
 
+// PromMetricResult represents a single Prometheus metric result with labels
+type PromMetricResult struct {
+	Metric map[string]string
+	Value  float64
+}
+
+// QueryPromWithLabels queries Prometheus and returns all results with their labels
+func (p *PrometheusClient) QueryPromWithLabels(ctx context.Context, query string) ([]PromMetricResult, error) {
+	result, warnings, err := p.client.Query(ctx, query, time.Now())
+	if err != nil {
+		return nil, fmt.Errorf("prometheus query failed: %w", err)
+	}
+
+	// Log any warnings from Prometheus
+	if len(warnings) > 0 {
+		fmt.Printf("Debug: Prometheus warnings: %v\n", warnings)
+	}
+
+	// Extract results with labels
+	switch v := result.(type) {
+	case model.Vector:
+		if len(v) == 0 {
+			return nil, fmt.Errorf("no data returned from prometheus query")
+		}
+		results := make([]PromMetricResult, len(v))
+		for i, sample := range v {
+			labels := make(map[string]string)
+			for k, v := range sample.Metric {
+				labels[string(k)] = string(v)
+			}
+			results[i] = PromMetricResult{
+				Metric: labels,
+				Value:  float64(sample.Value),
+			}
+		}
+		return results, nil
+	default:
+		return nil, fmt.Errorf("unexpected result type: %T", result)
+	}
+}
+
 // GetInfernoReplicaMetrics queries Prometheus for metrics emitted by the Inferno autoscaler
 func GetInfernoReplicaMetrics(variantName, namespace, acceleratorType, variantID string) (currentReplicas, desiredReplicas, desiredRatio float64, err error) {
 
