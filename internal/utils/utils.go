@@ -541,7 +541,9 @@ func MarshalStructToJsonString(t any) string {
 }
 
 // Helper to find SLOs for a model variant
+// If the specified model is not found, falls back to "default/default" SLO
 func FindModelSLO(cmData map[string]string, targetModel string) (*interfaces.ServiceClassEntry, string /* class name */, error) {
+	// First pass: try to find exact match for targetModel
 	for key, val := range cmData {
 		var sc interfaces.ServiceClass
 		if err := yaml.Unmarshal([]byte(val), &sc); err != nil {
@@ -554,7 +556,32 @@ func FindModelSLO(cmData map[string]string, targetModel string) (*interfaces.Ser
 			}
 		}
 	}
-	return nil, "", fmt.Errorf("model %q not found in any service class", targetModel)
+
+	// Model not found, try fallback to default/default
+	logger.Log.Info("Model SLO not found, attempting fallback to default/default",
+		"model", targetModel)
+
+	// Second pass: try to find default/default
+	for _, val := range cmData {
+		var sc interfaces.ServiceClass
+		if err := yaml.Unmarshal([]byte(val), &sc); err != nil {
+			continue // Skip unparseable entries
+		}
+
+		for _, entry := range sc.Data {
+			if entry.Model == "default/default" {
+				logger.Log.Info("Using fallback SLO from default/default",
+					"original-model", targetModel,
+					"service-class", sc.Name,
+					"slo-tpot", entry.SLOTPOT,
+					"slo-ttft", entry.SLOTTFT)
+				return &entry, sc.Name, nil
+			}
+		}
+	}
+
+	// Neither targetModel nor default/default found
+	return nil, "", fmt.Errorf("model %q not found in any service class and default/default fallback not found", targetModel)
 }
 
 func Ptr[T any](v T) *T {
