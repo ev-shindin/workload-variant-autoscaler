@@ -879,12 +879,41 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 
 		// Wait for controller to reconcile and emit metrics
 		By("waiting for controller to reconcile VariantAutoscaling and emit metrics")
-		time.Sleep(30 * time.Second) // Give controller time to reconcile
+
+		// Check VariantAutoscaling status to verify controller has reconciled
+		By("checking VariantAutoscaling status before metric verification")
+		Eventually(func(g Gomega) {
+			va := &v1alpha1.VariantAutoscaling{}
+			err := crClient.Get(ctx, client.ObjectKey{Name: vaName, Namespace: namespace}, va)
+			g.Expect(err).NotTo(HaveOccurred(), "Should be able to get VariantAutoscaling")
+
+			_, _ = fmt.Fprintf(GinkgoWriter, "VariantAutoscaling Status: CurrentReplicas=%d, DesiredReplicas=%d\n",
+				va.Status.CurrentAlloc.NumReplicas, va.Status.DesiredOptimizedAlloc.NumReplicas)
+
+			g.Expect(va.Status.DesiredOptimizedAlloc.NumReplicas).To(BeNumerically(">=", 0),
+				"Controller should have set desired replicas")
+		}, 2*time.Minute, 10*time.Second).Should(Succeed(), "Controller should reconcile VariantAutoscaling")
 
 		// Verify metrics are being emitted with all required labels
 		By("verifying controller emits inferno_desired_replicas metric with all 4 labels")
 		kedaQuery := fmt.Sprintf("inferno_desired_replicas{variant_name=\"%s\",exported_namespace=\"%s\",accelerator_type=\"%s\",variant_id=\"%s-%s-1\"}", vaName, namespace, accelerator, modelID, accelerator)
 		_, _ = fmt.Fprintf(GinkgoWriter, "KEDA Query: %s\n", kedaQuery)
+
+		// First check if ANY inferno_desired_replicas metrics exist
+		By("checking if any inferno_desired_replicas metrics exist in Prometheus")
+		diagClient, err := utils.NewPrometheusClient("https://localhost:9090", true)
+		Expect(err).NotTo(HaveOccurred(), "Should be able to create Prometheus client")
+
+		diagCtx, diagCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer diagCancel()
+
+		allMetricsQuery := "inferno_desired_replicas"
+		_, allMetricsErr := diagClient.QueryWithRetry(diagCtx, allMetricsQuery)
+		if allMetricsErr != nil {
+			_, _ = fmt.Fprintf(GinkgoWriter, "⚠ No inferno_desired_replicas metrics found in Prometheus: %v\n", allMetricsErr)
+		} else {
+			_, _ = fmt.Fprintf(GinkgoWriter, "✓ Some inferno_desired_replicas metrics exist in Prometheus\n")
+		}
 
 		Eventually(func(g Gomega) {
 			client, err := utils.NewPrometheusClient("https://localhost:9090", true)
@@ -1818,12 +1847,41 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 
 		// Wait for controller to reconcile and emit metrics
 		By("waiting for controller to reconcile VariantAutoscaling and emit metrics")
-		time.Sleep(30 * time.Second) // Give controller time to reconcile
+
+		// Check VariantAutoscaling status to verify controller has reconciled
+		By("checking VariantAutoscaling status before metric verification")
+		Eventually(func(g Gomega) {
+			va := &v1alpha1.VariantAutoscaling{}
+			err := crClient.Get(ctx, client.ObjectKey{Name: vaName, Namespace: namespace}, va)
+			g.Expect(err).NotTo(HaveOccurred(), "Should be able to get VariantAutoscaling")
+
+			_, _ = fmt.Fprintf(GinkgoWriter, "VariantAutoscaling Status: CurrentReplicas=%d, DesiredReplicas=%d\n",
+				va.Status.CurrentAlloc.NumReplicas, va.Status.DesiredOptimizedAlloc.NumReplicas)
+
+			g.Expect(va.Status.DesiredOptimizedAlloc.NumReplicas).To(BeNumerically(">=", 0),
+				"Controller should have set desired replicas")
+		}, 2*time.Minute, 10*time.Second).Should(Succeed(), "Controller should reconcile VariantAutoscaling")
 
 		// Verify metrics are being emitted with all required labels
 		By("verifying controller emits inferno_desired_replicas metric with all 4 labels")
 		kedaQuery := fmt.Sprintf("inferno_desired_replicas{variant_name=\"%s\",exported_namespace=\"%s\",accelerator_type=\"%s\",variant_id=\"%s-%s-1\"}", vaName, namespace, accelerator, modelID, accelerator)
 		_, _ = fmt.Fprintf(GinkgoWriter, "KEDA Query: %s\n", kedaQuery)
+
+		// First check if ANY inferno_desired_replicas metrics exist
+		By("checking if any inferno_desired_replicas metrics exist in Prometheus")
+		diagClient, err := utils.NewPrometheusClient("https://localhost:9090", true)
+		Expect(err).NotTo(HaveOccurred(), "Should be able to create Prometheus client")
+
+		diagCtx, diagCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer diagCancel()
+
+		allMetricsQuery := "inferno_desired_replicas"
+		_, allMetricsErr := diagClient.QueryWithRetry(diagCtx, allMetricsQuery)
+		if allMetricsErr != nil {
+			_, _ = fmt.Fprintf(GinkgoWriter, "⚠ No inferno_desired_replicas metrics found in Prometheus: %v\n", allMetricsErr)
+		} else {
+			_, _ = fmt.Fprintf(GinkgoWriter, "✓ Some inferno_desired_replicas metrics exist in Prometheus\n")
+		}
 
 		Eventually(func(g Gomega) {
 			client, err := utils.NewPrometheusClient("https://localhost:9090", true)
