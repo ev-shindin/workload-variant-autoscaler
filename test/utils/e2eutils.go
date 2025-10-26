@@ -1160,7 +1160,7 @@ func GetInfernoReplicaMetrics(variantName, namespace, acceleratorType, variantID
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	labels := fmt.Sprintf(`variant_name="%s",namespace="%s",accelerator_type="%s",variant_id="%s"`, variantName, namespace, acceleratorType, variantID)
+	labels := fmt.Sprintf(`variant_name="%s",exported_namespace="%s",accelerator_type="%s",variant_id="%s"`, variantName, namespace, acceleratorType, variantID)
 
 	// Query both metrics with retries
 	currentQuery := fmt.Sprintf(`%s{%s}`, constants.InfernoCurrentReplicas, labels)
