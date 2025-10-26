@@ -104,9 +104,15 @@ func (engine *VariantAutoscalingsEngine) Optimize(ctx context.Context,
 		variantID := va.Spec.VariantID
 		optimizedAllocation, err := utils.CreateOptimizedAlloc(vaName, vaNamespace, variantID, allocationSolution)
 		if err != nil {
-			logger.Log.Error(err, "Failed to create optimized allocation",
-				"variant", vaName, "namespace", vaNamespace)
-			continue
+			// Fallback to current replicas if no solution found for this variant
+			logger.Log.Warn("No optimizer solution found for variant, falling back to current replicas",
+				"variant", vaName,
+				"namespace", vaNamespace,
+				"currentReplicas", va.Status.CurrentAlloc.NumReplicas,
+				"error", err)
+			optimizedAllocation = &llmdOptv1alpha1.OptimizedAlloc{
+				NumReplicas: va.Status.CurrentAlloc.NumReplicas,
+			}
 		}
 
 		// Enforce maxReplicas bound
