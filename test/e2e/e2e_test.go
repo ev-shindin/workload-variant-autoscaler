@@ -888,7 +888,7 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 					"type": "prometheus",
 					"metadata": map[string]interface{}{
 						"serverAddress":       "https://kube-prometheus-stack-prometheus.workload-variant-autoscaler-monitoring.svc.cluster.local:9090",
-						"query":               fmt.Sprintf("inferno_desired_replicas{variant_name=\"%s\",namespace=\"%s\"}", vaName, namespace),
+						"query":               fmt.Sprintf("inferno_desired_replicas{variant_name=\"%s\",exported_namespace=\"%s\",accelerator_type=\"%s\",variant_id=\"%s-%s-1\"}", vaName, namespace, accelerator, modelID, accelerator),
 						"threshold":           "1",
 						"activationThreshold": "0",
 						"metricType":          "AverageValue",
@@ -1785,7 +1785,7 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 					"type": "prometheus",
 					"metadata": map[string]interface{}{
 						"serverAddress":       "https://kube-prometheus-stack-prometheus.workload-variant-autoscaler-monitoring.svc.cluster.local:9090",
-						"query":               fmt.Sprintf("inferno_desired_replicas{variant_name=\"%s\",namespace=\"%s\"}", vaName, namespace),
+						"query":               fmt.Sprintf("inferno_desired_replicas{variant_name=\"%s\",exported_namespace=\"%s\",accelerator_type=\"%s\",variant_id=\"%s-%s-1\"}", vaName, namespace, accelerator, modelID, accelerator),
 						"threshold":           "1",
 						"activationThreshold": "0",
 						"metricType":          "AverageValue",
