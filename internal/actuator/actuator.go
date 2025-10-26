@@ -59,6 +59,15 @@ func (a *Actuator) EmitMetrics(ctx context.Context, VariantAutoscaling *llmdOptv
 			currentReplicas = int32(VariantAutoscaling.Status.CurrentAlloc.NumReplicas) // fallback
 		}
 
+		// DEBUG: Log label values before emitting metrics
+		logger.Log.Info("DEBUG: EmitMetrics label values",
+			"variant_name", VariantAutoscaling.Name,
+			"namespace", VariantAutoscaling.Namespace,
+			"accelerator_type", VariantAutoscaling.Spec.Accelerator,
+			"variant_id", VariantAutoscaling.Spec.VariantID,
+			"current_replicas", currentReplicas,
+			"desired_replicas", VariantAutoscaling.Status.DesiredOptimizedAlloc.NumReplicas)
+
 		if err := a.MetricsEmitter.EmitReplicaMetrics(
 			ctx,
 			VariantAutoscaling,
