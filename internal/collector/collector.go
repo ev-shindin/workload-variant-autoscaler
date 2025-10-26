@@ -58,6 +58,15 @@ type MetricsValidationResult struct {
 // ValidateMetricsAvailability checks if vLLM metrics are available for the given model and namespace
 // Returns a validation result with details about metric availability
 func ValidateMetricsAvailability(ctx context.Context, promAPI promv1.API, modelName, namespace string) MetricsValidationResult {
+	// Handle nil promAPI (e.g., in unit tests without Prometheus)
+	if promAPI == nil {
+		return MetricsValidationResult{
+			Available: false,
+			Reason:    llmdVariantAutoscalingV1alpha1.ReasonPrometheusError,
+			Message:   "Prometheus API not configured",
+		}
+	}
+
 	// Query for basic vLLM metric to validate scraping is working
 	// Try with namespace label first (real vLLM), fall back to just model_name (vllme emulator)
 	testQuery := fmt.Sprintf(`vllm:request_success_total{model_name="%s",namespace="%s"}`, modelName, namespace)
