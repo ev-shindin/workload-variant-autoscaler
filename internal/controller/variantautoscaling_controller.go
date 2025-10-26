@@ -473,7 +473,12 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 			currentReplicas = va.Status.CurrentAlloc.NumReplicas
 		} else {
 			// Use actual deployment replicas
-			currentReplicas = deploy.Status.Replicas
+			// Prefer Status.Replicas (current state), but fall back to Spec.Replicas if Status not populated yet
+			if deploy.Status.Replicas > 0 {
+				currentReplicas = deploy.Status.Replicas
+			} else if deploy.Spec.Replicas != nil {
+				currentReplicas = *deploy.Spec.Replicas
+			}
 			logger.Log.Debug("Initialized CurrentAlloc from deployment",
 				"variant", va.Name, "replicas", currentReplicas)
 		}
