@@ -397,21 +397,32 @@ func (engine *VariantAutoscalingsEngine) applyFinalScaleToZeroCheck(
 			continue
 		}
 
-		// Scale all variants to zero (overrides minReplicas)
-		logger.Log.Info("Final scale-to-zero check: scaling all variants to zero",
+		// Scale variants to zero respecting per-variant minReplicas bounds
+		logger.Log.Info("Final scale-to-zero check: evaluating variants for scale-to-zero",
 			"modelID", modelID,
 			"scaleToZeroEnabled", scaleToZeroEnabled,
 			"totalRequests", totalRequests)
 
 		for _, va := range variants {
 			if alloc, exists := optimizedAllocMap[va.Name]; exists {
-				if alloc.NumReplicas > 0 {
+				// Get variant-specific minReplicas
+				minReplicas := utils.GetVariantMinReplicas(va)
+
+				// Only scale to zero if variant's minReplicas allows it
+				if minReplicas == 0 && alloc.NumReplicas > 0 {
 					logger.Log.Info("Scaling variant to zero (final scale-to-zero check)",
 						"variant", va.Name,
 						"namespace", va.Namespace,
-						"previousReplicas", alloc.NumReplicas)
+						"previousReplicas", alloc.NumReplicas,
+						"minReplicas", minReplicas)
 					alloc.NumReplicas = 0
 					optimizedAllocMap[va.Name] = alloc
+				} else if minReplicas > 0 {
+					logger.Log.Debug("Skipping scale-to-zero: variant has minReplicas > 0",
+						"variant", va.Name,
+						"namespace", va.Namespace,
+						"minReplicas", minReplicas,
+						"currentReplicas", alloc.NumReplicas)
 				}
 			}
 		}
