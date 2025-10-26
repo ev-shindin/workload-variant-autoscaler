@@ -889,6 +889,16 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 
 			_, _ = fmt.Fprintf(GinkgoWriter, "VariantAutoscaling Status: CurrentReplicas=%d, DesiredReplicas=%d\n",
 				va.Status.CurrentAlloc.NumReplicas, va.Status.DesiredOptimizedAlloc.NumReplicas)
+			_, _ = fmt.Fprintf(GinkgoWriter, "VariantAutoscaling Spec: Accelerator=%q, VariantID=%q, ModelID=%q\n",
+				va.Spec.Accelerator, va.Spec.VariantID, va.Spec.ModelID)
+
+			// Check if metric emission condition would be satisfied
+			if va.Status.DesiredOptimizedAlloc.NumReplicas < 0 {
+				_, _ = fmt.Fprintf(GinkgoWriter, "⚠ WARNING: DesiredOptimizedAlloc.NumReplicas=%d is negative - metrics will NOT be emitted!\n",
+					va.Status.DesiredOptimizedAlloc.NumReplicas)
+			} else {
+				_, _ = fmt.Fprintf(GinkgoWriter, "✓ Metric emission condition satisfied (DesiredReplicas >= 0)\n")
+			}
 
 			g.Expect(va.Status.DesiredOptimizedAlloc.NumReplicas).To(BeNumerically(">=", 0),
 				"Controller should have set desired replicas")
@@ -1867,6 +1877,16 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 
 			_, _ = fmt.Fprintf(GinkgoWriter, "VariantAutoscaling Status: CurrentReplicas=%d, DesiredReplicas=%d\n",
 				va.Status.CurrentAlloc.NumReplicas, va.Status.DesiredOptimizedAlloc.NumReplicas)
+			_, _ = fmt.Fprintf(GinkgoWriter, "VariantAutoscaling Spec: Accelerator=%q, VariantID=%q, ModelID=%q\n",
+				va.Spec.Accelerator, va.Spec.VariantID, va.Spec.ModelID)
+
+			// Check if metric emission condition would be satisfied
+			if va.Status.DesiredOptimizedAlloc.NumReplicas < 0 {
+				_, _ = fmt.Fprintf(GinkgoWriter, "⚠ WARNING: DesiredOptimizedAlloc.NumReplicas=%d is negative - metrics will NOT be emitted!\n",
+					va.Status.DesiredOptimizedAlloc.NumReplicas)
+			} else {
+				_, _ = fmt.Fprintf(GinkgoWriter, "✓ Metric emission condition satisfied (DesiredReplicas >= 0)\n")
+			}
 
 			g.Expect(va.Status.DesiredOptimizedAlloc.NumReplicas).To(BeNumerically(">=", 0),
 				"Controller should have set desired replicas")
