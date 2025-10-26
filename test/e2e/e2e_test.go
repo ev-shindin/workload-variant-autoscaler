@@ -865,6 +865,58 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 	})
 
 	It("should scale deployment to zero after idle period with no traffic", func() {
+		// Set up port-forwarding for Prometheus to enable metric verification
+		By("setting up port-forward to Prometheus service for metric verification")
+		prometheusPortForwardCmd := utils.SetUpPortForward(k8sClient, ctx, "kube-prometheus-stack-prometheus", controllerMonitoringNamespace, 9090, 9090)
+		defer func() {
+			err := utils.StopCmd(prometheusPortForwardCmd)
+			Expect(err).NotTo(HaveOccurred(), "Should be able to stop Prometheus port-forwarding")
+		}()
+
+		By("waiting for Prometheus port-forward to be ready")
+		err := utils.VerifyPortForwardReadiness(ctx, 9090, fmt.Sprintf("https://localhost:%d/api/v1/query?query=up", 9090))
+		Expect(err).NotTo(HaveOccurred(), "Prometheus port-forward should be ready within timeout")
+
+		// Wait for controller to reconcile and emit metrics
+		By("waiting for controller to reconcile VariantAutoscaling and emit metrics")
+		time.Sleep(30 * time.Second) // Give controller time to reconcile
+
+		// Verify metrics are being emitted with all required labels
+		By("verifying controller emits inferno_desired_replicas metric with all 4 labels")
+		kedaQuery := fmt.Sprintf("inferno_desired_replicas{variant_name=\"%s\",exported_namespace=\"%s\",accelerator_type=\"%s\",variant_id=\"%s-%s-1\"}", vaName, namespace, accelerator, modelID, accelerator)
+		_, _ = fmt.Fprintf(GinkgoWriter, "KEDA Query: %s\n", kedaQuery)
+
+		Eventually(func(g Gomega) {
+			client, err := utils.NewPrometheusClient("https://localhost:9090", true)
+			g.Expect(err).NotTo(HaveOccurred(), "Should be able to create Prometheus client")
+
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			value, err := client.QueryWithRetry(ctx, kedaQuery)
+			if err != nil {
+				_, _ = fmt.Fprintf(GinkgoWriter, "Metric query failed: %v\n", err)
+				g.Expect(err).NotTo(HaveOccurred(), "Metric query should succeed")
+			}
+
+			_, _ = fmt.Fprintf(GinkgoWriter, "✓ Metric query successful, value: %.0f\n", value)
+			g.Expect(value).To(BeNumerically(">=", 0), "Metric value should be non-negative")
+		}, 2*time.Minute, 10*time.Second).Should(Succeed(), "Controller should emit metrics that match KEDA query")
+
+		// Also verify that we can query metrics without accelerator_type and variant_id (should fail or return different results)
+		By("verifying query without all labels returns empty or different results (diagnostic)")
+		partialQuery := fmt.Sprintf("inferno_desired_replicas{variant_name=\"%s\",exported_namespace=\"%s\"}", vaName, namespace)
+		promClient, err := utils.NewPrometheusClient("https://localhost:9090", true)
+		Expect(err).NotTo(HaveOccurred())
+		ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel2()
+		partialValue, partialErr := promClient.QueryWithRetry(ctx2, partialQuery)
+		if partialErr != nil {
+			_, _ = fmt.Fprintf(GinkgoWriter, "Partial query (without accelerator_type/variant_id) failed as expected: %v\n", partialErr)
+		} else {
+			_, _ = fmt.Fprintf(GinkgoWriter, "Partial query returned value: %.0f (may be different from full query)\n", partialValue)
+		}
+
 		By("creating KEDA ScaledObject for deployment")
 		scaledObject := &unstructured.Unstructured{}
 		scaledObject.SetGroupVersionKind(schema.GroupVersionKind{
@@ -897,7 +949,7 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 				},
 			},
 		}
-		err := crClient.Create(ctx, scaledObject)
+		err = crClient.Create(ctx, scaledObject)
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to create ScaledObject: %s", deployName+"-scaler"))
 
 		By("waiting for KEDA ScaledObject to be ready")
@@ -931,17 +983,7 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 			g.Expect(found).To(BeTrue(), "ScaledObject should have conditions")
 		}, 3*time.Minute, 5*time.Second).Should(Succeed())
 
-		// Set up port-forwarding for Prometheus to enable metrics queries
-		By("setting up port-forward to Prometheus service")
-		prometheusPortForwardCmd := utils.SetUpPortForward(k8sClient, ctx, "kube-prometheus-stack-prometheus", controllerMonitoringNamespace, 9090, 9090)
-		defer func() {
-			err := utils.StopCmd(prometheusPortForwardCmd)
-			Expect(err).NotTo(HaveOccurred(), "Should be able to stop Prometheus port-forwarding")
-		}()
-
-		By("waiting for Prometheus port-forward to be ready")
-		err = utils.VerifyPortForwardReadiness(ctx, 9090, fmt.Sprintf("https://localhost:%d/api/v1/query?query=up", 9090))
-		Expect(err).NotTo(HaveOccurred(), "Prometheus port-forward should be ready within timeout")
+		// Note: Prometheus port-forward already set up earlier in the test for metric verification
 
 		By("waiting for retention period to pass with zero traffic")
 		_, _ = fmt.Fprintf(GinkgoWriter, "Waiting %v for retention period (no traffic simulated)...\n", retentionDuration)
@@ -1762,6 +1804,58 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 	})
 
 	It("should scale deployment to zero after idle period with no traffic", func() {
+		// Set up port-forwarding for Prometheus to enable metric verification
+		By("setting up port-forward to Prometheus service for metric verification")
+		prometheusPortForwardCmd := utils.SetUpPortForward(k8sClient, ctx, "kube-prometheus-stack-prometheus", controllerMonitoringNamespace, 9090, 9090)
+		defer func() {
+			err := utils.StopCmd(prometheusPortForwardCmd)
+			Expect(err).NotTo(HaveOccurred(), "Should be able to stop Prometheus port-forwarding")
+		}()
+
+		By("waiting for Prometheus port-forward to be ready")
+		err := utils.VerifyPortForwardReadiness(ctx, 9090, fmt.Sprintf("https://localhost:%d/api/v1/query?query=up", 9090))
+		Expect(err).NotTo(HaveOccurred(), "Prometheus port-forward should be ready within timeout")
+
+		// Wait for controller to reconcile and emit metrics
+		By("waiting for controller to reconcile VariantAutoscaling and emit metrics")
+		time.Sleep(30 * time.Second) // Give controller time to reconcile
+
+		// Verify metrics are being emitted with all required labels
+		By("verifying controller emits inferno_desired_replicas metric with all 4 labels")
+		kedaQuery := fmt.Sprintf("inferno_desired_replicas{variant_name=\"%s\",exported_namespace=\"%s\",accelerator_type=\"%s\",variant_id=\"%s-%s-1\"}", vaName, namespace, accelerator, modelID, accelerator)
+		_, _ = fmt.Fprintf(GinkgoWriter, "KEDA Query: %s\n", kedaQuery)
+
+		Eventually(func(g Gomega) {
+			client, err := utils.NewPrometheusClient("https://localhost:9090", true)
+			g.Expect(err).NotTo(HaveOccurred(), "Should be able to create Prometheus client")
+
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			value, err := client.QueryWithRetry(ctx, kedaQuery)
+			if err != nil {
+				_, _ = fmt.Fprintf(GinkgoWriter, "Metric query failed: %v\n", err)
+				g.Expect(err).NotTo(HaveOccurred(), "Metric query should succeed")
+			}
+
+			_, _ = fmt.Fprintf(GinkgoWriter, "✓ Metric query successful, value: %.0f\n", value)
+			g.Expect(value).To(BeNumerically(">=", 0), "Metric value should be non-negative")
+		}, 2*time.Minute, 10*time.Second).Should(Succeed(), "Controller should emit metrics that match KEDA query")
+
+		// Also verify that we can query metrics without accelerator_type and variant_id (should fail or return different results)
+		By("verifying query without all labels returns empty or different results (diagnostic)")
+		partialQuery := fmt.Sprintf("inferno_desired_replicas{variant_name=\"%s\",exported_namespace=\"%s\"}", vaName, namespace)
+		promClient, err := utils.NewPrometheusClient("https://localhost:9090", true)
+		Expect(err).NotTo(HaveOccurred())
+		ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel2()
+		partialValue, partialErr := promClient.QueryWithRetry(ctx2, partialQuery)
+		if partialErr != nil {
+			_, _ = fmt.Fprintf(GinkgoWriter, "Partial query (without accelerator_type/variant_id) failed as expected: %v\n", partialErr)
+		} else {
+			_, _ = fmt.Fprintf(GinkgoWriter, "Partial query returned value: %.0f (may be different from full query)\n", partialValue)
+		}
+
 		By("creating KEDA ScaledObject for deployment")
 		scaledObject := &unstructured.Unstructured{}
 		scaledObject.SetGroupVersionKind(schema.GroupVersionKind{
@@ -1794,7 +1888,7 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 				},
 			},
 		}
-		err := crClient.Create(ctx, scaledObject)
+		err = crClient.Create(ctx, scaledObject)
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to create ScaledObject: %s", deployName+"-scaler"))
 
 		By("waiting for KEDA ScaledObject to be ready")
@@ -1828,17 +1922,7 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 			g.Expect(found).To(BeTrue(), "ScaledObject should have conditions")
 		}, 3*time.Minute, 5*time.Second).Should(Succeed())
 
-		// Set up port-forwarding for Prometheus to enable metrics queries
-		By("setting up port-forward to Prometheus service")
-		prometheusPortForwardCmd := utils.SetUpPortForward(k8sClient, ctx, "kube-prometheus-stack-prometheus", controllerMonitoringNamespace, 9090, 9090)
-		defer func() {
-			err := utils.StopCmd(prometheusPortForwardCmd)
-			Expect(err).NotTo(HaveOccurred(), "Should be able to stop Prometheus port-forwarding")
-		}()
-
-		By("waiting for Prometheus port-forward to be ready")
-		err = utils.VerifyPortForwardReadiness(ctx, 9090, fmt.Sprintf("https://localhost:%d/api/v1/query?query=up", 9090))
-		Expect(err).NotTo(HaveOccurred(), "Prometheus port-forward should be ready within timeout")
+		// Note: Prometheus port-forward already set up earlier in the test for metric verification
 
 		By("waiting for retention period to pass with zero traffic")
 		_, _ = fmt.Fprintf(GinkgoWriter, "Waiting %v for retention period (no traffic simulated)...\n", retentionDuration)
