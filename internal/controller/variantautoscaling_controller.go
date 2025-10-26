@@ -410,46 +410,44 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 
 	for i := range updateList.Items {
 		va := &updateList.Items[i]
-		_, ok := optimizedAllocation[va.Name]
-		logger.Log.Debug("Processing variant - ", "index: ", i, ", variantAutoscaling-name: ", va.Name, ", namespace: ", va.Namespace, ", has_optimized_alloc: ", ok)
-		if !ok {
-			logger.Log.Debug("No optimized allocation found for variant - ", "variantAutoscaling-name: ", va.Name)
-			continue
-		}
+		optimizedAlloc, hasOptimizedAlloc := optimizedAllocation[va.Name]
+		logger.Log.Debug("Processing variant - ", "index: ", i, ", variantAutoscaling-name: ", va.Name, ", namespace: ", va.Namespace, ", has_optimized_alloc: ", hasOptimizedAlloc)
 
-		// Emit prediction metrics for the SELECTED allocation only
+		// Emit prediction metrics for the SELECTED allocation only (when available)
 		// This is done AFTER optimization selects which accelerator to use
-		if analyzerResponse, found := allAnalyzerResponses[va.Name]; found && analyzerResponse != nil {
-			// Get the selected accelerator from the variant spec
-			selectedAccelerator := va.Spec.Accelerator
+		if hasOptimizedAlloc {
+			if analyzerResponse, found := allAnalyzerResponses[va.Name]; found && analyzerResponse != nil {
+				// Get the selected accelerator from the variant spec
+				selectedAccelerator := va.Spec.Accelerator
 
-			// Get the allocation data for the selected accelerator only
-			if acceleratorAlloc, acceleratorFound := analyzerResponse.Allocations[selectedAccelerator]; acceleratorFound {
-				if acceleratorAlloc != nil && acceleratorAlloc.Allocation != nil {
-					allocData := acceleratorAlloc.Allocation.AllocationData()
+				// Get the allocation data for the selected accelerator only
+				if acceleratorAlloc, acceleratorFound := analyzerResponse.Allocations[selectedAccelerator]; acceleratorFound {
+					if acceleratorAlloc != nil && acceleratorAlloc.Allocation != nil {
+						allocData := acceleratorAlloc.Allocation.AllocationData()
 
-					// Convert from milliseconds to seconds
-					ttftSeconds := float64(allocData.TTFTAverage) / 1000.0
-					itlSeconds := float64(allocData.ITLAverage) / 1000.0
+						// Convert from milliseconds to seconds
+						ttftSeconds := float64(allocData.TTFTAverage) / 1000.0
+						itlSeconds := float64(allocData.ITLAverage) / 1000.0
 
-					// Emit metrics with correct VariantID (business ID, not Kubernetes UID)
-					if err := metricsEmitter.EmitPredictionMetrics(ctx, va, va.Spec.ModelID, ttftSeconds, itlSeconds, selectedAccelerator); err != nil {
-						logger.Log.Error(err, "Failed to emit prediction metrics",
-							"variantName", va.Name,
-							"modelID", va.Spec.ModelID,
-							"accelerator", selectedAccelerator)
-					} else {
-						logger.Log.Debug("Successfully emitted prediction metrics",
-							"variantName", va.Name,
-							"accelerator", selectedAccelerator,
-							"ttft_seconds", ttftSeconds,
-							"itl_seconds", itlSeconds)
+						// Emit metrics with correct VariantID (business ID, not Kubernetes UID)
+						if err := metricsEmitter.EmitPredictionMetrics(ctx, va, va.Spec.ModelID, ttftSeconds, itlSeconds, selectedAccelerator); err != nil {
+							logger.Log.Error(err, "Failed to emit prediction metrics",
+								"variantName", va.Name,
+								"modelID", va.Spec.ModelID,
+								"accelerator", selectedAccelerator)
+						} else {
+							logger.Log.Debug("Successfully emitted prediction metrics",
+								"variantName", va.Name,
+								"accelerator", selectedAccelerator,
+								"ttft_seconds", ttftSeconds,
+								"itl_seconds", itlSeconds)
+						}
 					}
+				} else {
+					logger.Log.Debug("No allocation found for selected accelerator",
+						"variantName", va.Name,
+						"accelerator", selectedAccelerator)
 				}
-			} else {
-				logger.Log.Debug("No allocation found for selected accelerator",
-					"variantName", va.Name,
-					"accelerator", selectedAccelerator)
 			}
 		}
 
@@ -464,7 +462,25 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 		// This ensures it's set even if metrics aren't available yet
 
 		updateVa.Status.CurrentAlloc = va.Status.CurrentAlloc
-		updateVa.Status.DesiredOptimizedAlloc = optimizedAllocation[va.Name]
+
+		// Use optimized allocation if available, otherwise use fallback (0 replicas)
+		// This ensures metrics are always emitted, even for zero-traffic scenarios
+		if hasOptimizedAlloc {
+			updateVa.Status.DesiredOptimizedAlloc = optimizedAlloc
+			logger.Log.Debug("Using optimized allocation",
+				"variantName", va.Name,
+				"replicas", optimizedAlloc.NumReplicas)
+		} else {
+			// Fallback: No traffic/metrics available, use minimum allocation
+			// This ensures KEDA can still query metrics for scale-to-zero scenarios
+			updateVa.Status.DesiredOptimizedAlloc = llmdVariantAutoscalingV1alpha1.OptimizedAlloc{
+				NumReplicas: 0,
+			}
+			logger.Log.Debug("No optimized allocation found, using fallback (0 replicas)",
+				"variantName", va.Name,
+				"accelerator", va.Spec.Accelerator)
+		}
+
 		updateVa.Status.Actuation.Applied = false // No longer directly applying changes
 
 		// Copy existing conditions from updateList (includes MetricsAvailable condition set during preparation)
@@ -472,19 +488,30 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 		// Always copy, even if empty, to preserve conditions set during prepareVariantAutoscalings
 		updateVa.Status.Conditions = va.Status.Conditions
 
-		// Set OptimizationReady condition to True on successful optimization
-		optimizedAlloc := updateVa.Status.DesiredOptimizedAlloc
-		llmdVariantAutoscalingV1alpha1.SetCondition(&updateVa,
-			llmdVariantAutoscalingV1alpha1.TypeOptimizationReady,
-			metav1.ConditionTrue,
-			llmdVariantAutoscalingV1alpha1.ReasonOptimizationSucceeded,
-			fmt.Sprintf("Optimization completed: %d replicas on %s",
-				optimizedAlloc.NumReplicas,
-				updateVa.Spec.Accelerator)) // Use spec field (single-variant architecture)
+		// Set OptimizationReady condition
+		desiredAlloc := updateVa.Status.DesiredOptimizedAlloc
+		if hasOptimizedAlloc {
+			llmdVariantAutoscalingV1alpha1.SetCondition(&updateVa,
+				llmdVariantAutoscalingV1alpha1.TypeOptimizationReady,
+				metav1.ConditionTrue,
+				llmdVariantAutoscalingV1alpha1.ReasonOptimizationSucceeded,
+				fmt.Sprintf("Optimization completed: %d replicas on %s",
+					desiredAlloc.NumReplicas,
+					updateVa.Spec.Accelerator)) // Use spec field (single-variant architecture)
+		} else {
+			llmdVariantAutoscalingV1alpha1.SetCondition(&updateVa,
+				llmdVariantAutoscalingV1alpha1.TypeOptimizationReady,
+				metav1.ConditionTrue,
+				llmdVariantAutoscalingV1alpha1.ReasonOptimizationSucceeded,
+				fmt.Sprintf("No metrics available, using fallback: %d replicas on %s",
+					desiredAlloc.NumReplicas,
+					updateVa.Spec.Accelerator))
+		}
 
 		act := actuator.NewActuator(r.Client)
 
-		// Emit optimization signals for external autoscalers
+		// ALWAYS emit optimization signals for external autoscalers (KEDA, HPA, etc.)
+		// This is critical for scale-to-zero scenarios where metrics must exist even with no traffic
 		if err := act.EmitMetrics(ctx, &updateVa); err != nil {
 			logger.Log.Error(err, "failed to emit optimization signals for external autoscalers - ", "variant: ", updateVa.Name)
 		} else {
