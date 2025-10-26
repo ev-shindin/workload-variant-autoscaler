@@ -461,7 +461,26 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 		// Note: ownerReference is now set earlier in prepareVariantAutoscalings
 		// This ensures it's set even if metrics aren't available yet
 
-		updateVa.Status.CurrentAlloc = va.Status.CurrentAlloc
+		// Initialize CurrentAlloc from actual deployment replicas
+		// This ensures Status.CurrentAlloc reflects reality, not stale data
+		var currentReplicas int32
+		var deploy appsv1.Deployment
+		if err := utils.GetDeploymentWithBackoff(ctx, r.Client, va.Name, va.Namespace, &deploy); err != nil {
+			// Deployment doesn't exist yet (first reconciliation) or error occurred
+			// Use existing status value, or 0 if never initialized
+			logger.Log.Debug("Could not get deployment for CurrentAlloc initialization, using existing status",
+				"variant", va.Name, "error", err)
+			currentReplicas = va.Status.CurrentAlloc.NumReplicas
+		} else {
+			// Use actual deployment replicas
+			currentReplicas = deploy.Status.Replicas
+			logger.Log.Debug("Initialized CurrentAlloc from deployment",
+				"variant", va.Name, "replicas", currentReplicas)
+		}
+
+		updateVa.Status.CurrentAlloc = llmdVariantAutoscalingV1alpha1.Allocation{
+			NumReplicas: currentReplicas,
+		}
 
 		// Use optimized allocation if available, otherwise use fallback (0 replicas)
 		// This ensures metrics are always emitted, even for zero-traffic scenarios
