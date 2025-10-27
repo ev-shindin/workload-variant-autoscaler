@@ -709,9 +709,8 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 		deployName        string
 		serviceName       string
 		serviceMonName    string
-		configMapName     string
-		vaName            string
-		appLabel          string
+		configMapName string
+		appLabel      string
 		modelID           string
 		accelerator       string
 		ctx               context.Context
@@ -733,7 +732,6 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 		serviceName = "scale-to-zero-service"
 		serviceMonName = "scale-to-zero-servicemonitor"
 		configMapName = "scale-to-zero-config"
-		vaName = "scale-to-zero-va"
 		appLabel = "scale-to-zero-test"
 		modelID = "test-scale-to-zero-model"
 		accelerator = a100Acc
@@ -778,9 +776,9 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to create ServiceMonitor: %s", serviceMonName))
 
 		By("creating VariantAutoscaling resource")
-		variantAutoscaling := utils.CreateVariantAutoscalingResource(namespace, vaName, modelID, accelerator)
+		variantAutoscaling := utils.CreateVariantAutoscalingResource(namespace, deployName, modelID, accelerator)
 		err = crClient.Create(ctx, variantAutoscaling)
-		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to create VariantAutoscaling: %s", vaName))
+		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to create VariantAutoscaling: %s", deployName))
 
 		By("creating InferenceModel with 0 traffic for scale-to-zero test")
 		inferenceModel = utils.CreateInferenceModel(deployName, namespace, modelID)
@@ -819,7 +817,7 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 		By("verifying VariantAutoscaling exists")
 		va := &v1alpha1.VariantAutoscaling{}
 		Eventually(func(g Gomega) {
-			err := crClient.Get(ctx, client.ObjectKey{Name: vaName, Namespace: namespace}, va)
+			err := crClient.Get(ctx, client.ObjectKey{Name: deployName, Namespace: namespace}, va)
 			g.Expect(err).NotTo(HaveOccurred(), "Should be able to get VariantAutoscaling")
 			g.Expect(va.Spec.ModelID).To(Equal(modelID), "ModelID should match")
 		}, 1*time.Minute, 5*time.Second).Should(Succeed())
@@ -884,7 +882,7 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 		By("checking VariantAutoscaling status before metric verification")
 		Eventually(func(g Gomega) {
 			va := &v1alpha1.VariantAutoscaling{}
-			err := crClient.Get(ctx, client.ObjectKey{Name: vaName, Namespace: namespace}, va)
+			err := crClient.Get(ctx, client.ObjectKey{Name: deployName, Namespace: namespace}, va)
 			g.Expect(err).NotTo(HaveOccurred(), "Should be able to get VariantAutoscaling")
 
 			_, _ = fmt.Fprintf(GinkgoWriter, "VariantAutoscaling Status: CurrentReplicas=%d, DesiredReplicas=%d, Actuation.Applied=%t\n",
@@ -919,7 +917,7 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 		Eventually(func(g Gomega) {
 			// Fetch the VariantAutoscaling CR to get actual Spec values
 			va := &v1alpha1.VariantAutoscaling{}
-			err := crClient.Get(ctx, client.ObjectKey{Name: vaName, Namespace: namespace}, va)
+			err := crClient.Get(ctx, client.ObjectKey{Name: deployName, Namespace: namespace}, va)
 			g.Expect(err).NotTo(HaveOccurred(), "Should be able to get VariantAutoscaling")
 
 			// Query metrics using the actual Spec values from the CR (like successful tests)
@@ -941,7 +939,7 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 
 		// Also verify that we can query metrics without accelerator_type and variant_id (should fail or return different results)
 		By("verifying query without all labels returns empty or different results (diagnostic)")
-		partialQuery := fmt.Sprintf("inferno_desired_replicas{variant_name=\"%s\",exported_namespace=\"%s\"}", vaName, namespace)
+		partialQuery := fmt.Sprintf("inferno_desired_replicas{variant_name=\"%s\",exported_namespace=\"%s\"}", deployName, namespace)
 		promClient, err := utils.NewPrometheusClient("https://localhost:9090", true)
 		Expect(err).NotTo(HaveOccurred())
 		ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
@@ -976,7 +974,7 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 					"type": "prometheus",
 					"metadata": map[string]interface{}{
 						"serverAddress":       "https://kube-prometheus-stack-prometheus.workload-variant-autoscaler-monitoring.svc.cluster.local:9090",
-						"query":               fmt.Sprintf("inferno_desired_replicas{variant_name=\"%s\",exported_namespace=\"%s\",accelerator_type=\"%s\",variant_id=\"%s-%s-1\"}", vaName, namespace, accelerator, modelID, accelerator),
+						"query":               fmt.Sprintf("inferno_desired_replicas{variant_name=\"%s\",exported_namespace=\"%s\",accelerator_type=\"%s\",variant_id=\"%s-%s-1\"}", deployName, namespace, accelerator, modelID, accelerator),
 						"threshold":           "1",
 						"activationThreshold": "0",
 						"metricType":          "AverageValue",
@@ -1029,7 +1027,7 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 		var desiredReplicasProm float64
 		Eventually(func(g Gomega) {
 			va := &v1alpha1.VariantAutoscaling{}
-			err := crClient.Get(ctx, client.ObjectKey{Name: vaName, Namespace: namespace}, va)
+			err := crClient.Get(ctx, client.ObjectKey{Name: deployName, Namespace: namespace}, va)
 			g.Expect(err).NotTo(HaveOccurred(), "Should be able to get VariantAutoscaling")
 
 			// Check if status has current allocation with 0 desired replicas
@@ -1101,13 +1099,13 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 		By("cleaning up VariantAutoscaling resource")
 		variantAutoscaling := &v1alpha1.VariantAutoscaling{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      vaName,
+				Name:      deployName,
 				Namespace: namespace,
 			},
 		}
 		err = crClient.Delete(ctx, variantAutoscaling)
 		err = client.IgnoreNotFound(err)
-		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to delete VariantAutoscaling: %s", vaName))
+		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to delete VariantAutoscaling: %s", deployName))
 
 		By("deleting InferenceModel")
 		err = crClient.Delete(ctx, inferenceModel)
@@ -1684,9 +1682,8 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 		deployName        string
 		serviceName       string
 		serviceMonName    string
-		configMapName     string
-		vaName            string
-		appLabel          string
+		configMapName string
+		appLabel      string
 		modelID           string
 		accelerator       string
 		ctx               context.Context
@@ -1708,7 +1705,6 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 		serviceName = "scale-to-zero-service"
 		serviceMonName = "scale-to-zero-servicemonitor"
 		configMapName = "scale-to-zero-config"
-		vaName = "scale-to-zero-va"
 		appLabel = "scale-to-zero-test"
 		modelID = "test-scale-to-zero-model"
 		accelerator = a100Acc
@@ -1753,9 +1749,9 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to create ServiceMonitor: %s", serviceMonName))
 
 		By("creating VariantAutoscaling resource")
-		variantAutoscaling := utils.CreateVariantAutoscalingResource(namespace, vaName, modelID, accelerator)
+		variantAutoscaling := utils.CreateVariantAutoscalingResource(namespace, deployName, modelID, accelerator)
 		err = crClient.Create(ctx, variantAutoscaling)
-		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to create VariantAutoscaling: %s", vaName))
+		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to create VariantAutoscaling: %s", deployName))
 
 		By("creating InferenceModel with 0 traffic for scale-to-zero test")
 		inferenceModel = utils.CreateInferenceModel(deployName, namespace, modelID)
@@ -1794,7 +1790,7 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 		By("verifying VariantAutoscaling exists")
 		va := &v1alpha1.VariantAutoscaling{}
 		Eventually(func(g Gomega) {
-			err := crClient.Get(ctx, client.ObjectKey{Name: vaName, Namespace: namespace}, va)
+			err := crClient.Get(ctx, client.ObjectKey{Name: deployName, Namespace: namespace}, va)
 			g.Expect(err).NotTo(HaveOccurred(), "Should be able to get VariantAutoscaling")
 			g.Expect(va.Spec.ModelID).To(Equal(modelID), "ModelID should match")
 		}, 1*time.Minute, 5*time.Second).Should(Succeed())
@@ -1859,7 +1855,7 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 		By("checking VariantAutoscaling status before metric verification")
 		Eventually(func(g Gomega) {
 			va := &v1alpha1.VariantAutoscaling{}
-			err := crClient.Get(ctx, client.ObjectKey{Name: vaName, Namespace: namespace}, va)
+			err := crClient.Get(ctx, client.ObjectKey{Name: deployName, Namespace: namespace}, va)
 			g.Expect(err).NotTo(HaveOccurred(), "Should be able to get VariantAutoscaling")
 
 			_, _ = fmt.Fprintf(GinkgoWriter, "VariantAutoscaling Status: CurrentReplicas=%d, DesiredReplicas=%d, Actuation.Applied=%t\n",
@@ -1894,7 +1890,7 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 		Eventually(func(g Gomega) {
 			// Fetch the VariantAutoscaling CR to get actual Spec values
 			va := &v1alpha1.VariantAutoscaling{}
-			err := crClient.Get(ctx, client.ObjectKey{Name: vaName, Namespace: namespace}, va)
+			err := crClient.Get(ctx, client.ObjectKey{Name: deployName, Namespace: namespace}, va)
 			g.Expect(err).NotTo(HaveOccurred(), "Should be able to get VariantAutoscaling")
 
 			// Query metrics using the actual Spec values from the CR (like successful tests)
@@ -1916,7 +1912,7 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 
 		// Also verify that we can query metrics without accelerator_type and variant_id (should fail or return different results)
 		By("verifying query without all labels returns empty or different results (diagnostic)")
-		partialQuery := fmt.Sprintf("inferno_desired_replicas{variant_name=\"%s\",exported_namespace=\"%s\"}", vaName, namespace)
+		partialQuery := fmt.Sprintf("inferno_desired_replicas{variant_name=\"%s\",exported_namespace=\"%s\"}", deployName, namespace)
 		promClient, err := utils.NewPrometheusClient("https://localhost:9090", true)
 		Expect(err).NotTo(HaveOccurred())
 		ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
@@ -1951,7 +1947,7 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 					"type": "prometheus",
 					"metadata": map[string]interface{}{
 						"serverAddress":       "https://kube-prometheus-stack-prometheus.workload-variant-autoscaler-monitoring.svc.cluster.local:9090",
-						"query":               fmt.Sprintf("inferno_desired_replicas{variant_name=\"%s\",exported_namespace=\"%s\",accelerator_type=\"%s\",variant_id=\"%s-%s-1\"}", vaName, namespace, accelerator, modelID, accelerator),
+						"query":               fmt.Sprintf("inferno_desired_replicas{variant_name=\"%s\",exported_namespace=\"%s\",accelerator_type=\"%s\",variant_id=\"%s-%s-1\"}", deployName, namespace, accelerator, modelID, accelerator),
 						"threshold":           "1",
 						"activationThreshold": "0",
 						"metricType":          "AverageValue",
@@ -2004,7 +2000,7 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 		var desiredReplicasProm float64
 		Eventually(func(g Gomega) {
 			va := &v1alpha1.VariantAutoscaling{}
-			err := crClient.Get(ctx, client.ObjectKey{Name: vaName, Namespace: namespace}, va)
+			err := crClient.Get(ctx, client.ObjectKey{Name: deployName, Namespace: namespace}, va)
 			g.Expect(err).NotTo(HaveOccurred(), "Should be able to get VariantAutoscaling")
 
 			// Check if status has current allocation with 0 desired replicas
@@ -2076,13 +2072,13 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 		By("cleaning up VariantAutoscaling resource")
 		variantAutoscaling := &v1alpha1.VariantAutoscaling{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      vaName,
+				Name:      deployName,
 				Namespace: namespace,
 			},
 		}
 		err = crClient.Delete(ctx, variantAutoscaling)
 		err = client.IgnoreNotFound(err)
-		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to delete VariantAutoscaling: %s", vaName))
+		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to delete VariantAutoscaling: %s", deployName))
 
 		By("deleting InferenceModel")
 		err = crClient.Delete(ctx, inferenceModel)
