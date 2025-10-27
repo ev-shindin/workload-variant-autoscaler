@@ -179,7 +179,7 @@ func (r *VariantAutoscalingReconciler) Reconcile(ctx context.Context, req ctrl.R
 		// Safely get VA from map with nil check
 		va, ok := vaMap[s.Name()]
 		if !ok || va == nil {
-			logger.Log.Error(nil, "VA not found in map for server", "serverName", s.Name())
+			logger.Log.Warn("VA not found in map for server", "serverName", s.Name())
 			continue
 		}
 
@@ -219,8 +219,24 @@ func (r *VariantAutoscalingReconciler) Reconcile(ctx context.Context, req ctrl.R
 
 	logger.Log.Debug("Optimization completed successfully, emitting optimization metrics")
 	logger.Log.Debug("Optimized allocation map - ", "numKeys: ", len(optimizedAllocation), ", updateList_count: ", len(updateList.Items))
-	for key, value := range optimizedAllocation {
-		logger.Log.Debug("Optimized allocation entry - ", "key: ", key, ", value: ", value)
+
+	// Validate optimizer returned results for all variants
+	if len(optimizedAllocation) > 0 && len(optimizedAllocation) < len(updateList.Items) {
+		logger.Log.Warnw("Optimizer returned partial results - some variants will use fallback allocation",
+			"expected", len(updateList.Items),
+			"received", len(optimizedAllocation),
+			"missing", len(updateList.Items)-len(optimizedAllocation))
+
+		// Log which variants are missing
+		missingVariants := make([]string, 0)
+		for i := range updateList.Items {
+			if _, found := optimizedAllocation[updateList.Items[i].Name]; !found {
+				missingVariants = append(missingVariants, updateList.Items[i].Name)
+			}
+		}
+		if len(missingVariants) > 0 {
+			logger.Log.Debug("Variants missing from optimizer results", "variants", missingVariants)
+		}
 	}
 
 	if err := r.applyOptimizedAllocations(ctx, updateList, optimizedAllocation, allAnalyzerResponses); err != nil {
@@ -383,6 +399,34 @@ func max(a, b int32) int32 {
 	return b
 }
 
+// addVariantWithFallback is a helper function that safely fetches the latest VA and adds it with fallback allocation.
+// If the fetch fails, it uses the provided VA object as fallback to ensure metrics are always emitted.
+func (r *VariantAutoscalingReconciler) addVariantWithFallback(
+	ctx context.Context,
+	va llmdVariantAutoscalingV1alpha1.VariantAutoscaling,
+	deploy *appsv1.Deployment,
+	reason string,
+	message string,
+	updateList *llmdVariantAutoscalingV1alpha1.VariantAutoscalingList,
+	allVariants []llmdVariantAutoscalingV1alpha1.VariantAutoscaling,
+	scaleToZeroConfigData utils.ScaleToZeroConfigData,
+	aggregateLoad *float64,
+) {
+	// Try to get fresh copy of VA, but use original if fetch fails
+	var updateVA llmdVariantAutoscalingV1alpha1.VariantAutoscaling
+	if err := utils.GetVariantAutoscalingWithBackoff(ctx, r.Client, va.Name, va.Namespace, &updateVA); err != nil {
+		logger.Log.Warn("Failed to fetch fresh VA for fallback, using original object",
+			"variant", va.Name,
+			"namespace", va.Namespace,
+			"error", err)
+		updateVA = va
+	}
+
+	isCheapest := isCheapestVariantForModel(&updateVA, allVariants, va.Spec.ModelID)
+	addVariantWithFallbackAllocation(&updateVA, deploy, reason, message, updateList,
+		scaleToZeroConfigData, va.Spec.ModelID, aggregateLoad, isCheapest)
+}
+
 // isCheapestVariantForModel determines if the given variant is the cheapest among all variants for the same model.
 // Cheapest is determined by accelerator count (fewer accelerators = cheaper).
 func isCheapestVariantForModel(
@@ -433,38 +477,20 @@ func (r *VariantAutoscalingReconciler) prepareVariantAutoscalings(
 		modelName := va.Spec.ModelID
 		if modelName == "" {
 			logger.Log.Warn("variantAutoscaling missing modelName, using fallback allocation for metric emission - ", "variantAutoscaling-name: ", va.Name)
-			// Get the VA to emit fallback metrics
-			var updateVA llmdVariantAutoscalingV1alpha1.VariantAutoscaling
-			if err := utils.GetVariantAutoscalingWithBackoff(ctx, r.Client, va.Name, va.Namespace, &updateVA); err == nil {
-				isCheapest := isCheapestVariantForModel(&updateVA, activeVAs, modelName)
-				addVariantWithFallbackAllocation(&updateVA, nil,
-					llmdVariantAutoscalingV1alpha1.ReasonOptimizationFailed,
-					"ModelID is empty - cannot optimize",
-					&updateList,
-					scaleToZeroConfigData,
-					modelName,
-					nil, // No aggregate load available
-					isCheapest)
-			}
+			r.addVariantWithFallback(ctx, va, nil,
+				llmdVariantAutoscalingV1alpha1.ReasonOptimizationFailed,
+				"ModelID is empty - cannot optimize",
+				&updateList, activeVAs, scaleToZeroConfigData, nil)
 			continue
 		}
 
 		entry, className, err := utils.FindModelSLO(serviceClassCm, modelName)
 		if err != nil {
 			logger.Log.Error(err, "failed to locate SLO for model, using fallback allocation for metric emission - ", "variantAutoscaling-name: ", va.Name, "modelName: ", modelName)
-			// Get the VA to emit fallback metrics
-			var updateVA llmdVariantAutoscalingV1alpha1.VariantAutoscaling
-			if err := utils.GetVariantAutoscalingWithBackoff(ctx, r.Client, va.Name, va.Namespace, &updateVA); err == nil {
-				isCheapest := isCheapestVariantForModel(&updateVA, activeVAs, modelName)
-				addVariantWithFallbackAllocation(&updateVA, nil,
-					llmdVariantAutoscalingV1alpha1.ReasonOptimizationFailed,
-					fmt.Sprintf("SLO not found for model %s", modelName),
-					&updateList,
-					scaleToZeroConfigData,
-					modelName,
-					nil, // No aggregate load available
-					isCheapest)
-			}
+			r.addVariantWithFallback(ctx, va, nil,
+				llmdVariantAutoscalingV1alpha1.ReasonOptimizationFailed,
+				fmt.Sprintf("SLO not found for model %s", modelName),
+				&updateList, activeVAs, scaleToZeroConfigData, nil)
 			continue
 		}
 		logger.Log.Info("Found SLO for model - ", "model: ", modelName, ", class: ", className, ", slo-tpot: ", entry.SLOTPOT, ", slo-ttft: ", entry.SLOTTFT)
@@ -475,19 +501,10 @@ func (r *VariantAutoscalingReconciler) prepareVariantAutoscalings(
 			va.Spec.AcceleratorCount,
 			&va.Spec.VariantProfile); err != nil {
 			logger.Log.Error(err, "failed to add variant profile to system data, using fallback allocation for metric emission", "variantAutoscaling", va.Name)
-			// Get the VA to emit fallback metrics
-			var updateVA llmdVariantAutoscalingV1alpha1.VariantAutoscaling
-			if err := utils.GetVariantAutoscalingWithBackoff(ctx, r.Client, va.Name, va.Namespace, &updateVA); err == nil {
-				isCheapest := isCheapestVariantForModel(&updateVA, activeVAs, modelName)
-				addVariantWithFallbackAllocation(&updateVA, nil,
-					llmdVariantAutoscalingV1alpha1.ReasonOptimizationFailed,
-					"Failed to add variant profile to system data",
-					&updateList,
-					scaleToZeroConfigData,
-					modelName,
-					nil, // No aggregate load available
-					isCheapest)
-			}
+			r.addVariantWithFallback(ctx, va, nil,
+				llmdVariantAutoscalingV1alpha1.ReasonOptimizationFailed,
+				"Failed to add variant profile to system data",
+				&updateList, activeVAs, scaleToZeroConfigData, nil)
 			continue
 		}
 
@@ -495,19 +512,10 @@ func (r *VariantAutoscalingReconciler) prepareVariantAutoscalings(
 		err = utils.GetDeploymentWithBackoff(ctx, r.Client, va.Name, va.Namespace, &deploy)
 		if err != nil {
 			logger.Log.Error(err, "failed to get Deployment after retries, using fallback allocation for metric emission - ", "variantAutoscaling-name: ", va.Name)
-			// Get the VA to emit fallback metrics (deployment not found, so use 0 replicas)
-			var updateVA llmdVariantAutoscalingV1alpha1.VariantAutoscaling
-			if err := utils.GetVariantAutoscalingWithBackoff(ctx, r.Client, va.Name, va.Namespace, &updateVA); err == nil {
-				isCheapest := isCheapestVariantForModel(&updateVA, activeVAs, modelName)
-				addVariantWithFallbackAllocation(&updateVA, nil,
-					llmdVariantAutoscalingV1alpha1.ReasonOptimizationFailed,
-					"Deployment not found - using 0 replicas as fallback",
-					&updateList,
-					scaleToZeroConfigData,
-					modelName,
-					nil, // No aggregate load available
-					isCheapest)
-			}
+			r.addVariantWithFallback(ctx, va, nil,
+				llmdVariantAutoscalingV1alpha1.ReasonOptimizationFailed,
+				"Deployment not found - using 0 replicas as fallback",
+				&updateList, activeVAs, scaleToZeroConfigData, nil)
 			continue
 		}
 
@@ -689,6 +697,9 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 	// Create actuator once and reuse for all variants (more efficient)
 	act := actuator.NewActuator(r.Client)
 
+	// Collect status update errors to report at the end
+	var statusUpdateErrors []error
+
 	for i := range updateList.Items {
 		va := &updateList.Items[i]
 		optimizedAlloc, hasOptimizedAlloc := optimizedAllocation[va.Name]
@@ -828,11 +839,20 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 
 		if err := utils.UpdateStatusWithBackoff(ctx, r.Client, &updateVa, utils.StandardBackoff, "VariantAutoscaling"); err != nil {
 			logger.Log.Error(err, "failed to patch status for variantAutoscaling after retries - ", "variantAutoscaling-name: ", updateVa.Name)
+			statusUpdateErrors = append(statusUpdateErrors, fmt.Errorf("variant %s/%s: %w", updateVa.Namespace, updateVa.Name, err))
 			continue
 		}
 	}
 
 	logger.Log.Debug("Completed variant processing loop")
+
+	// Return error if any status updates failed
+	if len(statusUpdateErrors) > 0 {
+		logger.Log.Warnw("Some variant status updates failed",
+			"failedCount", len(statusUpdateErrors),
+			"totalCount", len(updateList.Items))
+		return fmt.Errorf("failed to update status for %d variant(s): %v", len(statusUpdateErrors), statusUpdateErrors)
+	}
 
 	// Log summary of reconciliation
 	if len(updateList.Items) > 0 {
