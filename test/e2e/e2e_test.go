@@ -1227,32 +1227,7 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 		_, _ = fmt.Fprintf(GinkgoWriter, "Waiting 60 seconds for pip install and traffic to start...\n")
 		time.Sleep(60 * time.Second)
 
-		By("waiting for Prometheus to scrape vLLM metrics")
-		_, _ = fmt.Fprintf(GinkgoWriter, "Waiting 30 seconds for Prometheus to scrape vLLM metrics...\n")
-		time.Sleep(30 * time.Second)
-
-		By("verifying traffic is flowing from vLLM to Prometheus before resuming KEDA")
-		Eventually(func(g Gomega) {
-			promClient, err2 := utils.NewPrometheusClient("https://localhost:9090", true)
-			g.Expect(err2).NotTo(HaveOccurred(), "Should be able to create Prometheus client")
-
-			// Check if vLLM is exposing request metrics that Prometheus is scraping
-			query := fmt.Sprintf(`rate(vllm_request_success_total{model_name="%s",namespace="%s"}[30s])`, modelID, namespace)
-			ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel2()
-			result, err2 := promClient.QueryWithRetry(ctx2, query)
-			if err2 != nil {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Traffic verification failed (will retry): %v\n", err2)
-				g.Expect(err2).NotTo(HaveOccurred())
-			}
-
-			_, _ = fmt.Fprintf(GinkgoWriter, "vLLM traffic rate: %.2f req/s (query: %s)\n", result, query)
-			g.Expect(result).To(BeNumerically(">", 0), "Traffic should be flowing from vLLM to Prometheus")
-		}, 2*time.Minute, 5*time.Second).Should(Succeed())
-
-		_, _ = fmt.Fprintf(GinkgoWriter, "✓ Traffic verified - vLLM → Prometheus pipeline is working\n")
-
-		By("resuming KEDA scaling now that traffic is confirmed")
+		By("resuming KEDA scaling")
 		// Remove paused annotation
 		err = crClient.Get(ctx, client.ObjectKey{Name: scaledObjectName, Namespace: namespace}, scaledObject)
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to get ScaledObject: %s", scaledObjectName))
@@ -1262,7 +1237,29 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 		err = crClient.Update(ctx, scaledObject)
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to resume ScaledObject: %s", scaledObjectName))
 
-		By("continuing traffic generation for 30 seconds to establish non-zero request count")
+		By("verifying controller sees traffic and updates VA status (confirms vLLM→Prometheus→Controller pipeline)")
+		Eventually(func(g Gomega) {
+			va := &v1alpha1.VariantAutoscaling{}
+			err := crClient.Get(ctx, client.ObjectKey{Name: deployName, Namespace: namespace}, va)
+			g.Expect(err).NotTo(HaveOccurred(), "Should be able to get VariantAutoscaling")
+
+			_, _ = fmt.Fprintf(GinkgoWriter, "VA Status: DesiredOptimized=%d, Current=%d, Actuation.Applied=%t\n",
+				va.Status.DesiredOptimizedAlloc.NumReplicas,
+				va.Status.CurrentAlloc.NumReplicas,
+				va.Status.Actuation.Applied)
+
+			// Verify controller has processed traffic and set desired replicas > 0
+			g.Expect(va.Status.DesiredOptimizedAlloc.NumReplicas).To(BeNumerically(">", 0),
+				"Controller should see traffic and recommend replicas > 0 (proves vLLM→Prometheus→Controller works)")
+
+			// Verify metrics were emitted
+			g.Expect(va.Status.Actuation.Applied).To(BeTrue(),
+				"Controller should have emitted metrics (Actuation.Applied=true)")
+		}, 3*time.Minute, 10*time.Second).Should(Succeed())
+
+		_, _ = fmt.Fprintf(GinkgoWriter, "✓ Controller is seeing traffic - full pipeline verified\n")
+
+		By("continuing traffic generation for 30 seconds to establish stable non-zero request count")
 		_, _ = fmt.Fprintf(GinkgoWriter, "Continuing traffic at %d req/s for 30 seconds...\n", loadRate)
 		time.Sleep(30 * time.Second)
 
