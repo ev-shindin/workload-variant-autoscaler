@@ -1030,6 +1030,15 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 			err := crClient.Get(ctx, client.ObjectKey{Name: deployName, Namespace: namespace}, va)
 			g.Expect(err).NotTo(HaveOccurred(), "Should be able to get VariantAutoscaling")
 
+			// Debug output to understand the flow
+			_, _ = fmt.Fprintf(GinkgoWriter, "VA Status: DesiredOptimized=%d, Current=%d\n",
+				va.Status.DesiredOptimizedAlloc.NumReplicas,
+				va.Status.CurrentAlloc.NumReplicas)
+
+			// First check if optimizer recommended 0
+			g.Expect(va.Status.DesiredOptimizedAlloc.NumReplicas).To(Equal(int32(0)),
+				"Optimizer should recommend 0 replicas for scale-to-zero scenario")
+
 			// Check if status has current allocation with 0 desired replicas
 			if va.Status.CurrentAlloc.NumReplicas == 0 {
 				_, _ = fmt.Fprintf(GinkgoWriter, "✓ Controller set desiredReplicas to 0 in VariantAutoscaling status\n")
@@ -2002,6 +2011,15 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 			va := &v1alpha1.VariantAutoscaling{}
 			err := crClient.Get(ctx, client.ObjectKey{Name: deployName, Namespace: namespace}, va)
 			g.Expect(err).NotTo(HaveOccurred(), "Should be able to get VariantAutoscaling")
+
+			// Debug output to understand the flow
+			_, _ = fmt.Fprintf(GinkgoWriter, "VA Status: DesiredOptimized=%d, Current=%d\n",
+				va.Status.DesiredOptimizedAlloc.NumReplicas,
+				va.Status.CurrentAlloc.NumReplicas)
+
+			// First check if optimizer recommended 0
+			g.Expect(va.Status.DesiredOptimizedAlloc.NumReplicas).To(Equal(int32(0)),
+				"Optimizer should recommend 0 replicas for scale-to-zero scenario")
 
 			// Check if status has current allocation with 0 desired replicas
 			if va.Status.CurrentAlloc.NumReplicas == 0 {
