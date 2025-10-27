@@ -474,6 +474,15 @@ func (r *VariantAutoscalingReconciler) prepareVariantAutoscalings(
 	vaMap := make(map[string]*llmdVariantAutoscalingV1alpha1.VariantAutoscaling)
 
 	for _, va := range activeVAs {
+		// Check for context cancellation to enable graceful shutdown
+		select {
+		case <-ctx.Done():
+			logger.Log.Info("Context cancelled during variant preparation, stopping early")
+			return &updateList, vaMap, allAnalyzerResponses, ctx.Err()
+		default:
+			// Continue processing
+		}
+
 		modelName := va.Spec.ModelID
 		if modelName == "" {
 			logger.Log.Warn("variantAutoscaling missing modelName, using fallback allocation for metric emission - ", "variantAutoscaling-name: ", va.Name)
@@ -701,6 +710,15 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 	var statusUpdateErrors []error
 
 	for i := range updateList.Items {
+		// Check for context cancellation to enable graceful shutdown
+		select {
+		case <-ctx.Done():
+			logger.Log.Info("Context cancelled during variant allocation, stopping early")
+			return ctx.Err()
+		default:
+			// Continue processing
+		}
+
 		va := &updateList.Items[i]
 		optimizedAlloc, hasOptimizedAlloc := optimizedAllocation[va.Name]
 		logger.Log.Debug("Processing variant - ", "index: ", i, ", variantAutoscaling-name: ", va.Name, ", namespace: ", va.Namespace, ", has_optimized_alloc: ", hasOptimizedAlloc)
@@ -808,13 +826,20 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 
 		updateVa.Status.Actuation.Applied = false // No longer directly applying changes
 
-		// Copy existing conditions from updateList (includes MetricsAvailable and OptimizationReady conditions set during preparation)
-		// This ensures we don't lose conditions when fetching fresh copy from API
-		// Always copy, even if empty, to preserve conditions set during prepareVariantAutoscalings
-		updateVa.Status.Conditions = va.Status.Conditions
+		// Selectively copy conditions set during preparation to avoid overwriting other conditions
+		// This preserves MetricsAvailable and OptimizationReady from preparation phase
+		// while keeping any other conditions that may have been set externally
+		for _, condType := range []string{
+			llmdVariantAutoscalingV1alpha1.TypeMetricsAvailable,
+			llmdVariantAutoscalingV1alpha1.TypeOptimizationReady,
+		} {
+			if cond := llmdVariantAutoscalingV1alpha1.GetCondition(va, condType); cond != nil {
+				llmdVariantAutoscalingV1alpha1.SetCondition(&updateVa,
+					condType, cond.Status, cond.Reason, cond.Message)
+			}
+		}
 
-		// Set OptimizationReady condition only if we have optimized allocation
-		// If using fallback, preserve the condition set by addVariantWithFallbackAllocation
+		// Override OptimizationReady if we have fresh optimized allocation
 		if hasOptimizedAlloc {
 			desiredAlloc := updateVa.Status.DesiredOptimizedAlloc
 			llmdVariantAutoscalingV1alpha1.SetCondition(&updateVa,
@@ -825,8 +850,6 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 					desiredAlloc.NumReplicas,
 					updateVa.Spec.Accelerator)) // Use spec field (single-variant architecture)
 		}
-		// Note: If !hasOptimizedAlloc, the OptimizationReady condition was already set
-		// by addVariantWithFallbackAllocation with specific reason (e.g., "Metrics unavailable", "Deployment not found")
 
 		// ALWAYS emit optimization signals for external autoscalers (KEDA, HPA, etc.)
 		// This is critical for scale-to-zero scenarios where metrics must exist even with no traffic

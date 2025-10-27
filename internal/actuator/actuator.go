@@ -68,11 +68,10 @@ func (a *Actuator) EmitMetrics(ctx context.Context, VariantAutoscaling *llmdOptv
 			VariantAutoscaling.Spec.Accelerator,                                // Use spec field (single-variant architecture)
 			VariantAutoscaling.Spec.VariantID,                                  // Use spec field (single-variant architecture)
 		); err != nil {
-			logger.Log.Error(err, "Failed to emit optimization signals for variantAutoscaling - ",
-				"variantAutoscaling-name: ", VariantAutoscaling.Name)
-			// Don't fail the reconciliation for metric emission errors
-			// Metrics are critical for HPA, but emission failures shouldn't break core functionality
-			return nil
+			logger.Log.Error(err, "Failed to emit optimization signals - this will break HPA/KEDA autoscaling",
+				"variant", VariantAutoscaling.Name)
+			// Return error - metrics are critical for HPA/KEDA functionality
+			return fmt.Errorf("critical metric emission failed for %s: %w", VariantAutoscaling.Name, err)
 		}
 		logger.Log.Debug("EmitReplicaMetrics completed for ", "variantAutoscaling-name: ", VariantAutoscaling.Name, ", current-replicas: ", VariantAutoscaling.Status.CurrentAlloc.NumReplicas, ", desired-replicas: ", VariantAutoscaling.Status.DesiredOptimizedAlloc.NumReplicas, ", accelerator: ", VariantAutoscaling.Spec.Accelerator)
 		return nil
