@@ -357,6 +357,11 @@ func AddMetricsToOptStatus(ctx context.Context,
 			TotalRequestsOverRetentionPeriod: totalRequestsOverRetention,
 			RetentionPeriod:                  retentionPeriod,
 		})
+		logger.Log.Info("Cached scale-to-zero metrics",
+			"modelName", modelName,
+			"totalRequestsOverRetention", totalRequestsOverRetention,
+			"retentionPeriod", retentionPeriod,
+			"query", totalRequestsQuery)
 	}
 
 	// number of replicas

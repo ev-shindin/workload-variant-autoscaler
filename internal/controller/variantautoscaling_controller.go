@@ -827,17 +827,19 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 		// This ensures metrics are always emitted, even for zero-traffic scenarios
 		if hasOptimizedAlloc {
 			updateVa.Status.DesiredOptimizedAlloc = optimizedAlloc
-			logger.Log.Debug("Using optimized allocation",
+			logger.Log.Info("Using optimized allocation from optimizer",
 				"variantName", va.Name,
-				"replicas", optimizedAlloc.NumReplicas)
+				"currentReplicas", updateVa.Status.CurrentAlloc.NumReplicas,
+				"desiredReplicas", optimizedAlloc.NumReplicas)
 		} else {
 			// Check if fallback allocation was set in updateList (from addVariantWithFallbackAllocation)
 			if va.Status.DesiredOptimizedAlloc.NumReplicas >= 0 || !va.Status.DesiredOptimizedAlloc.LastRunTime.IsZero() {
 				// Use the fallback allocation that was computed during preparation
 				updateVa.Status.DesiredOptimizedAlloc = va.Status.DesiredOptimizedAlloc
-				logger.Log.Debug("Using fallback allocation from preparation phase",
+				logger.Log.Info("Using fallback allocation from preparation phase",
 					"variantName", va.Name,
-					"replicas", va.Status.DesiredOptimizedAlloc.NumReplicas)
+					"currentReplicas", va.Status.CurrentAlloc.NumReplicas,
+					"desiredReplicas", va.Status.DesiredOptimizedAlloc.NumReplicas)
 			} else {
 				// No optimization and no fallback - use 0 replicas as last resort
 				updateVa.Status.DesiredOptimizedAlloc = llmdVariantAutoscalingV1alpha1.OptimizedAlloc{

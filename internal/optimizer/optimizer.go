@@ -188,6 +188,13 @@ func (engine *VariantAutoscalingsEngine) applyZeroRateHandling(
 		if scaleToZeroCache != nil {
 			if metrics, exists := scaleToZeroCache.Get(modelID); exists {
 				totalRequests = metrics.TotalRequestsOverRetentionPeriod
+				logger.Log.Info("Scale-to-zero cache hit",
+					"modelID", modelID,
+					"totalRequestsOverRetention", totalRequests,
+					"retentionPeriod", metrics.RetentionPeriod)
+			} else {
+				logger.Log.Info("Scale-to-zero cache miss - no metrics found",
+					"modelID", modelID)
 			}
 		}
 
@@ -199,6 +206,12 @@ func (engine *VariantAutoscalingsEngine) applyZeroRateHandling(
 
 		// Determine if we should keep at least one replica
 		shouldKeepOneReplica := !scaleToZeroEnabled || totalRequests > 0
+
+		logger.Log.Info("Scale-to-zero decision",
+			"modelID", modelID,
+			"scaleToZeroEnabled", scaleToZeroEnabled,
+			"totalRequests", totalRequests,
+			"shouldKeepOneReplica", shouldKeepOneReplica)
 
 		if !shouldKeepOneReplica {
 			// Scale all variants to zero
