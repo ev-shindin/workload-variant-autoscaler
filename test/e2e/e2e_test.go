@@ -1123,6 +1123,33 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 
 		By("ensuring deployment is scaled up before traffic generation")
 		// Previous test may have scaled to 0, so we need to scale back up
+		// However, KEDA will immediately scale it back down to 0 if desired replicas is 0
+		// Solution: Temporarily pause KEDA scaling
+
+		scaledObjectName := deployName + "-scaler"
+		scaledObject := &unstructured.Unstructured{}
+		scaledObject.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "keda.sh",
+			Version: "v1alpha1",
+			Kind:    "ScaledObject",
+		})
+		err := crClient.Get(ctx, client.ObjectKey{Name: scaledObjectName, Namespace: namespace}, scaledObject)
+		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to get ScaledObject: %s", scaledObjectName))
+
+		By("pausing KEDA scaling to allow manual scale-up")
+		// Add paused annotation to prevent KEDA from scaling
+		annotations := scaledObject.GetAnnotations()
+		if annotations == nil {
+			annotations = make(map[string]string)
+		}
+		annotations["autoscaling.keda.sh/paused"] = "true"
+		scaledObject.SetAnnotations(annotations)
+		err = crClient.Update(ctx, scaledObject)
+		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to pause ScaledObject: %s", scaledObjectName))
+
+		// Ensure KEDA processes the pause annotation
+		time.Sleep(5 * time.Second)
+
 		deployment, err := k8sClient.AppsV1().Deployments(namespace).Get(ctx, deployName, metav1.GetOptions{})
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to get Deployment: %s", deployName))
 
@@ -1140,6 +1167,16 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 			g.Expect(deployment.Status.ReadyReplicas).To(BeNumerically(">=", 1),
 				"Deployment should have at least 1 ready replica before port-forwarding")
 		}, 8*time.Minute, 10*time.Second).Should(Succeed())
+
+		By("resuming KEDA scaling after deployment is ready")
+		// Remove paused annotation
+		err = crClient.Get(ctx, client.ObjectKey{Name: scaledObjectName, Namespace: namespace}, scaledObject)
+		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to get ScaledObject: %s", scaledObjectName))
+		annotations = scaledObject.GetAnnotations()
+		delete(annotations, "autoscaling.keda.sh/paused")
+		scaledObject.SetAnnotations(annotations)
+		err = crClient.Update(ctx, scaledObject)
+		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to resume ScaledObject: %s", scaledObjectName))
 
 		By("setting up port-forward to the vllme service for traffic generation")
 		port := 8001 // Use different port to avoid conflict with other tests
