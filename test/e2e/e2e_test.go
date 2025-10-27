@@ -1178,6 +1178,25 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 		err = crClient.Update(ctx, scaledObject)
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to resume ScaledObject: %s", scaledObjectName))
 
+		By("waiting for service endpoints to be ready for port-forwarding")
+		Eventually(func(g Gomega) {
+			endpoints, err := k8sClient.CoreV1().Endpoints(namespace).Get(ctx, serviceName, metav1.GetOptions{})
+			g.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to get Endpoints for service: %s", serviceName))
+
+			// Check if endpoints has at least one ready address
+			hasReadyEndpoint := false
+			for _, subset := range endpoints.Subsets {
+				if len(subset.Addresses) > 0 {
+					hasReadyEndpoint = true
+					_, _ = fmt.Fprintf(GinkgoWriter, "Service endpoints ready: %d addresses, %d ports\n", len(subset.Addresses), len(subset.Ports))
+					break
+				}
+			}
+
+			g.Expect(hasReadyEndpoint).To(BeTrue(),
+				"Service should have at least one ready endpoint for port-forwarding")
+		}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
 		By("setting up port-forward to the vllme service for traffic generation")
 		port := 8001 // Use different port to avoid conflict with other tests
 		portForwardCmd := utils.SetUpPortForward(k8sClient, ctx, serviceName, namespace, port, 80)
