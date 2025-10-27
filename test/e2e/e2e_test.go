@@ -709,8 +709,8 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 		deployName        string
 		serviceName       string
 		serviceMonName    string
-		configMapName string
-		appLabel      string
+		configMapName     string
+		appLabel          string
 		modelID           string
 		accelerator       string
 		ctx               context.Context
@@ -886,7 +886,7 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 			g.Expect(err).NotTo(HaveOccurred(), "Should be able to get VariantAutoscaling")
 
 			_, _ = fmt.Fprintf(GinkgoWriter, "VariantAutoscaling Status: CurrentReplicas=%d, DesiredReplicas=%d, Actuation.Applied=%t\n",
-			va.Status.CurrentAlloc.NumReplicas, va.Status.DesiredOptimizedAlloc.NumReplicas, va.Status.Actuation.Applied)
+				va.Status.CurrentAlloc.NumReplicas, va.Status.DesiredOptimizedAlloc.NumReplicas, va.Status.Actuation.Applied)
 			_, _ = fmt.Fprintf(GinkgoWriter, "VariantAutoscaling Spec: Accelerator=%q, VariantID=%q, ModelID=%q\n",
 				va.Spec.Accelerator, va.Spec.VariantID, va.Spec.ModelID)
 
@@ -895,9 +895,9 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 				_, _ = fmt.Fprintf(GinkgoWriter, "⚠ WARNING: DesiredOptimizedAlloc.NumReplicas=%d is negative - metrics will NOT be emitted!\n",
 					va.Status.DesiredOptimizedAlloc.NumReplicas)
 			} else if !va.Status.Actuation.Applied {
-					_, _ = fmt.Fprintf(GinkgoWriter, "⚠ WARNING: Actuation.Applied=false - metrics have NOT been emitted yet!\n")
+				_, _ = fmt.Fprintf(GinkgoWriter, "⚠ WARNING: Actuation.Applied=false - metrics have NOT been emitted yet!\n")
 			} else {
-					_, _ = fmt.Fprintf(GinkgoWriter, "✓ Metric emission condition satisfied (DesiredReplicas >= 0, Actuation.Applied=true)\n")
+				_, _ = fmt.Fprintf(GinkgoWriter, "✓ Metric emission condition satisfied (DesiredReplicas >= 0, Actuation.Applied=true)\n")
 			}
 
 			// CRITICAL: Wait for Actuation.Applied to be true, confirming EmitMetrics succeeded
@@ -1022,6 +1022,22 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 		By("waiting for retention period to pass with zero traffic")
 		_, _ = fmt.Fprintf(GinkgoWriter, "Waiting %v for retention period (no traffic simulated)...\n", retentionDuration)
 		time.Sleep(retentionDuration + 30*time.Second) // Add buffer for controller reconciliation
+
+		By("checking totalRequests from Prometheus (what optimizer sees)")
+		totalRequestsQuery := fmt.Sprintf(`sum(increase(vllm_request_success_total{model_name="%s",namespace="%s"}[2m]))`, modelID, namespace)
+		promClient2, err2 := utils.NewPrometheusClient("https://localhost:9090", true)
+		Expect(err2).NotTo(HaveOccurred())
+		ctx3, cancel3 := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel3()
+		totalRequests, err2 := promClient2.QueryWithRetry(ctx3, totalRequestsQuery)
+		if err2 != nil {
+			_, _ = fmt.Fprintf(GinkgoWriter, "⚠ Failed to query totalRequests: %v\n", err2)
+		} else {
+			_, _ = fmt.Fprintf(GinkgoWriter, "📊 totalRequests over retention period: %.0f (query: %s)\n", totalRequests, totalRequestsQuery)
+			if totalRequests > 0 {
+				_, _ = fmt.Fprintf(GinkgoWriter, "⚠ WARNING: totalRequests > 0 - optimizer will keep 1 replica even with zero user traffic!\n")
+			}
+		}
 
 		By("verifying controller sets desiredReplicas to 0 in VariantAutoscaling status")
 		var desiredReplicasProm float64
@@ -1777,8 +1793,8 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 		deployName        string
 		serviceName       string
 		serviceMonName    string
-		configMapName string
-		appLabel      string
+		configMapName     string
+		appLabel          string
 		modelID           string
 		accelerator       string
 		ctx               context.Context
@@ -1954,7 +1970,7 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 			g.Expect(err).NotTo(HaveOccurred(), "Should be able to get VariantAutoscaling")
 
 			_, _ = fmt.Fprintf(GinkgoWriter, "VariantAutoscaling Status: CurrentReplicas=%d, DesiredReplicas=%d, Actuation.Applied=%t\n",
-			va.Status.CurrentAlloc.NumReplicas, va.Status.DesiredOptimizedAlloc.NumReplicas, va.Status.Actuation.Applied)
+				va.Status.CurrentAlloc.NumReplicas, va.Status.DesiredOptimizedAlloc.NumReplicas, va.Status.Actuation.Applied)
 			_, _ = fmt.Fprintf(GinkgoWriter, "VariantAutoscaling Spec: Accelerator=%q, VariantID=%q, ModelID=%q\n",
 				va.Spec.Accelerator, va.Spec.VariantID, va.Spec.ModelID)
 
@@ -1963,9 +1979,9 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 				_, _ = fmt.Fprintf(GinkgoWriter, "⚠ WARNING: DesiredOptimizedAlloc.NumReplicas=%d is negative - metrics will NOT be emitted!\n",
 					va.Status.DesiredOptimizedAlloc.NumReplicas)
 			} else if !va.Status.Actuation.Applied {
-					_, _ = fmt.Fprintf(GinkgoWriter, "⚠ WARNING: Actuation.Applied=false - metrics have NOT been emitted yet!\n")
+				_, _ = fmt.Fprintf(GinkgoWriter, "⚠ WARNING: Actuation.Applied=false - metrics have NOT been emitted yet!\n")
 			} else {
-					_, _ = fmt.Fprintf(GinkgoWriter, "✓ Metric emission condition satisfied (DesiredReplicas >= 0, Actuation.Applied=true)\n")
+				_, _ = fmt.Fprintf(GinkgoWriter, "✓ Metric emission condition satisfied (DesiredReplicas >= 0, Actuation.Applied=true)\n")
 			}
 
 			// CRITICAL: Wait for Actuation.Applied to be true, confirming EmitMetrics succeeded
@@ -2090,6 +2106,22 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 		By("waiting for retention period to pass with zero traffic")
 		_, _ = fmt.Fprintf(GinkgoWriter, "Waiting %v for retention period (no traffic simulated)...\n", retentionDuration)
 		time.Sleep(retentionDuration + 30*time.Second) // Add buffer for controller reconciliation
+
+		By("checking totalRequests from Prometheus (what optimizer sees)")
+		totalRequestsQuery := fmt.Sprintf(`sum(increase(vllm_request_success_total{model_name="%s",namespace="%s"}[2m]))`, modelID, namespace)
+		promClient2, err2 := utils.NewPrometheusClient("https://localhost:9090", true)
+		Expect(err2).NotTo(HaveOccurred())
+		ctx3, cancel3 := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel3()
+		totalRequests, err2 := promClient2.QueryWithRetry(ctx3, totalRequestsQuery)
+		if err2 != nil {
+			_, _ = fmt.Fprintf(GinkgoWriter, "⚠ Failed to query totalRequests: %v\n", err2)
+		} else {
+			_, _ = fmt.Fprintf(GinkgoWriter, "📊 totalRequests over retention period: %.0f (query: %s)\n", totalRequests, totalRequestsQuery)
+			if totalRequests > 0 {
+				_, _ = fmt.Fprintf(GinkgoWriter, "⚠ WARNING: totalRequests > 0 - optimizer will keep 1 replica even with zero user traffic!\n")
+			}
+		}
 
 		By("verifying controller sets desiredReplicas to 0 in VariantAutoscaling status")
 		var desiredReplicasProm float64
