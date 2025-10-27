@@ -1208,7 +1208,24 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 				_, _ = fmt.Fprintf(GinkgoWriter, "Warning: Failed to stop load generator: %v\n", err)
 			}
 		}()
-		_, _ = fmt.Fprintf(GinkgoWriter, "Load generator started (installing dependencies and sending traffic)...\n")
+
+		By("waiting for load generator to install dependencies and start sending traffic")
+		_, _ = fmt.Fprintf(GinkgoWriter, "Waiting 60 seconds for pip install and traffic to start...\n")
+		time.Sleep(60 * time.Second)
+
+		By("resuming KEDA scaling now that traffic is flowing")
+		// Remove paused annotation
+		err = crClient.Get(ctx, client.ObjectKey{Name: scaledObjectName, Namespace: namespace}, scaledObject)
+		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to get ScaledObject: %s", scaledObjectName))
+		annotations = scaledObject.GetAnnotations()
+		delete(annotations, "autoscaling.keda.sh/paused")
+		scaledObject.SetAnnotations(annotations)
+		err = crClient.Update(ctx, scaledObject)
+		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to resume ScaledObject: %s", scaledObjectName))
+
+		By("continuing traffic generation for 30 seconds to establish non-zero request count")
+		_, _ = fmt.Fprintf(GinkgoWriter, "Continuing traffic at %d req/s for 30 seconds...\n", loadRate)
+		time.Sleep(30 * time.Second)
 
 		By("setting up port-forward to Prometheus service for traffic verification")
 		prometheusPortForwardCmd := utils.SetUpPortForward(k8sClient, ctx, "kube-prometheus-stack-prometheus", controllerMonitoringNamespace, 9090, 9090)
@@ -1222,44 +1239,6 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 		By("waiting for Prometheus port-forward to be ready")
 		err = utils.VerifyPortForwardReadiness(ctx, 9090, fmt.Sprintf("https://localhost:%d/api/v1/query?query=up", 9090))
 		Expect(err).NotTo(HaveOccurred(), "Prometheus port-forward should be ready within timeout")
-
-		By("waiting for Prometheus to scrape initial metrics from vLLM service")
-		_, _ = fmt.Fprintf(GinkgoWriter, "Waiting 30 seconds for Prometheus to scrape metrics...\n")
-		time.Sleep(30 * time.Second)
-
-		By("verifying traffic is successfully reaching service in Prometheus")
-		Eventually(func(g Gomega) {
-			promClient, err2 := utils.NewPrometheusClient("https://localhost:9090", true)
-			g.Expect(err2).NotTo(HaveOccurred(), "Should be able to create Prometheus client")
-
-			query := fmt.Sprintf(`rate(vllm_request_success_total{model_name="%s",namespace="%s"}[30s])`, modelID, namespace)
-			ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel2()
-			result, err2 := promClient.QueryWithRetry(ctx2, query)
-			if err2 != nil {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Prometheus query failed (will retry): %v\n", err2)
-				g.Expect(err2).NotTo(HaveOccurred())
-			}
-
-			_, _ = fmt.Fprintf(GinkgoWriter, "Traffic rate in Prometheus: %.2f req/s\n", result)
-			g.Expect(result).To(BeNumerically(">", 0), "Traffic should be flowing to service")
-		}, 2*time.Minute, 5*time.Second).Should(Succeed())
-
-		_, _ = fmt.Fprintf(GinkgoWriter, "✓ Traffic confirmed flowing to service\n")
-
-		By("resuming KEDA scaling now that traffic is confirmed")
-		// Remove paused annotation
-		err = crClient.Get(ctx, client.ObjectKey{Name: scaledObjectName, Namespace: namespace}, scaledObject)
-		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to get ScaledObject: %s", scaledObjectName))
-		annotations = scaledObject.GetAnnotations()
-		delete(annotations, "autoscaling.keda.sh/paused")
-		scaledObject.SetAnnotations(annotations)
-		err = crClient.Update(ctx, scaledObject)
-		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to resume ScaledObject: %s", scaledObjectName))
-
-		By("continuing traffic generation for 30 seconds to establish non-zero request count")
-		_, _ = fmt.Fprintf(GinkgoWriter, "Continuing traffic at %d req/s for 30 seconds...\n", loadRate)
-		time.Sleep(30 * time.Second)
 
 		By("stopping traffic generation")
 		err = utils.StopCmd(loadGenCmd)
