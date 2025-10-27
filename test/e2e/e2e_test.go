@@ -731,7 +731,7 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 		deployName = "scale-to-zero-deployment"
 		serviceName = "scale-to-zero-service"
 		serviceMonName = "scale-to-zero-servicemonitor"
-		configMapName = "scale-to-zero-config"
+		configMapName = "model-scale-to-zero-config"
 		appLabel = "scale-to-zero-test"
 		modelID = "test-scale-to-zero-model"
 		accelerator = a100Acc
@@ -1050,6 +1050,14 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 			_, _ = fmt.Fprintf(GinkgoWriter, "VA Status: DesiredOptimized=%d, Current=%d\n",
 				va.Status.DesiredOptimizedAlloc.NumReplicas,
 				va.Status.CurrentAlloc.NumReplicas)
+
+			// Check status conditions to see if optimizer is running or fallback is used
+			for _, cond := range va.Status.Conditions {
+				if cond.Type == "OptimizationReady" || cond.Type == "MetricsAvailable" {
+					_, _ = fmt.Fprintf(GinkgoWriter, "  Condition: %s=%s, Reason=%s, Message=%s\n",
+						cond.Type, cond.Status, cond.Reason, cond.Message)
+				}
+			}
 
 			// First check if optimizer recommended 0
 			g.Expect(va.Status.DesiredOptimizedAlloc.NumReplicas).To(Equal(int32(0)),
@@ -1815,7 +1823,7 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 		deployName = "scale-to-zero-deployment"
 		serviceName = "scale-to-zero-service"
 		serviceMonName = "scale-to-zero-servicemonitor"
-		configMapName = "scale-to-zero-config"
+		configMapName = "model-scale-to-zero-config"
 		appLabel = "scale-to-zero-test"
 		modelID = "test-scale-to-zero-model"
 		accelerator = a100Acc
@@ -2134,6 +2142,14 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 			_, _ = fmt.Fprintf(GinkgoWriter, "VA Status: DesiredOptimized=%d, Current=%d\n",
 				va.Status.DesiredOptimizedAlloc.NumReplicas,
 				va.Status.CurrentAlloc.NumReplicas)
+
+			// Check status conditions to see if optimizer is running or fallback is used
+			for _, cond := range va.Status.Conditions {
+				if cond.Type == "OptimizationReady" || cond.Type == "MetricsAvailable" {
+					_, _ = fmt.Fprintf(GinkgoWriter, "  Condition: %s=%s, Reason=%s, Message=%s\n",
+						cond.Type, cond.Status, cond.Reason, cond.Message)
+				}
+			}
 
 			// First check if optimizer recommended 0
 			g.Expect(va.Status.DesiredOptimizedAlloc.NumReplicas).To(Equal(int32(0)),
