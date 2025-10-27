@@ -276,9 +276,11 @@ func addVariantWithFallbackAllocation(
 	// Get current replicas from deployment
 	var currentReplicas int32
 	if deploy != nil {
-		if deploy.Status.Replicas > 0 {
+		// Prefer status replicas if deployment has been reconciled
+		if deploy.Status.ObservedGeneration > 0 {
 			currentReplicas = deploy.Status.Replicas
 		} else if deploy.Spec.Replicas != nil {
+			// Fallback to spec if status not ready yet
 			currentReplicas = *deploy.Spec.Replicas
 		}
 	}
@@ -681,8 +683,11 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 ) error {
 	logger.Log.Debug("Optimization metrics emitted, starting to process variants - ", "variant_count: ", len(updateList.Items))
 
-	// Create metrics emitter for prediction metrics
+	// Create metrics emitter for prediction metrics (reused across all variants)
 	metricsEmitter := metrics.NewMetricsEmitter()
+
+	// Create actuator once and reuse for all variants (more efficient)
+	act := actuator.NewActuator(r.Client)
 
 	for i := range updateList.Items {
 		va := &updateList.Items[i]
@@ -749,10 +754,11 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 			currentReplicas = va.Status.CurrentAlloc.NumReplicas
 		} else {
 			// Use actual deployment replicas
-			// Prefer Status.Replicas (current state), but fall back to Spec.Replicas if Status not populated yet
-			if deploy.Status.Replicas > 0 {
+			// Prefer Status.Replicas if deployment has been reconciled
+			if deploy.Status.ObservedGeneration > 0 {
 				currentReplicas = deploy.Status.Replicas
 			} else if deploy.Spec.Replicas != nil {
+				// Fallback to spec if status not ready yet
 				currentReplicas = *deploy.Spec.Replicas
 			}
 			logger.Log.Debug("Initialized CurrentAlloc from deployment",
@@ -810,8 +816,6 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 		}
 		// Note: If !hasOptimizedAlloc, the OptimizationReady condition was already set
 		// by addVariantWithFallbackAllocation with specific reason (e.g., "Metrics unavailable", "Deployment not found")
-
-		act := actuator.NewActuator(r.Client)
 
 		// ALWAYS emit optimization signals for external autoscalers (KEDA, HPA, etc.)
 		// This is critical for scale-to-zero scenarios where metrics must exist even with no traffic

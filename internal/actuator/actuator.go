@@ -33,18 +33,19 @@ func (a *Actuator) getCurrentDeploymentReplicas(ctx context.Context, va *llmdOpt
 		return 0, fmt.Errorf("failed to get Deployment %s/%s: %w", va.Namespace, va.Name, err)
 	}
 
-	// Prefer status replicas (actual current state)
-	if deploy.Status.Replicas >= 0 {
+	// Prefer status replicas if deployment has been reconciled
+	// Check if status is populated (deployment controller has run)
+	if deploy.Status.ObservedGeneration > 0 {
 		return deploy.Status.Replicas, nil
 	}
 
-	// Fallback to spec if status not ready
+	// Fallback to spec if status not ready yet (deployment just created)
 	if deploy.Spec.Replicas != nil {
 		return *deploy.Spec.Replicas, nil
 	}
 
-	// Final fallback
-	return 1, nil
+	// Final fallback - deployment exists but has no replicas configured
+	return 0, nil
 }
 
 func (a *Actuator) EmitMetrics(ctx context.Context, VariantAutoscaling *llmdOptv1alpha1.VariantAutoscaling) error {
