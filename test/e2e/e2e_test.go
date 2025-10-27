@@ -1199,6 +1199,19 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 		err = utils.VerifyPortForwardReadiness(ctx, port, fmt.Sprintf("http://localhost:%d/v1", port))
 		Expect(err).NotTo(HaveOccurred(), "Port-forward should be ready within timeout")
 
+		By("setting up port-forward to Prometheus service for traffic verification")
+		prometheusPortForwardCmd := utils.SetUpPortForward(k8sClient, ctx, "kube-prometheus-stack-prometheus", controllerMonitoringNamespace, 9090, 9090)
+		defer func() {
+			err := utils.StopCmd(prometheusPortForwardCmd)
+			if err != nil {
+				_, _ = fmt.Fprintf(GinkgoWriter, "Warning: Failed to stop Prometheus port-forwarding: %v\n", err)
+			}
+		}()
+
+		By("waiting for Prometheus port-forward to be ready")
+		err = utils.VerifyPortForwardReadiness(ctx, 9090, fmt.Sprintf("https://localhost:%d/api/v1/query?query=up", 9090))
+		Expect(err).NotTo(HaveOccurred(), "Prometheus port-forward should be ready within timeout")
+
 		By("starting traffic generation while KEDA is still paused")
 		loadRate := 10 // 10 requests per second
 		loadGenCmd := utils.StartLoadGenerator(loadRate, 100, port, modelID)
