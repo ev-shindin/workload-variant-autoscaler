@@ -1121,6 +1121,26 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 		// 2. Stop traffic and wait retention period -> optimizer scales to 0
 		// 3. KEDA scales deployment to 0
 
+		By("ensuring deployment is scaled up before traffic generation")
+		// Previous test may have scaled to 0, so we need to scale back up
+		deployment, err := k8sClient.AppsV1().Deployments(namespace).Get(ctx, deployName, metav1.GetOptions{})
+		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to get Deployment: %s", deployName))
+
+		if *deployment.Spec.Replicas == 0 {
+			By("scaling deployment to 1 replica for traffic generation test")
+			deployment.Spec.Replicas = &initialReplicas
+			_, err = k8sClient.AppsV1().Deployments(namespace).Update(ctx, deployment, metav1.UpdateOptions{})
+			Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to scale up Deployment: %s", deployName))
+		}
+
+		By("waiting for deployment to have ready replicas")
+		Eventually(func(g Gomega) {
+			deployment, err := k8sClient.AppsV1().Deployments(namespace).Get(ctx, deployName, metav1.GetOptions{})
+			g.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to get Deployment: %s", deployName))
+			g.Expect(deployment.Status.ReadyReplicas).To(BeNumerically(">=", 1),
+				"Deployment should have at least 1 ready replica before port-forwarding")
+		}, 8*time.Minute, 10*time.Second).Should(Succeed())
+
 		By("setting up port-forward to the vllme service for traffic generation")
 		port := 8001 // Use different port to avoid conflict with other tests
 		portForwardCmd := utils.SetUpPortForward(k8sClient, ctx, serviceName, namespace, port, 80)
@@ -1130,7 +1150,7 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 		}()
 
 		By("waiting for port-forward to be ready")
-		err := utils.VerifyPortForwardReadiness(ctx, port, fmt.Sprintf("http://localhost:%d/v1", port))
+		err = utils.VerifyPortForwardReadiness(ctx, port, fmt.Sprintf("http://localhost:%d/v1", port))
 		Expect(err).NotTo(HaveOccurred(), "Port-forward should be ready within timeout")
 
 		By("generating traffic for 30 seconds to establish non-zero request count")
