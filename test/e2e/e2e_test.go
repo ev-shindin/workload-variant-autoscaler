@@ -1091,6 +1091,92 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 		_, _ = fmt.Fprintf(GinkgoWriter, "✓ Scale-to-zero flow completed successfully\n")
 	})
 
+	It("should scale to zero after traffic stops and retention period expires", func() {
+		// This test verifies the complete scale-to-zero flow:
+		// 1. Start with traffic (30 seconds) -> optimizer keeps replicas
+		// 2. Stop traffic and wait retention period -> optimizer scales to 0
+		// 3. KEDA scales deployment to 0
+
+		By("setting up port-forward to the vllme service for traffic generation")
+		port := 8001 // Use different port to avoid conflict with other tests
+		portForwardCmd := utils.SetUpPortForward(k8sClient, ctx, serviceName, namespace, port, 80)
+		defer func() {
+			err := utils.StopCmd(portForwardCmd)
+			Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to stop port-forwarding for: %s", serviceName))
+		}()
+
+		By("waiting for port-forward to be ready")
+		err := utils.VerifyPortForwardReadiness(ctx, port, fmt.Sprintf("http://localhost:%d/v1", port))
+		Expect(err).NotTo(HaveOccurred(), "Port-forward should be ready within timeout")
+
+		By("generating traffic for 30 seconds to establish non-zero request count")
+		loadRate := 10 // 10 requests per second
+		loadGenCmd := utils.StartLoadGenerator(loadRate, 100, port, modelID)
+
+		// Let traffic run for 30 seconds
+		_, _ = fmt.Fprintf(GinkgoWriter, "Generating traffic at %d req/s for 30 seconds...\n", loadRate)
+		time.Sleep(30 * time.Second)
+
+		By("stopping traffic generation")
+		err = utils.StopCmd(loadGenCmd)
+		Expect(err).NotTo(HaveOccurred(), "Should be able to stop load generator")
+		_, _ = fmt.Fprintf(GinkgoWriter, "✓ Traffic stopped. Waiting for retention period...\n")
+
+		By("waiting for retention period to pass with zero traffic")
+		_, _ = fmt.Fprintf(GinkgoWriter, "Waiting %v for retention period (no traffic)...\n", retentionDuration)
+		time.Sleep(retentionDuration + 30*time.Second) // Add buffer for controller reconciliation
+
+		By("verifying controller sets DesiredOptimizedAlloc to 0")
+		var desiredReplicasProm float64
+		Eventually(func(g Gomega) {
+			va := &v1alpha1.VariantAutoscaling{}
+			err := crClient.Get(ctx, client.ObjectKey{Name: deployName, Namespace: namespace}, va)
+			g.Expect(err).NotTo(HaveOccurred(), "Should be able to get VariantAutoscaling")
+
+			_, _ = fmt.Fprintf(GinkgoWriter, "VA Status: DesiredOptimized=%d, Current=%d\n",
+				va.Status.DesiredOptimizedAlloc.NumReplicas,
+				va.Status.CurrentAlloc.NumReplicas)
+
+			// Verify optimizer recommends 0
+			g.Expect(va.Status.DesiredOptimizedAlloc.NumReplicas).To(Equal(int32(0)),
+				"Optimizer should recommend 0 replicas after retention period with no traffic")
+
+			// Verify Prometheus metric
+			_, desiredReplicasProm, _, err = utils.GetInfernoReplicaMetrics(va.Name, namespace, va.Spec.Accelerator, va.Spec.VariantID)
+			g.Expect(err).NotTo(HaveOccurred(), "Should be able to query Prometheus metrics")
+			g.Expect(int32(desiredReplicasProm)).To(Equal(int32(0)),
+				"Prometheus inferno_desired_replicas should be 0")
+
+		}, 3*time.Minute, 10*time.Second).Should(Succeed())
+
+		By("verifying KEDA scales deployment to 0 replicas")
+		Eventually(func(g Gomega) {
+			deployment, err := k8sClient.AppsV1().Deployments(namespace).Get(ctx, deployName, metav1.GetOptions{})
+			g.Expect(err).NotTo(HaveOccurred(), "Should be able to get Deployment")
+
+			if deployment.Status.Replicas == 0 {
+				_, _ = fmt.Fprintf(GinkgoWriter, "✓ KEDA successfully scaled deployment to 0 replicas\n")
+			} else {
+				_, _ = fmt.Fprintf(GinkgoWriter, "Deployment replicas: %d (expected 0)\n", deployment.Status.Replicas)
+			}
+
+			g.Expect(deployment.Status.Replicas).To(Equal(int32(0)),
+				"KEDA should scale deployment to 0 replicas")
+		}, 5*time.Minute, 15*time.Second).Should(Succeed())
+
+		By("verifying CurrentAlloc reflects the scaled-down state")
+		Eventually(func(g Gomega) {
+			va := &v1alpha1.VariantAutoscaling{}
+			err := crClient.Get(ctx, client.ObjectKey{Name: deployName, Namespace: namespace}, va)
+			g.Expect(err).NotTo(HaveOccurred(), "Should be able to get VariantAutoscaling")
+
+			g.Expect(va.Status.CurrentAlloc.NumReplicas).To(Equal(int32(0)),
+				"CurrentAlloc should reflect deployment scaled to 0")
+		}, 2*time.Minute, 10*time.Second).Should(Succeed())
+
+		_, _ = fmt.Fprintf(GinkgoWriter, "✓ Scale-to-zero after traffic stops completed successfully\n")
+	})
+
 	AfterAll(func() {
 		By("cleaning up KEDA ScaledObject")
 		scaledObject := &unstructured.Unstructured{}
