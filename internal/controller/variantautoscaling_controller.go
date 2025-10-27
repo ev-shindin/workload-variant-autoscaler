@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -261,14 +262,24 @@ func filterActiveVariantAutoscalings(items []llmdVariantAutoscalingV1alpha1.Vari
 // addVariantWithFallbackAllocation adds a variant to the update list with fallback allocation
 // when metrics or optimization data is unavailable. This ensures metrics are always emitted
 // even when optimization cannot proceed normally.
+//
+// Fallback logic:
+// 1. Respect replica bounds (minReplicas, maxReplicas)
+// 2. If scale-to-zero is disabled and no minReplicas: set 1 replica for cheapest variant only
+// 3. If scale-to-zero is enabled AND aggregate metrics available: scale to zero only if load == 0
+// 4. If aggregate metrics not available: can set to 0 for all variants
 func addVariantWithFallbackAllocation(
 	updateVA *llmdVariantAutoscalingV1alpha1.VariantAutoscaling,
 	deploy *appsv1.Deployment,
 	reason string,
 	message string,
 	updateList *llmdVariantAutoscalingV1alpha1.VariantAutoscalingList,
+	scaleToZeroConfigData utils.ScaleToZeroConfigData,
+	modelName string,
+	aggregateLoad *float64,
+	isCheapestVariant bool,
 ) {
-	// Get current replicas from deployment as fallback
+	// Get current replicas from deployment
 	var currentReplicas int32
 	if deploy != nil {
 		if deploy.Status.Replicas > 0 {
@@ -278,14 +289,74 @@ func addVariantWithFallbackAllocation(
 		}
 	}
 
+	// Determine desired replicas based on scale-to-zero config and aggregate metrics
+	var desiredReplicas int32
+	scaleToZeroEnabled := utils.IsScaleToZeroEnabled(scaleToZeroConfigData, modelName)
+
+	if !scaleToZeroEnabled {
+		// Scale-to-zero is disabled
+		// If no minReplicas set and this is the cheapest variant, maintain at least 1 replica
+		if updateVA.Spec.MinReplicas == nil {
+			if isCheapestVariant {
+				desiredReplicas = max(1, currentReplicas)
+				message = fmt.Sprintf("%s. Scale-to-zero disabled, maintaining cheapest variant with min 1 replica", message)
+			} else {
+				desiredReplicas = currentReplicas // Other variants can be 0
+			}
+		} else {
+			// MinReplicas is set, respect it
+			desiredReplicas = currentReplicas
+		}
+	} else {
+		// Scale-to-zero is enabled
+		if aggregateLoad != nil {
+			// Aggregate metrics available - check load
+			if *aggregateLoad > 0 {
+				// There is load - maintain current replicas
+				desiredReplicas = currentReplicas
+				message = fmt.Sprintf("%s. Scale-to-zero enabled but load > 0 (%.2f), maintaining current replicas", message, *aggregateLoad)
+			} else {
+				// No load - can scale to zero
+				desiredReplicas = 0
+				message = fmt.Sprintf("%s. Scale-to-zero enabled and load == 0, scaling to zero", message)
+			}
+		} else {
+			// Aggregate metrics not available - safe to scale to zero
+			desiredReplicas = 0
+			message = fmt.Sprintf("%s. Scale-to-zero enabled, aggregate metrics unavailable, scaling to zero", message)
+		}
+	}
+
+	// Apply replica bounds (clamp to [minReplicas, maxReplicas])
+	if updateVA.Spec.MinReplicas != nil {
+		minReplicas := *updateVA.Spec.MinReplicas
+		if desiredReplicas < minReplicas {
+			logger.Log.Info("Clamping desired replicas to minReplicas",
+				"variant", updateVA.Name,
+				"original", desiredReplicas,
+				"clamped", minReplicas)
+			desiredReplicas = minReplicas
+		}
+	}
+	if updateVA.Spec.MaxReplicas != nil {
+		maxReplicas := *updateVA.Spec.MaxReplicas
+		if desiredReplicas > maxReplicas {
+			logger.Log.Info("Clamping desired replicas to maxReplicas",
+				"variant", updateVA.Name,
+				"original", desiredReplicas,
+				"clamped", maxReplicas)
+			desiredReplicas = maxReplicas
+		}
+	}
+
 	// Set current allocation
 	updateVA.Status.CurrentAlloc = llmdVariantAutoscalingV1alpha1.Allocation{
 		NumReplicas: currentReplicas,
 	}
 
-	// Set desired = current as safe fallback (no-op for autoscalers)
+	// Set desired allocation with computed fallback value
 	updateVA.Status.DesiredOptimizedAlloc = llmdVariantAutoscalingV1alpha1.OptimizedAlloc{
-		NumReplicas: currentReplicas,
+		NumReplicas: desiredReplicas,
 		LastRunTime: metav1.Now(),
 	}
 
@@ -302,8 +373,51 @@ func addVariantWithFallbackAllocation(
 	logger.Log.Info("Added variant with fallback allocation for metric emission",
 		"variant", updateVA.Name,
 		"currentReplicas", currentReplicas,
-		"desiredReplicas", currentReplicas,
+		"desiredReplicas", desiredReplicas,
+		"scaleToZeroEnabled", scaleToZeroEnabled,
+		"isCheapest", isCheapestVariant,
 		"reason", reason)
+}
+
+// max returns the maximum of two int32 values
+func max(a, b int32) int32 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// isCheapestVariantForModel determines if the given variant is the cheapest among all variants for the same model.
+// Cheapest is determined by accelerator count (fewer accelerators = cheaper).
+func isCheapestVariantForModel(
+	currentVariant *llmdVariantAutoscalingV1alpha1.VariantAutoscaling,
+	allVariants []llmdVariantAutoscalingV1alpha1.VariantAutoscaling,
+	modelName string,
+) bool {
+	if currentVariant == nil {
+		return false
+	}
+
+	minAcceleratorCount := currentVariant.Spec.AcceleratorCount
+	cheapestVariantID := currentVariant.Spec.VariantID
+
+	// Find the variant with minimum accelerator count for this model
+	for _, va := range allVariants {
+		if va.Spec.ModelID != modelName {
+			continue // Different model
+		}
+		if va.Spec.AcceleratorCount < minAcceleratorCount {
+			minAcceleratorCount = va.Spec.AcceleratorCount
+			cheapestVariantID = va.Spec.VariantID
+		} else if va.Spec.AcceleratorCount == minAcceleratorCount {
+			// If same count, choose by variant ID (deterministic)
+			if va.Spec.VariantID < cheapestVariantID {
+				cheapestVariantID = va.Spec.VariantID
+			}
+		}
+	}
+
+	return currentVariant.Spec.VariantID == cheapestVariantID
 }
 
 // prepareVariantAutoscalings collects and prepares all data for optimization.
@@ -326,10 +440,15 @@ func (r *VariantAutoscalingReconciler) prepareVariantAutoscalings(
 			// Get the VA to emit fallback metrics
 			var updateVA llmdVariantAutoscalingV1alpha1.VariantAutoscaling
 			if err := utils.GetVariantAutoscalingWithBackoff(ctx, r.Client, va.Name, va.Namespace, &updateVA); err == nil {
+				isCheapest := isCheapestVariantForModel(&updateVA, activeVAs, modelName)
 				addVariantWithFallbackAllocation(&updateVA, nil,
 					llmdVariantAutoscalingV1alpha1.ReasonOptimizationFailed,
 					"ModelID is empty - cannot optimize",
-					&updateList)
+					&updateList,
+					scaleToZeroConfigData,
+					modelName,
+					nil, // No aggregate load available
+					isCheapest)
 			}
 			continue
 		}
@@ -340,10 +459,15 @@ func (r *VariantAutoscalingReconciler) prepareVariantAutoscalings(
 			// Get the VA to emit fallback metrics
 			var updateVA llmdVariantAutoscalingV1alpha1.VariantAutoscaling
 			if err := utils.GetVariantAutoscalingWithBackoff(ctx, r.Client, va.Name, va.Namespace, &updateVA); err == nil {
+				isCheapest := isCheapestVariantForModel(&updateVA, activeVAs, modelName)
 				addVariantWithFallbackAllocation(&updateVA, nil,
 					llmdVariantAutoscalingV1alpha1.ReasonOptimizationFailed,
 					fmt.Sprintf("SLO not found for model %s", modelName),
-					&updateList)
+					&updateList,
+					scaleToZeroConfigData,
+					modelName,
+					nil, // No aggregate load available
+					isCheapest)
 			}
 			continue
 		}
@@ -358,10 +482,15 @@ func (r *VariantAutoscalingReconciler) prepareVariantAutoscalings(
 			// Get the VA to emit fallback metrics
 			var updateVA llmdVariantAutoscalingV1alpha1.VariantAutoscaling
 			if err := utils.GetVariantAutoscalingWithBackoff(ctx, r.Client, va.Name, va.Namespace, &updateVA); err == nil {
+				isCheapest := isCheapestVariantForModel(&updateVA, activeVAs, modelName)
 				addVariantWithFallbackAllocation(&updateVA, nil,
 					llmdVariantAutoscalingV1alpha1.ReasonOptimizationFailed,
 					"Failed to add variant profile to system data",
-					&updateList)
+					&updateList,
+					scaleToZeroConfigData,
+					modelName,
+					nil, // No aggregate load available
+					isCheapest)
 			}
 			continue
 		}
@@ -373,10 +502,15 @@ func (r *VariantAutoscalingReconciler) prepareVariantAutoscalings(
 			// Get the VA to emit fallback metrics (deployment not found, so use 0 replicas)
 			var updateVA llmdVariantAutoscalingV1alpha1.VariantAutoscaling
 			if err := utils.GetVariantAutoscalingWithBackoff(ctx, r.Client, va.Name, va.Namespace, &updateVA); err == nil {
+				isCheapest := isCheapestVariantForModel(&updateVA, activeVAs, modelName)
 				addVariantWithFallbackAllocation(&updateVA, nil,
 					llmdVariantAutoscalingV1alpha1.ReasonOptimizationFailed,
 					"Deployment not found - using 0 replicas as fallback",
-					&updateList)
+					&updateList,
+					scaleToZeroConfigData,
+					modelName,
+					nil, // No aggregate load available
+					isCheapest)
 			}
 			continue
 		}
@@ -440,10 +574,15 @@ func (r *VariantAutoscalingReconciler) prepareVariantAutoscalings(
 				metricsValidation.Message)
 
 			// Add to updateList with fallback allocation for metric emission
+			isCheapest := isCheapestVariantForModel(&updateVA, activeVAs, modelName)
 			addVariantWithFallbackAllocation(&updateVA, &deploy,
 				llmdVariantAutoscalingV1alpha1.ReasonMetricsUnavailable,
-				fmt.Sprintf("Metrics unavailable (%s), using current replicas as fallback", metricsValidation.Reason),
-				&updateList)
+				fmt.Sprintf("Metrics unavailable (%s)", metricsValidation.Reason),
+				&updateList,
+				scaleToZeroConfigData,
+				modelName,
+				nil, // No aggregate load available
+				isCheapest)
 			continue
 		}
 
@@ -455,10 +594,15 @@ func (r *VariantAutoscalingReconciler) prepareVariantAutoscalings(
 		if err != nil {
 			logger.Log.Error(err, "unable to collect allocation data, using fallback allocation for metric emission")
 			// Add to updateList with fallback allocation for metric emission
+			isCheapest := isCheapestVariantForModel(&updateVA, activeVAs, modelName)
 			addVariantWithFallbackAllocation(&updateVA, &deploy,
 				llmdVariantAutoscalingV1alpha1.ReasonMetricsUnavailable,
 				fmt.Sprintf("Failed to collect allocation data: %v", err),
-				&updateList)
+				&updateList,
+				scaleToZeroConfigData,
+				modelName,
+				nil, // No aggregate load available
+				isCheapest)
 			continue
 		}
 
@@ -471,10 +615,15 @@ func (r *VariantAutoscalingReconciler) prepareVariantAutoscalings(
 		if err != nil {
 			logger.Log.Error(err, "unable to fetch aggregate metrics, using fallback allocation for metric emission")
 			// Add to updateList with fallback allocation for metric emission
+			isCheapest := isCheapestVariantForModel(&updateVA, activeVAs, modelName)
 			addVariantWithFallbackAllocation(&updateVA, &deploy,
 				llmdVariantAutoscalingV1alpha1.ReasonMetricsUnavailable,
 				fmt.Sprintf("Failed to collect aggregate metrics: %v", err),
-				&updateList)
+				&updateList,
+				scaleToZeroConfigData,
+				modelName,
+				nil, // No aggregate load available
+				isCheapest)
 			continue
 		}
 
@@ -484,10 +633,20 @@ func (r *VariantAutoscalingReconciler) prepareVariantAutoscalings(
 		if err != nil {
 			logger.Log.Error(err, "failed to parse variant metrics, using fallback allocation for metric emission")
 			// Add to updateList with fallback allocation for metric emission
+			// Extract load value from LoadProfile
+			var loadValue *float64
+			if arrivalRate, parseErr := strconv.ParseFloat(load.ArrivalRate, 64); parseErr == nil {
+				loadValue = &arrivalRate
+			}
+			isCheapest := isCheapestVariantForModel(&updateVA, activeVAs, modelName)
 			addVariantWithFallbackAllocation(&updateVA, &deploy,
 				llmdVariantAutoscalingV1alpha1.ReasonMetricsUnavailable,
 				fmt.Sprintf("Failed to parse variant metrics: %v", err),
-				&updateList)
+				&updateList,
+				scaleToZeroConfigData,
+				modelName,
+				loadValue, // We have load but failed to parse full metrics
+				isCheapest)
 			continue
 		}
 
@@ -495,10 +654,20 @@ func (r *VariantAutoscalingReconciler) prepareVariantAutoscalings(
 		if err := utils.AddServerInfoToSystemData(systemData, &updateVA, className, metrics, scaleToZeroConfigData); err != nil {
 			logger.Log.Info("variantAutoscaling bad deployment server data, using fallback allocation for metric emission")
 			// Add to updateList with fallback allocation for metric emission
+			// Extract load value from LoadProfile
+			var loadValue *float64
+			if arrivalRate, parseErr := strconv.ParseFloat(load.ArrivalRate, 64); parseErr == nil {
+				loadValue = &arrivalRate
+			}
+			isCheapest := isCheapestVariantForModel(&updateVA, activeVAs, modelName)
 			addVariantWithFallbackAllocation(&updateVA, &deploy,
 				llmdVariantAutoscalingV1alpha1.ReasonMetricsUnavailable,
 				fmt.Sprintf("Failed to add server info: %v", err),
-				&updateList)
+				&updateList,
+				scaleToZeroConfigData,
+				modelName,
+				loadValue, // We have load and metrics but validation failed
+				isCheapest)
 			continue
 		}
 
