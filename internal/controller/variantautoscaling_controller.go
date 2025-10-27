@@ -517,19 +517,6 @@ func (r *VariantAutoscalingReconciler) prepareVariantAutoscalings(
 		}
 		logger.Log.Info("Found SLO for model - ", "model: ", modelName, ", class: ", className, ", slo-tpot: ", entry.SLOTPOT, ", slo-ttft: ", entry.SLOTTFT)
 
-		if err := utils.AddVariantProfileToSystemData(systemData,
-			modelName,
-			va.Spec.Accelerator,
-			va.Spec.AcceleratorCount,
-			&va.Spec.VariantProfile); err != nil {
-			logger.Log.Error(err, "failed to add variant profile to system data, using fallback allocation for metric emission", "variantAutoscaling", va.Name)
-			r.addVariantWithFallback(ctx, va, nil,
-				llmdVariantAutoscalingV1alpha1.ReasonOptimizationFailed,
-				"Failed to add variant profile to system data",
-				&updateList, activeVAs, scaleToZeroConfigData, nil)
-			continue
-		}
-
 		var deploy appsv1.Deployment
 		err = utils.GetDeploymentWithBackoff(ctx, r.Client, va.Name, va.Namespace, &deploy)
 		if err != nil {
@@ -672,6 +659,31 @@ func (r *VariantAutoscalingReconciler) prepareVariantAutoscalings(
 				scaleToZeroConfigData,
 				modelName,
 				loadValue, // We have load but failed to parse full metrics
+				isCheapest)
+			continue
+		}
+
+		// Add variant profile to systemData now that we have validated metrics are available
+		// This ensures systemData only contains variants that will be optimized
+		if err := utils.AddVariantProfileToSystemData(systemData,
+			modelName,
+			updateVA.Spec.Accelerator,
+			updateVA.Spec.AcceleratorCount,
+			&updateVA.Spec.VariantProfile); err != nil {
+			logger.Log.Error(err, "failed to add variant profile to system data, using fallback allocation for metric emission", "variantAutoscaling", updateVA.Name)
+			// Extract load value from LoadProfile
+			var loadValue *float64
+			if arrivalRate, parseErr := strconv.ParseFloat(load.ArrivalRate, 64); parseErr == nil {
+				loadValue = &arrivalRate
+			}
+			isCheapest := isCheapestVariantForModel(&updateVA, activeVAs, modelName)
+			addVariantWithFallbackAllocation(&updateVA, &deploy,
+				llmdVariantAutoscalingV1alpha1.ReasonOptimizationFailed,
+				fmt.Sprintf("Failed to add variant profile to system data: %v", err),
+				&updateList,
+				scaleToZeroConfigData,
+				modelName,
+				loadValue,
 				isCheapest)
 			continue
 		}
