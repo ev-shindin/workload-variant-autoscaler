@@ -1227,6 +1227,14 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 		_, _ = fmt.Fprintf(GinkgoWriter, "Waiting 60 seconds for pip install and traffic to start...\n")
 		time.Sleep(60 * time.Second)
 
+		By("verifying load generator process is still running")
+		if loadGenCmd.ProcessState != nil && loadGenCmd.ProcessState.Exited() {
+			_, _ = fmt.Fprintf(GinkgoWriter, "⚠️ CRITICAL: Load generator exited unexpectedly with code: %d\n", loadGenCmd.ProcessState.ExitCode())
+			Fail(fmt.Sprintf("Load generator process exited before resuming KEDA (exit code: %d)", loadGenCmd.ProcessState.ExitCode()))
+		} else {
+			_, _ = fmt.Fprintf(GinkgoWriter, "✓ Load generator process (PID %d) is still running\n", loadGenCmd.Process.Pid)
+		}
+
 		By("resuming KEDA scaling")
 		// Remove paused annotation
 		err = crClient.Get(ctx, client.ObjectKey{Name: scaledObjectName, Namespace: namespace}, scaledObject)
@@ -1239,14 +1247,42 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 
 		By("verifying controller sees traffic and updates VA status (confirms vLLM→Prometheus→Controller pipeline)")
 		Eventually(func(g Gomega) {
+			// Check if load generator is still running
+			if loadGenCmd.ProcessState != nil && loadGenCmd.ProcessState.Exited() {
+				_, _ = fmt.Fprintf(GinkgoWriter, "⚠️ Load generator exited during verification (exit code: %d)\n", loadGenCmd.ProcessState.ExitCode())
+			}
+
 			va := &v1alpha1.VariantAutoscaling{}
 			err := crClient.Get(ctx, client.ObjectKey{Name: deployName, Namespace: namespace}, va)
 			g.Expect(err).NotTo(HaveOccurred(), "Should be able to get VariantAutoscaling")
 
-			_, _ = fmt.Fprintf(GinkgoWriter, "VA Status: DesiredOptimized=%d, Current=%d, Actuation.Applied=%t\n",
+			_, _ = fmt.Fprintf(GinkgoWriter, "VA Status: DesiredOptimized=%d, Current=%d, Actuation.Applied=%t, LoadGen PID=%d Running=%t\n",
 				va.Status.DesiredOptimizedAlloc.NumReplicas,
 				va.Status.CurrentAlloc.NumReplicas,
-				va.Status.Actuation.Applied)
+				va.Status.Actuation.Applied,
+				loadGenCmd.Process.Pid,
+				loadGenCmd.ProcessState == nil || !loadGenCmd.ProcessState.Exited())
+
+			// Check status conditions for debugging
+			for _, cond := range va.Status.Conditions {
+				if cond.Type == "OptimizationReady" || cond.Type == "MetricsAvailable" {
+					_, _ = fmt.Fprintf(GinkgoWriter, "  Condition: %s=%s, Reason=%s\n",
+						cond.Type, cond.Status, cond.Reason)
+				}
+			}
+
+			// Check if vLLM metrics are in Prometheus
+			promClient, err2 := utils.NewPrometheusClient("https://localhost:9090", true)
+			if err2 == nil {
+				query := fmt.Sprintf(`rate(vllm_request_success_total{model_name="%s",namespace="%s"}[30s])`, modelID, namespace)
+				ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel2()
+				if result, err2 := promClient.QueryWithRetry(ctx2, query); err2 == nil {
+					_, _ = fmt.Fprintf(GinkgoWriter, "  vLLM traffic rate in Prometheus: %.2f req/s\n", result)
+				} else {
+					_, _ = fmt.Fprintf(GinkgoWriter, "  vLLM metrics query failed: %v\n", err2)
+				}
+			}
 
 			// Verify controller has processed traffic and set desired replicas > 0
 			g.Expect(va.Status.DesiredOptimizedAlloc.NumReplicas).To(BeNumerically(">", 0),
