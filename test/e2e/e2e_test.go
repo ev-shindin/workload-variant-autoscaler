@@ -887,8 +887,8 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 			err := crClient.Get(ctx, client.ObjectKey{Name: vaName, Namespace: namespace}, va)
 			g.Expect(err).NotTo(HaveOccurred(), "Should be able to get VariantAutoscaling")
 
-			_, _ = fmt.Fprintf(GinkgoWriter, "VariantAutoscaling Status: CurrentReplicas=%d, DesiredReplicas=%d\n",
-				va.Status.CurrentAlloc.NumReplicas, va.Status.DesiredOptimizedAlloc.NumReplicas)
+			_, _ = fmt.Fprintf(GinkgoWriter, "VariantAutoscaling Status: CurrentReplicas=%d, DesiredReplicas=%d, Actuation.Applied=%t\n",
+			va.Status.CurrentAlloc.NumReplicas, va.Status.DesiredOptimizedAlloc.NumReplicas, va.Status.Actuation.Applied)
 			_, _ = fmt.Fprintf(GinkgoWriter, "VariantAutoscaling Spec: Accelerator=%q, VariantID=%q, ModelID=%q\n",
 				va.Spec.Accelerator, va.Spec.VariantID, va.Spec.ModelID)
 
@@ -896,13 +896,23 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 			if va.Status.DesiredOptimizedAlloc.NumReplicas < 0 {
 				_, _ = fmt.Fprintf(GinkgoWriter, "⚠ WARNING: DesiredOptimizedAlloc.NumReplicas=%d is negative - metrics will NOT be emitted!\n",
 					va.Status.DesiredOptimizedAlloc.NumReplicas)
+			} else if !va.Status.Actuation.Applied {
+					_, _ = fmt.Fprintf(GinkgoWriter, "⚠ WARNING: Actuation.Applied=false - metrics have NOT been emitted yet!\n")
 			} else {
-				_, _ = fmt.Fprintf(GinkgoWriter, "✓ Metric emission condition satisfied (DesiredReplicas >= 0)\n")
+					_, _ = fmt.Fprintf(GinkgoWriter, "✓ Metric emission condition satisfied (DesiredReplicas >= 0, Actuation.Applied=true)\n")
 			}
+
+			// CRITICAL: Wait for Actuation.Applied to be true, confirming EmitMetrics succeeded
+			g.Expect(va.Status.Actuation.Applied).To(BeTrue(),
+				"Controller should have successfully emitted metrics (Actuation.Applied should be true)")
 
 			g.Expect(va.Status.DesiredOptimizedAlloc.NumReplicas).To(BeNumerically(">=", 0),
 				"Controller should have set desired replicas")
-		}, 2*time.Minute, 10*time.Second).Should(Succeed(), "Controller should reconcile VariantAutoscaling")
+		}, 2*time.Minute, 10*time.Second).Should(Succeed(), "Controller should reconcile VariantAutoscaling and emit metrics")
+
+		// Wait additional time for Prometheus to scrape the controller\'s /metrics endpoint
+		By("waiting for Prometheus to scrape metrics from controller")
+		time.Sleep(30 * time.Second) // Prometheus scrape interval is typically 15-30s
 
 		// Verify metrics are being emitted - use the actual CR values like successful tests do
 		By("verifying controller emits replica metrics with correct labels")
@@ -1852,8 +1862,8 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 			err := crClient.Get(ctx, client.ObjectKey{Name: vaName, Namespace: namespace}, va)
 			g.Expect(err).NotTo(HaveOccurred(), "Should be able to get VariantAutoscaling")
 
-			_, _ = fmt.Fprintf(GinkgoWriter, "VariantAutoscaling Status: CurrentReplicas=%d, DesiredReplicas=%d\n",
-				va.Status.CurrentAlloc.NumReplicas, va.Status.DesiredOptimizedAlloc.NumReplicas)
+			_, _ = fmt.Fprintf(GinkgoWriter, "VariantAutoscaling Status: CurrentReplicas=%d, DesiredReplicas=%d, Actuation.Applied=%t\n",
+			va.Status.CurrentAlloc.NumReplicas, va.Status.DesiredOptimizedAlloc.NumReplicas, va.Status.Actuation.Applied)
 			_, _ = fmt.Fprintf(GinkgoWriter, "VariantAutoscaling Spec: Accelerator=%q, VariantID=%q, ModelID=%q\n",
 				va.Spec.Accelerator, va.Spec.VariantID, va.Spec.ModelID)
 
@@ -1861,13 +1871,23 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 			if va.Status.DesiredOptimizedAlloc.NumReplicas < 0 {
 				_, _ = fmt.Fprintf(GinkgoWriter, "⚠ WARNING: DesiredOptimizedAlloc.NumReplicas=%d is negative - metrics will NOT be emitted!\n",
 					va.Status.DesiredOptimizedAlloc.NumReplicas)
+			} else if !va.Status.Actuation.Applied {
+					_, _ = fmt.Fprintf(GinkgoWriter, "⚠ WARNING: Actuation.Applied=false - metrics have NOT been emitted yet!\n")
 			} else {
-				_, _ = fmt.Fprintf(GinkgoWriter, "✓ Metric emission condition satisfied (DesiredReplicas >= 0)\n")
+					_, _ = fmt.Fprintf(GinkgoWriter, "✓ Metric emission condition satisfied (DesiredReplicas >= 0, Actuation.Applied=true)\n")
 			}
+
+			// CRITICAL: Wait for Actuation.Applied to be true, confirming EmitMetrics succeeded
+			g.Expect(va.Status.Actuation.Applied).To(BeTrue(),
+				"Controller should have successfully emitted metrics (Actuation.Applied should be true)")
 
 			g.Expect(va.Status.DesiredOptimizedAlloc.NumReplicas).To(BeNumerically(">=", 0),
 				"Controller should have set desired replicas")
-		}, 2*time.Minute, 10*time.Second).Should(Succeed(), "Controller should reconcile VariantAutoscaling")
+		}, 2*time.Minute, 10*time.Second).Should(Succeed(), "Controller should reconcile VariantAutoscaling and emit metrics")
+
+		// Wait additional time for Prometheus to scrape the controller\'s /metrics endpoint
+		By("waiting for Prometheus to scrape metrics from controller")
+		time.Sleep(30 * time.Second) // Prometheus scrape interval is typically 15-30s
 
 		// Verify metrics are being emitted - use the actual CR values like successful tests do
 		By("verifying controller emits replica metrics with correct labels")
