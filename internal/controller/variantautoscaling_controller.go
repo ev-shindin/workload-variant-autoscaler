@@ -279,6 +279,13 @@ func addVariantWithFallbackAllocation(
 	aggregateLoad *float64,
 	isCheapestVariant bool,
 ) {
+	// Log warning about using fallback allocation
+	logger.Log.Warnw("Using fallback allocation for variant - optimization data unavailable",
+		"variant", updateVA.Name,
+		"namespace", updateVA.Namespace,
+		"model", modelName,
+		"reason", reason)
+
 	// Get current replicas from deployment
 	var currentReplicas int32
 	if deploy != nil {
@@ -436,7 +443,7 @@ func (r *VariantAutoscalingReconciler) prepareVariantAutoscalings(
 	for _, va := range activeVAs {
 		modelName := va.Spec.ModelID
 		if modelName == "" {
-			logger.Log.Info("variantAutoscaling missing modelName, using fallback allocation for metric emission - ", "variantAutoscaling-name: ", va.Name)
+			logger.Log.Warn("variantAutoscaling missing modelName, using fallback allocation for metric emission - ", "variantAutoscaling-name: ", va.Name)
 			// Get the VA to emit fallback metrics
 			var updateVA llmdVariantAutoscalingV1alpha1.VariantAutoscaling
 			if err := utils.GetVariantAutoscalingWithBackoff(ctx, r.Client, va.Name, va.Namespace, &updateVA); err == nil {
@@ -652,7 +659,7 @@ func (r *VariantAutoscalingReconciler) prepareVariantAutoscalings(
 
 		// Add server info with both metrics and scale-to-zero configuration
 		if err := utils.AddServerInfoToSystemData(systemData, &updateVA, className, metrics, scaleToZeroConfigData); err != nil {
-			logger.Log.Info("variantAutoscaling bad deployment server data, using fallback allocation for metric emission")
+			logger.Log.Warn("variantAutoscaling bad deployment server data, using fallback allocation for metric emission")
 			// Add to updateList with fallback allocation for metric emission
 			// Extract load value from LoadProfile
 			var loadValue *float64
