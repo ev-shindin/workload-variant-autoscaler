@@ -58,6 +58,19 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
+const (
+	// Reconciliation interval bounds
+	DefaultReconciliationInterval = 60 * time.Second
+	MinReconciliationInterval     = 1 * time.Second
+	MaxReconciliationInterval     = 1 * time.Hour
+
+	// Cache TTL settings
+	MinCacheTTL = 5 * time.Second
+
+	// Default values
+	DefaultVariantCost = "10"
+)
+
 // VariantAutoscalingReconciler reconciles a variantAutoscaling object
 type VariantAutoscalingReconciler struct {
 	client.Client
@@ -946,7 +959,7 @@ func (r *VariantAutoscalingReconciler) SetupWithManager(mgr ctrl.Manager) error 
 	}
 
 	// Parse reconciliation interval (default 60s if not set)
-	reconciliationInterval := 60 * time.Second
+	reconciliationInterval := DefaultReconciliationInterval
 	if intervalStr != "" {
 		if parsedInterval, parseErr := time.ParseDuration(intervalStr); parseErr != nil {
 			logger.Log.Warn("Failed to parse reconciliation interval, using default",
@@ -954,7 +967,21 @@ func (r *VariantAutoscalingReconciler) SetupWithManager(mgr ctrl.Manager) error 
 				"error", parseErr.Error(),
 				"default", reconciliationInterval.String())
 		} else {
-			reconciliationInterval = parsedInterval
+			// Validate interval bounds to prevent API server overload or stale data
+			if parsedInterval < MinReconciliationInterval {
+				logger.Log.Warn("Reconciliation interval too short, using minimum",
+					"configured", parsedInterval,
+					"minimum", MinReconciliationInterval,
+					"using", MinReconciliationInterval)
+				reconciliationInterval = MinReconciliationInterval
+			} else if parsedInterval > MaxReconciliationInterval {
+				logger.Log.Warn("Reconciliation interval very long, may cause stale data",
+					"configured", parsedInterval,
+					"maximum", MaxReconciliationInterval)
+				reconciliationInterval = parsedInterval
+			} else {
+				reconciliationInterval = parsedInterval
+			}
 		}
 	}
 
@@ -965,13 +992,12 @@ func (r *VariantAutoscalingReconciler) SetupWithManager(mgr ctrl.Manager) error 
 
 	// Apply minimum TTL of 5 seconds to prevent excessive Prometheus queries
 	// if reconciliation interval is configured very short (< 10s)
-	minCacheTTL := 5 * time.Second
-	if cacheTTL < minCacheTTL {
+	if cacheTTL < MinCacheTTL {
 		logger.Log.Warn("Calculated cache TTL too short, using minimum",
 			"calculated", cacheTTL.String(),
-			"minimum", minCacheTTL.String(),
+			"minimum", MinCacheTTL.String(),
 			"reconciliationInterval", reconciliationInterval.String())
-		cacheTTL = minCacheTTL
+		cacheTTL = MinCacheTTL
 	}
 
 	r.MetricsCache = collector.NewModelMetricsCache(cacheTTL)
@@ -979,6 +1005,19 @@ func (r *VariantAutoscalingReconciler) SetupWithManager(mgr ctrl.Manager) error 
 		"cacheTTL", cacheTTL.String(),
 		"reconciliationInterval", reconciliationInterval.String(),
 		"ratio", "TTL = interval / 2")
+
+	// Start background goroutine to periodically clean up stale cache entries
+	// This prevents unbounded memory growth from models that are no longer active
+	go func() {
+		ticker := time.NewTicker(cacheTTL)
+		defer ticker.Stop()
+		for range ticker.C {
+			r.MetricsCache.Cleanup()
+			logger.Log.Debug("Metrics cache cleanup completed")
+		}
+	}()
+	logger.Log.Info("Metrics cache cleanup goroutine started",
+		"cleanupInterval", cacheTTL.String())
 
 	//logger.Log.Info("Prometheus client initialized (validation skipped)")
 
