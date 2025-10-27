@@ -1147,7 +1147,7 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 			Version: "v1alpha1",
 			Kind:    "ScaledObject",
 		})
-		err := crClient.Get(ctx, client.ObjectKey{Name: scaledObjectName, Namespace: namespace}, scaledObject)
+		err = crClient.Get(ctx, client.ObjectKey{Name: scaledObjectName, Namespace: namespace}, scaledObject)
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to get ScaledObject: %s", scaledObjectName))
 
 		By("pausing KEDA scaling to allow manual scale-up")
