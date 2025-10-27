@@ -201,30 +201,17 @@ func (r *VariantAutoscalingReconciler) Reconcile(ctx context.Context, req ctrl.R
 
 	optimizedAllocation, err := engine.Optimize(ctx, *updateList, allAnalyzerResponses, &scaleToZeroConfigData, r.ScaleToZeroMetricsCache)
 	if err != nil {
-		logger.Log.Error(err, "unable to perform model optimization, skipping this iteration")
+		logger.Log.Warnw("Optimization failed - will emit fallback metrics for all variants",
+			"error", err,
+			"variantCount", len(updateList.Items))
 
-		// Update OptimizationReady condition to False for all VAs in the update list
-		for i := range updateList.Items {
-			va := &updateList.Items[i]
-
-			// Fetch fresh copy to avoid status update conflicts
-			var freshVA llmdVariantAutoscalingV1alpha1.VariantAutoscaling
-			if err := r.Get(ctx, client.ObjectKeyFromObject(va), &freshVA); err != nil {
-				logger.Log.Error(err, "failed to fetch fresh VA for status update",
-					"name", va.Name, "namespace", va.Namespace)
-				continue
-			}
-
-			llmdVariantAutoscalingV1alpha1.SetCondition(&freshVA,
-				llmdVariantAutoscalingV1alpha1.TypeOptimizationReady,
-				metav1.ConditionFalse,
-				llmdVariantAutoscalingV1alpha1.ReasonOptimizationFailed,
-				fmt.Sprintf("Optimization failed: %v", err))
-
-			if statusErr := r.Status().Update(ctx, &freshVA); statusErr != nil {
-				logger.Log.Error(statusErr, "failed to update status condition after optimization failure",
-					"variantAutoscaling", freshVA.Name)
-			}
+		// Emit fallback metrics even when optimization fails
+		// The variants in updateList already have fallback DesiredOptimizedAlloc set
+		if emitErr := r.applyOptimizedAllocations(ctx, updateList, optimizedAllocation, allAnalyzerResponses); emitErr != nil {
+			logger.Log.Error(emitErr, "failed to emit fallback metrics after optimization failure")
+		} else {
+			logger.Log.Info("Successfully emitted fallback metrics after optimization failure",
+				"variantCount", len(updateList.Items))
 		}
 
 		return ctrl.Result{RequeueAfter: requeueDuration}, nil
@@ -776,7 +763,7 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 			NumReplicas: currentReplicas,
 		}
 
-		// Use optimized allocation if available, otherwise use fallback (0 replicas)
+		// Use optimized allocation if available, otherwise preserve fallback from updateList
 		// This ensures metrics are always emitted, even for zero-traffic scenarios
 		if hasOptimizedAlloc {
 			updateVa.Status.DesiredOptimizedAlloc = optimizedAlloc
@@ -784,26 +771,35 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 				"variantName", va.Name,
 				"replicas", optimizedAlloc.NumReplicas)
 		} else {
-			// Fallback: No traffic/metrics available, use minimum allocation
-			// This ensures KEDA can still query metrics for scale-to-zero scenarios
-			updateVa.Status.DesiredOptimizedAlloc = llmdVariantAutoscalingV1alpha1.OptimizedAlloc{
-				NumReplicas: 0,
+			// Check if fallback allocation was set in updateList (from addVariantWithFallbackAllocation)
+			if va.Status.DesiredOptimizedAlloc.NumReplicas >= 0 || !va.Status.DesiredOptimizedAlloc.LastRunTime.IsZero() {
+				// Use the fallback allocation that was computed during preparation
+				updateVa.Status.DesiredOptimizedAlloc = va.Status.DesiredOptimizedAlloc
+				logger.Log.Debug("Using fallback allocation from preparation phase",
+					"variantName", va.Name,
+					"replicas", va.Status.DesiredOptimizedAlloc.NumReplicas)
+			} else {
+				// No optimization and no fallback - use 0 replicas as last resort
+				updateVa.Status.DesiredOptimizedAlloc = llmdVariantAutoscalingV1alpha1.OptimizedAlloc{
+					NumReplicas: 0,
+				}
+				logger.Log.Debug("No optimized allocation or fallback found, using 0 replicas",
+					"variantName", va.Name,
+					"accelerator", va.Spec.Accelerator)
 			}
-			logger.Log.Debug("No optimized allocation found, using fallback (0 replicas)",
-				"variantName", va.Name,
-				"accelerator", va.Spec.Accelerator)
 		}
 
 		updateVa.Status.Actuation.Applied = false // No longer directly applying changes
 
-		// Copy existing conditions from updateList (includes MetricsAvailable condition set during preparation)
-		// This ensures we don't lose the MetricsAvailable condition when fetching fresh copy from API
+		// Copy existing conditions from updateList (includes MetricsAvailable and OptimizationReady conditions set during preparation)
+		// This ensures we don't lose conditions when fetching fresh copy from API
 		// Always copy, even if empty, to preserve conditions set during prepareVariantAutoscalings
 		updateVa.Status.Conditions = va.Status.Conditions
 
-		// Set OptimizationReady condition
-		desiredAlloc := updateVa.Status.DesiredOptimizedAlloc
+		// Set OptimizationReady condition only if we have optimized allocation
+		// If using fallback, preserve the condition set by addVariantWithFallbackAllocation
 		if hasOptimizedAlloc {
+			desiredAlloc := updateVa.Status.DesiredOptimizedAlloc
 			llmdVariantAutoscalingV1alpha1.SetCondition(&updateVa,
 				llmdVariantAutoscalingV1alpha1.TypeOptimizationReady,
 				metav1.ConditionTrue,
@@ -811,15 +807,9 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 				fmt.Sprintf("Optimization completed: %d replicas on %s",
 					desiredAlloc.NumReplicas,
 					updateVa.Spec.Accelerator)) // Use spec field (single-variant architecture)
-		} else {
-			llmdVariantAutoscalingV1alpha1.SetCondition(&updateVa,
-				llmdVariantAutoscalingV1alpha1.TypeOptimizationReady,
-				metav1.ConditionTrue,
-				llmdVariantAutoscalingV1alpha1.ReasonOptimizationSucceeded,
-				fmt.Sprintf("No metrics available, using fallback: %d replicas on %s",
-					desiredAlloc.NumReplicas,
-					updateVa.Spec.Accelerator))
 		}
+		// Note: If !hasOptimizedAlloc, the OptimizationReady condition was already set
+		// by addVariantWithFallbackAllocation with specific reason (e.g., "Metrics unavailable", "Deployment not found")
 
 		act := actuator.NewActuator(r.Client)
 
