@@ -1408,7 +1408,17 @@ var _ = Describe("Test traffic-based scale-to-zero with retention period", Order
 					"Deployment should have at least 1 ready replica")
 			}, 8*time.Minute, 10*time.Second).Should(Succeed())
 		} else {
-			_, _ = fmt.Fprintf(GinkgoWriter, "Deployment already at %d replicas\n", *deployment.Spec.Replicas)
+			_, _ = fmt.Fprintf(GinkgoWriter, "Deployment already at %d replicas, verifying pod readiness\n", *deployment.Spec.Replicas)
+
+			By("waiting for deployment to have ready replicas")
+			Eventually(func(g Gomega) {
+				deployment, err := k8sClient.AppsV1().Deployments(namespace).Get(ctx, deployName, metav1.GetOptions{})
+				g.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to get Deployment: %s", deployName))
+				_, _ = fmt.Fprintf(GinkgoWriter, "Deployment replicas: Ready=%d, Available=%d, Target=%d\n",
+					deployment.Status.ReadyReplicas, deployment.Status.AvailableReplicas, *deployment.Spec.Replicas)
+				g.Expect(deployment.Status.ReadyReplicas).To(BeNumerically(">=", 1),
+					"Deployment should have at least 1 ready replica")
+			}, 8*time.Minute, 10*time.Second).Should(Succeed())
 		}
 
 		// Wait for controller to reconcile and see the 1 replica BEFORE generating traffic
