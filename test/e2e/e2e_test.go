@@ -705,7 +705,7 @@ var _ = Describe("Test workload-variant-autoscaler with vllme deployment - singl
 })
 
 
-var _ = Describe("Test idle scale-to-zero with KEDA", func() {
+var _ = Describe("Test idle scale-to-zero with KEDA", Ordered, func() {
 	var (
 		namespace         string
 		deployName        string
@@ -1186,7 +1186,7 @@ var _ = Describe("Test idle scale-to-zero with KEDA", func() {
 	})
 })
 
-var _ = Describe("Test traffic-based scale-to-zero with retention period", func() {
+var _ = Describe("Test traffic-based scale-to-zero with retention period", Ordered, func() {
 	var (
 		namespace         string
 		deployName        string
