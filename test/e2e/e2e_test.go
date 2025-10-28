@@ -1393,10 +1393,28 @@ var _ = Describe("Test traffic-based scale-to-zero with retention period", Order
 			_, _ = fmt.Fprintf(GinkgoWriter, "✓ Controller emitting baseline metrics: desired=%.0f\n", desiredReplicasProm)
 		}, 3*time.Minute, 10*time.Second).Should(Succeed(), "Prometheus should be scraping controller metrics")
 
-		By("waiting for Prometheus to potentially discover and scrape vLLM pod")
-		// Additional time for Prometheus to discover ServiceMonitor and start scraping vLLM
-		_, _ = fmt.Fprintf(GinkgoWriter, "Waiting additional 2 minutes for Prometheus ServiceMonitor discovery...\n")
-		time.Sleep(2 * time.Minute)
+		By("waiting for Prometheus to discover ServiceMonitor and scrape vLLM pod")
+		// Verify Prometheus is actually scraping vLLM (not just blindly waiting)
+		Eventually(func(g Gomega) {
+			promClient, err2 := utils.NewPrometheusClient("https://localhost:9090", true)
+			g.Expect(err2).NotTo(HaveOccurred(), "Should be able to create Prometheus client")
+
+			// Query for vLLM gauge metric (these exist even without traffic)
+			// Use a gauge like num_requests_waiting which should be 0 initially
+			query := fmt.Sprintf(`vllm_num_requests_waiting{model_name="%s",namespace="%s"}`, modelID, namespace)
+			ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel2()
+			result, err2 := promClient.QueryWithRetry(ctx2, query)
+
+			if err2 != nil {
+				_, _ = fmt.Fprintf(GinkgoWriter, "Waiting for vLLM metrics discovery (will retry): %v\n", err2)
+				g.Expect(err2).NotTo(HaveOccurred())
+			}
+
+			_, _ = fmt.Fprintf(GinkgoWriter, "✓ Prometheus scraping vLLM pod: vllm_num_requests_waiting=%.0f\n", result)
+			// Just verify metric exists (value can be anything, including 0)
+			g.Expect(err2).NotTo(HaveOccurred(), "Prometheus should be scraping vLLM pod")
+		}, 5*time.Minute, 15*time.Second).Should(Succeed(), "Prometheus should discover ServiceMonitor and scrape vLLM")
 	})
 
 	It("should scale to zero after traffic stops and retention period expires", func() {
