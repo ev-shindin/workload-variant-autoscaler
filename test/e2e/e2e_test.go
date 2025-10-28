@@ -1444,6 +1444,31 @@ var _ = Describe("Test traffic-based scale-to-zero with retention period", Order
 		By("waiting for Prometheus to scrape metrics from controller")
 		time.Sleep(30 * time.Second) // Prometheus scrape interval is typically 15-30s
 
+		// Verify service has endpoints before port-forwarding
+		By("verifying service has ready endpoints before port-forward")
+		Eventually(func(g Gomega) {
+			_, err := k8sClient.CoreV1().Services(namespace).Get(ctx, serviceName, metav1.GetOptions{})
+			g.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to get Service: %s", serviceName))
+
+			endpoints, err := k8sClient.CoreV1().Endpoints(namespace).Get(ctx, serviceName, metav1.GetOptions{})
+			g.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to get Endpoints for Service: %s", serviceName))
+
+			// Check that service has at least one ready endpoint
+			hasReadyEndpoint := false
+			for _, subset := range endpoints.Subsets {
+				if len(subset.Addresses) > 0 {
+					hasReadyEndpoint = true
+					break
+				}
+			}
+
+			_, _ = fmt.Fprintf(GinkgoWriter, "Service %s endpoints: %d subsets, hasReadyEndpoint=%v\n",
+				serviceName, len(endpoints.Subsets), hasReadyEndpoint)
+
+			g.Expect(hasReadyEndpoint).To(BeTrue(),
+				fmt.Sprintf("Service %s should have at least one ready endpoint", serviceName))
+		}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
 		// Start traffic BEFORE creating KEDA (so KEDA sees desired > 0 when created)
 		By("setting up port-forward to the vllme service for traffic generation")
 		port := 8001 // Use different port to avoid conflict with other tests
