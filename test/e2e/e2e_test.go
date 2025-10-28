@@ -1260,6 +1260,31 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 				}
 			}
 
+			// Check if vLLM is exposing metrics in Prometheus
+			promClient, err2 := utils.NewPrometheusClient("https://localhost:9090", true)
+			if err2 == nil {
+				// Query the exact metric the optimizer uses for scale-to-zero decisions
+				optimizerQuery := fmt.Sprintf(`sum(increase(vllm_request_success_total{model_name="%s",namespace="%s"}[2m]))`, modelID, namespace)
+				ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel2()
+				if totalRequests, err2 := promClient.QueryWithRetry(ctx2, optimizerQuery); err2 == nil {
+					_, _ = fmt.Fprintf(GinkgoWriter, "  📊 Optimizer query result: totalRequests=%.0f (query: %s)\n", totalRequests, optimizerQuery)
+					if totalRequests == 0 {
+						_, _ = fmt.Fprintf(GinkgoWriter, "  ⚠️ PROBLEM: Optimizer sees 0 requests! Either vLLM not receiving traffic or not exposing metrics.\n")
+					}
+				} else {
+					_, _ = fmt.Fprintf(GinkgoWriter, "  ❌ Optimizer query failed: %v\n", err2)
+				}
+
+				// Also check rate to see current traffic flow
+				rateQuery := fmt.Sprintf(`rate(vllm_request_success_total{model_name="%s",namespace="%s"}[30s])`, modelID, namespace)
+				ctx3, cancel3 := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel3()
+				if rate, err3 := promClient.QueryWithRetry(ctx3, rateQuery); err3 == nil {
+					_, _ = fmt.Fprintf(GinkgoWriter, "  📊 Current traffic rate: %.2f req/s\n", rate)
+				}
+			}
+
 			// Verify controller has seen traffic and recommended replicas > 0
 			g.Expect(va.Status.DesiredOptimizedAlloc.NumReplicas).To(BeNumerically(">", 0),
 				"Controller must emit desired replicas > 0 before resuming KEDA")
