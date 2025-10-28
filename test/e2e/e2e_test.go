@@ -19,6 +19,7 @@ package e2e
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"time"
@@ -1235,6 +1236,18 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 			_, _ = fmt.Fprintf(GinkgoWriter, "✓ Load generator process (PID %d) is still running\n", loadGenCmd.Process.Pid)
 		}
 
+		By("verifying vLLM service is responding to HTTP requests")
+		testURL := fmt.Sprintf("http://localhost:%d/v1/models", port)
+		_, _ = fmt.Fprintf(GinkgoWriter, "Testing vLLM connectivity: %s\n", testURL)
+		resp, err := http.Get(testURL)
+		if err != nil {
+			_, _ = fmt.Fprintf(GinkgoWriter, "⚠️ WARNING: vLLM service not responding: %v\n", err)
+			_, _ = fmt.Fprintf(GinkgoWriter, "This means load generator cannot send requests!\n")
+		} else {
+			resp.Body.Close()
+			_, _ = fmt.Fprintf(GinkgoWriter, "✓ vLLM service responding (HTTP %d)\n", resp.StatusCode)
+		}
+
 		By("waiting for controller to process traffic and emit inferno_desired_replicas > 0 BEFORE resuming KEDA")
 		_, _ = fmt.Fprintf(GinkgoWriter, "⚠️ CRITICAL: Must verify controller emitted desired replicas > 0 before resuming KEDA\n")
 		_, _ = fmt.Fprintf(GinkgoWriter, "Otherwise KEDA will see desired=0 and immediately scale deployment to 0, killing vLLM pod!\n")
@@ -1263,6 +1276,20 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 			// Check if vLLM is exposing metrics in Prometheus
 			promClient, err2 := utils.NewPrometheusClient("https://localhost:9090", true)
 			if err2 == nil {
+				// First, check if ANY vllm_* metrics exist at all (to verify Prometheus is scraping)
+				anyVllmQuery := `vllm_request_success_total`
+				ctx4, cancel4 := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel4()
+				if _, err4 := promClient.QueryWithRetry(ctx4, anyVllmQuery); err4 == nil {
+					_, _ = fmt.Fprintf(GinkgoWriter, "  ✓ vllm_request_success_total metric exists in Prometheus\n")
+				} else {
+					_, _ = fmt.Fprintf(GinkgoWriter, "  ❌ CRITICAL: vllm_request_success_total metric NOT FOUND in Prometheus!\n")
+					_, _ = fmt.Fprintf(GinkgoWriter, "     This means either:\n")
+					_, _ = fmt.Fprintf(GinkgoWriter, "     1. vLLM emulator pod not exposing /metrics endpoint\n")
+					_, _ = fmt.Fprintf(GinkgoWriter, "     2. Prometheus not scraping vLLM pod (ServiceMonitor missing/broken)\n")
+					_, _ = fmt.Fprintf(GinkgoWriter, "     3. vLLM emulator not counting requests (metric never incremented)\n")
+				}
+
 				// Query the exact metric the optimizer uses for scale-to-zero decisions
 				optimizerQuery := fmt.Sprintf(`sum(increase(vllm_request_success_total{model_name="%s",namespace="%s"}[2m]))`, modelID, namespace)
 				ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
