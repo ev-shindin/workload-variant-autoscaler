@@ -1228,6 +1228,14 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 		_, _ = fmt.Fprintf(GinkgoWriter, "Waiting 60 seconds for pip install and traffic to start...\n")
 		time.Sleep(60 * time.Second)
 
+		By("waiting additional time for Prometheus to discover and scrape the new pod")
+		_, _ = fmt.Fprintf(GinkgoWriter, "⚠️ CRITICAL: After scaling from 0→1, Prometheus needs time to:\n")
+		_, _ = fmt.Fprintf(GinkgoWriter, "  1. Discover new pod endpoints from ServiceMonitor\n")
+		_, _ = fmt.Fprintf(GinkgoWriter, "  2. Start scraping /metrics endpoint (scrape interval: 15s)\n")
+		_, _ = fmt.Fprintf(GinkgoWriter, "  3. Accumulate at least one metric data point\n")
+		_, _ = fmt.Fprintf(GinkgoWriter, "Waiting 60 additional seconds for Prometheus scraping to start...\n")
+		time.Sleep(60 * time.Second)
+
 		By("verifying load generator process is still running")
 		if loadGenCmd.ProcessState != nil && loadGenCmd.ProcessState.Exited() {
 			_, _ = fmt.Fprintf(GinkgoWriter, "⚠️ CRITICAL: Load generator exited unexpectedly with code: %d\n", loadGenCmd.ProcessState.ExitCode())
