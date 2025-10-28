@@ -704,7 +704,8 @@ var _ = Describe("Test workload-variant-autoscaler with vllme deployment - singl
 	})
 })
 
-var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
+
+var _ = Describe("Test idle scale-to-zero with KEDA", func() {
 	var (
 		namespace         string
 		deployName        string
@@ -729,12 +730,12 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 
 		ctx = context.Background()
 		namespace = llmDNamespace
-		deployName = "scale-to-zero-deployment"
-		serviceName = "scale-to-zero-service"
-		serviceMonName = "scale-to-zero-servicemonitor"
+		deployName = "idle-sto-zero-deployment"
+		serviceName = "idle-sto-zero-service"
+		serviceMonName = "idle-sto-zero-servicemonitor"
 		configMapName = "model-scale-to-zero-config"
-		appLabel = "scale-to-zero-test"
-		modelID = "test-scale-to-zero-model"
+		appLabel = "idle-sto-zero-test"
+		modelID = "test-idle-sto-zero-model"
 		accelerator = a100Acc
 		initialReplicas = 1
 		retentionDuration = 2 * time.Minute // Retention period for scale-to-zero
@@ -1114,6 +1115,234 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 		}, 2*time.Minute, 10*time.Second).Should(Succeed())
 
 		_, _ = fmt.Fprintf(GinkgoWriter, "✓ Scale-to-zero flow completed successfully\n")
+	})
+
+	AfterAll(func() {
+		By("cleaning up KEDA ScaledObject")
+		scaledObject := &unstructured.Unstructured{}
+		scaledObject.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "keda.sh",
+			Version: "v1alpha1",
+			Kind:    "ScaledObject",
+		})
+		scaledObject.SetName(deployName + "-scaler")
+		scaledObject.SetNamespace(namespace)
+		err := crClient.Delete(ctx, scaledObject)
+		err = client.IgnoreNotFound(err)
+		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to delete ScaledObject: %s", deployName+"-scaler"))
+
+		By("cleaning up VariantAutoscaling resource")
+		variantAutoscaling := &v1alpha1.VariantAutoscaling{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      deployName,
+				Namespace: namespace,
+			},
+		}
+		err = crClient.Delete(ctx, variantAutoscaling)
+		err = client.IgnoreNotFound(err)
+		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to delete VariantAutoscaling: %s", deployName))
+
+		By("deleting InferenceModel")
+		err = crClient.Delete(ctx, inferenceModel)
+		err = client.IgnoreNotFound(err)
+		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to delete InferenceModel: %s", modelID))
+
+		By("cleaning up ServiceMonitor")
+		serviceMonitor := &unstructured.Unstructured{}
+		serviceMonitor.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "monitoring.coreos.com",
+			Version: "v1",
+			Kind:    "ServiceMonitor",
+		})
+		serviceMonitor.SetName(serviceMonName)
+		serviceMonitor.SetNamespace(controllerMonitoringNamespace)
+		err = crClient.Delete(ctx, serviceMonitor)
+		err = client.IgnoreNotFound(err)
+		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to delete ServiceMonitor: %s", serviceMonName))
+
+		By("cleaning up Service")
+		err = k8sClient.CoreV1().Services(namespace).Delete(ctx, serviceName, metav1.DeleteOptions{})
+		err = client.IgnoreNotFound(err)
+		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to delete Service: %s", serviceName))
+
+		By("cleaning up Deployment")
+		err = k8sClient.AppsV1().Deployments(namespace).Delete(ctx, deployName, metav1.DeleteOptions{})
+		err = client.IgnoreNotFound(err)
+		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to delete Deployment: %s", deployName))
+
+		By("waiting for all pods to be deleted")
+		Eventually(func(g Gomega) {
+			podList, err := k8sClient.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+				LabelSelector: fmt.Sprintf("app=%s", appLabel),
+			})
+			g.Expect(err).NotTo(HaveOccurred(), "Should be able to list Pods")
+			g.Expect(podList.Items).To(BeEmpty(), fmt.Sprintf("All Pods with label %s should be deleted", appLabel))
+		}, 2*time.Minute, 10*time.Second).Should(Succeed())
+
+		By("cleaning up ConfigMap")
+		err = k8sClient.CoreV1().ConfigMaps(controllerNamespace).Delete(ctx, configMapName, metav1.DeleteOptions{})
+		err = client.IgnoreNotFound(err)
+		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to delete ConfigMap: %s", configMapName))
+	})
+})
+
+var _ = Describe("Test traffic-based scale-to-zero with retention period", func() {
+	var (
+		namespace         string
+		deployName        string
+		serviceName       string
+		serviceMonName    string
+		configMapName     string
+		appLabel          string
+		modelID           string
+		accelerator       string
+		ctx               context.Context
+		initialReplicas   int32
+		retentionDuration time.Duration
+		inferenceModel    *unstructured.Unstructured
+	)
+
+	BeforeAll(func() {
+		if os.Getenv("KUBECONFIG") == "" {
+			Skip("KUBECONFIG is not set; skipping e2e test")
+		}
+
+		initializeK8sClient()
+
+		ctx = context.Background()
+		namespace = llmDNamespace
+		deployName = "traffic-sto-zero-deployment"
+		serviceName = "traffic-sto-zero-service"
+		serviceMonName = "traffic-sto-zero-servicemonitor"
+		configMapName = "model-scale-to-zero-config"
+		appLabel = "traffic-sto-zero-test"
+		modelID = "test-traffic-sto-zero-model"
+		accelerator = a100Acc
+		initialReplicas = 1
+		retentionDuration = 2 * time.Minute // Retention period for scale-to-zero
+
+		By("ensuring unique app label and model")
+		utils.ValidateAppLabelUniqueness(namespace, appLabel, k8sClient, crClient)
+		utils.ValidateVariantAutoscalingUniqueness(namespace, modelID, accelerator, crClient)
+
+		By("creating scale-to-zero ConfigMap")
+		configMap := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      configMapName,
+				Namespace: controllerNamespace,
+			},
+			Data: map[string]string{
+				fmt.Sprintf("model.%s", modelID): fmt.Sprintf(`{
+					"modelID": "%s",
+					"enableScaleToZero": true,
+					"retentionPeriod": "2m"
+				}`, modelID),
+			},
+		}
+		_, err := k8sClient.CoreV1().ConfigMaps(controllerNamespace).Create(ctx, configMap, metav1.CreateOptions{})
+		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to create ConfigMap: %s", configMapName))
+
+		By("creating vllme deployment with initial replica")
+		deployment := utils.CreateVllmeDeployment(namespace, deployName, modelID, appLabel)
+		deployment.Spec.Replicas = &initialReplicas
+		_, err = k8sClient.AppsV1().Deployments(namespace).Create(ctx, deployment, metav1.CreateOptions{})
+		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to create Deployment: %s", deployName))
+
+		By("creating vllme service")
+		service := utils.CreateVllmeService(namespace, serviceName, appLabel, 30001)
+		_, err = k8sClient.CoreV1().Services(namespace).Create(ctx, service, metav1.CreateOptions{})
+		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to create Service: %s", serviceName))
+
+		By("creating ServiceMonitor for vllme metrics")
+		serviceMonitor := utils.CreateVllmeServiceMonitor(serviceMonName, controllerMonitoringNamespace, appLabel)
+		err = crClient.Create(ctx, serviceMonitor)
+		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to create ServiceMonitor: %s", serviceMonName))
+
+		By("creating VariantAutoscaling resource")
+		variantAutoscaling := utils.CreateVariantAutoscalingResource(namespace, deployName, modelID, accelerator)
+		err = crClient.Create(ctx, variantAutoscaling)
+		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to create VariantAutoscaling: %s", deployName))
+
+		By("creating InferenceModel with 0 traffic for scale-to-zero test")
+		inferenceModel = utils.CreateInferenceModel(deployName, namespace, modelID)
+		err = crClient.Create(ctx, inferenceModel)
+		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to create InferenceModel: %s", modelID))
+
+		By("verifying KEDA is installed")
+		Eventually(func(g Gomega) {
+			podList, err := k8sClient.CoreV1().Pods("keda-system").List(ctx, metav1.ListOptions{
+				LabelSelector: "app.kubernetes.io/name=keda-operator",
+			})
+			g.Expect(err).NotTo(HaveOccurred(), "Should be able to list KEDA pods")
+			g.Expect(podList.Items).NotTo(BeEmpty(), "KEDA operator should be running")
+			for _, pod := range podList.Items {
+				g.Expect(pod.Status.Phase).To(Equal(corev1.PodRunning), fmt.Sprintf("KEDA pod %s should be running", pod.Name))
+			}
+		}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+		logf.SetLogger(zap.New(zap.WriteTo(GinkgoWriter), zap.UseDevMode(true)))
+	})
+
+	It("deployment should be running initially", func() {
+		Eventually(func() (appsv1.DeploymentStatus, error) {
+			deployment, err := k8sClient.AppsV1().Deployments(namespace).Get(ctx, deployName, metav1.GetOptions{})
+			if err != nil {
+				return appsv1.DeploymentStatus{}, err
+			}
+			return deployment.Status, nil
+		}, 8*time.Minute, 10*time.Second).Should(And(
+			HaveField("ReadyReplicas", BeNumerically("==", initialReplicas)),
+			HaveField("Replicas", BeNumerically("==", initialReplicas)),
+		))
+	})
+
+	It("VariantAutoscaling should be created and reconciled", func() {
+		By("verifying VariantAutoscaling exists")
+		va := &v1alpha1.VariantAutoscaling{}
+		Eventually(func(g Gomega) {
+			err := crClient.Get(ctx, client.ObjectKey{Name: deployName, Namespace: namespace}, va)
+			g.Expect(err).NotTo(HaveOccurred(), "Should be able to get VariantAutoscaling")
+			g.Expect(va.Spec.ModelID).To(Equal(modelID), "ModelID should match")
+		}, 1*time.Minute, 5*time.Second).Should(Succeed())
+	})
+
+	It("deployment should have correct deployment labels", func() {
+		deployment, err := k8sClient.AppsV1().Deployments(namespace).Get(ctx, deployName, metav1.GetOptions{})
+		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to get Deployment: %s", deployName))
+
+		By("verifying deployment selector labels")
+		selector := deployment.Spec.Selector.MatchLabels
+		Expect(selector).To(HaveKeyWithValue("app", appLabel))
+
+		By("verifying pod template labels")
+		podLabels := deployment.Spec.Template.Labels
+		Expect(podLabels).To(HaveKeyWithValue("app", appLabel))
+	})
+
+	It("deployment should have correct resource configuration", func() {
+		deployment, err := k8sClient.AppsV1().Deployments(namespace).Get(ctx, deployName, metav1.GetOptions{})
+		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to get Deployment: %s", deployName))
+
+		By("verifying container resource limits")
+		container := deployment.Spec.Template.Spec.Containers[0]
+		Expect(container.Resources.Limits).To(HaveKeyWithValue(corev1.ResourceName("nvidia.com/gpu"), resource.MustParse("1")))
+
+		By("verifying environment variables")
+		var modelNameEnv *corev1.EnvVar
+		for _, env := range container.Env {
+			if env.Name == "MODEL_NAME" {
+				modelNameEnv = &env
+			}
+		}
+		Expect(modelNameEnv).NotTo(BeNil(), "MODEL_NAME environment variable should be set")
+	})
+
+	It("deployment should have corresponding service with correct selector", func() {
+		service, err := k8sClient.CoreV1().Services(namespace).Get(ctx, serviceName, metav1.GetOptions{})
+		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to get Service: %s", serviceName))
+
+		By("verifying service selector")
+		Expect(service.Spec.Selector).To(HaveKeyWithValue("app", appLabel))
 	})
 
 	It("should scale to zero after traffic stops and retention period expires", func() {
@@ -1501,6 +1730,7 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to delete ConfigMap: %s", configMapName))
 	})
 })
+
 
 var _ = Describe("Test workload-variant-autoscaler with vllme deployment - multiple VAs - critical requests", Ordered, func() {
 	var (
@@ -2027,483 +2257,3 @@ var _ = Describe("Test workload-variant-autoscaler with vllme deployment - multi
 	})
 })
 
-var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
-	var (
-		namespace         string
-		deployName        string
-		serviceName       string
-		serviceMonName    string
-		configMapName     string
-		appLabel          string
-		modelID           string
-		accelerator       string
-		ctx               context.Context
-		initialReplicas   int32
-		retentionDuration time.Duration
-		inferenceModel    *unstructured.Unstructured
-	)
-
-	BeforeAll(func() {
-		if os.Getenv("KUBECONFIG") == "" {
-			Skip("KUBECONFIG is not set; skipping e2e test")
-		}
-
-		initializeK8sClient()
-
-		ctx = context.Background()
-		namespace = llmDNamespace
-		deployName = "scale-to-zero-deployment"
-		serviceName = "scale-to-zero-service"
-		serviceMonName = "scale-to-zero-servicemonitor"
-		configMapName = "model-scale-to-zero-config"
-		appLabel = "scale-to-zero-test"
-		modelID = "test-scale-to-zero-model"
-		accelerator = a100Acc
-		initialReplicas = 1
-		retentionDuration = 2 * time.Minute // Retention period for scale-to-zero
-
-		By("ensuring unique app label and model")
-		utils.ValidateAppLabelUniqueness(namespace, appLabel, k8sClient, crClient)
-		utils.ValidateVariantAutoscalingUniqueness(namespace, modelID, accelerator, crClient)
-
-		By("creating scale-to-zero ConfigMap")
-		configMap := &corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      configMapName,
-				Namespace: controllerNamespace,
-			},
-			Data: map[string]string{
-				fmt.Sprintf("model.%s", modelID): fmt.Sprintf(`{
-					"modelID": "%s",
-					"enableScaleToZero": true,
-					"retentionPeriod": "2m"
-				}`, modelID),
-			},
-		}
-		_, err := k8sClient.CoreV1().ConfigMaps(controllerNamespace).Create(ctx, configMap, metav1.CreateOptions{})
-		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to create ConfigMap: %s", configMapName))
-
-		By("creating vllme deployment with initial replica")
-		deployment := utils.CreateVllmeDeployment(namespace, deployName, modelID, appLabel)
-		deployment.Spec.Replicas = &initialReplicas
-		_, err = k8sClient.AppsV1().Deployments(namespace).Create(ctx, deployment, metav1.CreateOptions{})
-		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to create Deployment: %s", deployName))
-
-		By("creating vllme service")
-		service := utils.CreateVllmeService(namespace, serviceName, appLabel, 30001)
-		_, err = k8sClient.CoreV1().Services(namespace).Create(ctx, service, metav1.CreateOptions{})
-		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to create Service: %s", serviceName))
-
-		By("creating ServiceMonitor for vllme metrics")
-		serviceMonitor := utils.CreateVllmeServiceMonitor(serviceMonName, controllerMonitoringNamespace, appLabel)
-		err = crClient.Create(ctx, serviceMonitor)
-		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to create ServiceMonitor: %s", serviceMonName))
-
-		By("creating VariantAutoscaling resource")
-		variantAutoscaling := utils.CreateVariantAutoscalingResource(namespace, deployName, modelID, accelerator)
-		err = crClient.Create(ctx, variantAutoscaling)
-		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to create VariantAutoscaling: %s", deployName))
-
-		By("creating InferenceModel with 0 traffic for scale-to-zero test")
-		inferenceModel = utils.CreateInferenceModel(deployName, namespace, modelID)
-		err = crClient.Create(ctx, inferenceModel)
-		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to create InferenceModel: %s", modelID))
-
-		By("verifying KEDA is installed")
-		Eventually(func(g Gomega) {
-			podList, err := k8sClient.CoreV1().Pods("keda-system").List(ctx, metav1.ListOptions{
-				LabelSelector: "app.kubernetes.io/name=keda-operator",
-			})
-			g.Expect(err).NotTo(HaveOccurred(), "Should be able to list KEDA pods")
-			g.Expect(podList.Items).NotTo(BeEmpty(), "KEDA operator should be running")
-			for _, pod := range podList.Items {
-				g.Expect(pod.Status.Phase).To(Equal(corev1.PodRunning), fmt.Sprintf("KEDA pod %s should be running", pod.Name))
-			}
-		}, 2*time.Minute, 5*time.Second).Should(Succeed())
-
-		logf.SetLogger(zap.New(zap.WriteTo(GinkgoWriter), zap.UseDevMode(true)))
-	})
-
-	It("deployment should be running initially", func() {
-		Eventually(func() (appsv1.DeploymentStatus, error) {
-			deployment, err := k8sClient.AppsV1().Deployments(namespace).Get(ctx, deployName, metav1.GetOptions{})
-			if err != nil {
-				return appsv1.DeploymentStatus{}, err
-			}
-			return deployment.Status, nil
-		}, 8*time.Minute, 10*time.Second).Should(And(
-			HaveField("ReadyReplicas", BeNumerically("==", initialReplicas)),
-			HaveField("Replicas", BeNumerically("==", initialReplicas)),
-		))
-	})
-
-	It("VariantAutoscaling should be created and reconciled", func() {
-		By("verifying VariantAutoscaling exists")
-		va := &v1alpha1.VariantAutoscaling{}
-		Eventually(func(g Gomega) {
-			err := crClient.Get(ctx, client.ObjectKey{Name: deployName, Namespace: namespace}, va)
-			g.Expect(err).NotTo(HaveOccurred(), "Should be able to get VariantAutoscaling")
-			g.Expect(va.Spec.ModelID).To(Equal(modelID), "ModelID should match")
-		}, 1*time.Minute, 5*time.Second).Should(Succeed())
-	})
-
-	It("deployment should have correct deployment labels", func() {
-		deployment, err := k8sClient.AppsV1().Deployments(namespace).Get(ctx, deployName, metav1.GetOptions{})
-		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to get Deployment: %s", deployName))
-
-		By("verifying deployment selector labels")
-		selector := deployment.Spec.Selector.MatchLabels
-		Expect(selector).To(HaveKeyWithValue("app", appLabel))
-
-		By("verifying pod template labels")
-		podLabels := deployment.Spec.Template.Labels
-		Expect(podLabels).To(HaveKeyWithValue("app", appLabel))
-	})
-
-	It("deployment should have correct resource configuration", func() {
-		deployment, err := k8sClient.AppsV1().Deployments(namespace).Get(ctx, deployName, metav1.GetOptions{})
-		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to get Deployment: %s", deployName))
-
-		By("verifying container resource limits")
-		container := deployment.Spec.Template.Spec.Containers[0]
-		Expect(container.Resources.Limits).To(HaveKeyWithValue(corev1.ResourceName("nvidia.com/gpu"), resource.MustParse("1")))
-
-		By("verifying environment variables")
-		var modelNameEnv *corev1.EnvVar
-		for _, env := range container.Env {
-			if env.Name == "MODEL_NAME" {
-				modelNameEnv = &env
-			}
-		}
-		Expect(modelNameEnv).NotTo(BeNil(), "MODEL_NAME environment variable should be set")
-	})
-
-	It("deployment should have corresponding service with correct selector", func() {
-		service, err := k8sClient.CoreV1().Services(namespace).Get(ctx, serviceName, metav1.GetOptions{})
-		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to get Service: %s", serviceName))
-
-		By("verifying service selector")
-		Expect(service.Spec.Selector).To(HaveKeyWithValue("app", appLabel))
-	})
-
-	It("should scale deployment to zero after idle period with no traffic", func() {
-		// Set up port-forwarding for Prometheus to enable metric verification
-		By("setting up port-forward to Prometheus service for metric verification")
-		prometheusPortForwardCmd := utils.SetUpPortForward(k8sClient, ctx, "kube-prometheus-stack-prometheus", controllerMonitoringNamespace, 9090, 9090)
-		defer func() {
-			err := utils.StopCmd(prometheusPortForwardCmd)
-			Expect(err).NotTo(HaveOccurred(), "Should be able to stop Prometheus port-forwarding")
-		}()
-
-		By("waiting for Prometheus port-forward to be ready")
-		err := utils.VerifyPortForwardReadiness(ctx, 9090, fmt.Sprintf("https://localhost:%d/api/v1/query?query=up", 9090))
-		Expect(err).NotTo(HaveOccurred(), "Prometheus port-forward should be ready within timeout")
-
-		// Wait for controller to reconcile and emit metrics
-		By("waiting for controller to reconcile VariantAutoscaling and emit metrics")
-
-		// Check VariantAutoscaling status to verify controller has reconciled
-		By("checking VariantAutoscaling status before metric verification")
-		Eventually(func(g Gomega) {
-			va := &v1alpha1.VariantAutoscaling{}
-			err := crClient.Get(ctx, client.ObjectKey{Name: deployName, Namespace: namespace}, va)
-			g.Expect(err).NotTo(HaveOccurred(), "Should be able to get VariantAutoscaling")
-
-			_, _ = fmt.Fprintf(GinkgoWriter, "VariantAutoscaling Status: CurrentReplicas=%d, DesiredReplicas=%d, Actuation.Applied=%t\n",
-				va.Status.CurrentAlloc.NumReplicas, va.Status.DesiredOptimizedAlloc.NumReplicas, va.Status.Actuation.Applied)
-			_, _ = fmt.Fprintf(GinkgoWriter, "VariantAutoscaling Spec: Accelerator=%q, VariantID=%q, ModelID=%q\n",
-				va.Spec.Accelerator, va.Spec.VariantID, va.Spec.ModelID)
-
-			// Check if metric emission condition would be satisfied
-			if va.Status.DesiredOptimizedAlloc.NumReplicas < 0 {
-				_, _ = fmt.Fprintf(GinkgoWriter, "⚠ WARNING: DesiredOptimizedAlloc.NumReplicas=%d is negative - metrics will NOT be emitted!\n",
-					va.Status.DesiredOptimizedAlloc.NumReplicas)
-			} else if !va.Status.Actuation.Applied {
-				_, _ = fmt.Fprintf(GinkgoWriter, "⚠ WARNING: Actuation.Applied=false - metrics have NOT been emitted yet!\n")
-			} else {
-				_, _ = fmt.Fprintf(GinkgoWriter, "✓ Metric emission condition satisfied (DesiredReplicas >= 0, Actuation.Applied=true)\n")
-			}
-
-			// CRITICAL: Wait for Actuation.Applied to be true, confirming EmitMetrics succeeded
-			g.Expect(va.Status.Actuation.Applied).To(BeTrue(),
-				"Controller should have successfully emitted metrics (Actuation.Applied should be true)")
-
-			g.Expect(va.Status.DesiredOptimizedAlloc.NumReplicas).To(BeNumerically(">=", 0),
-				"Controller should have set desired replicas")
-		}, 2*time.Minute, 10*time.Second).Should(Succeed(), "Controller should reconcile VariantAutoscaling and emit metrics")
-
-		// Wait additional time for Prometheus to scrape the controller\'s /metrics endpoint
-		By("waiting for Prometheus to scrape metrics from controller")
-		time.Sleep(30 * time.Second) // Prometheus scrape interval is typically 15-30s
-
-		// Verify metrics are being emitted - use the actual CR values like successful tests do
-		By("verifying controller emits replica metrics with correct labels")
-		Eventually(func(g Gomega) {
-			// Fetch the VariantAutoscaling CR to get actual Spec values
-			va := &v1alpha1.VariantAutoscaling{}
-			err := crClient.Get(ctx, client.ObjectKey{Name: deployName, Namespace: namespace}, va)
-			g.Expect(err).NotTo(HaveOccurred(), "Should be able to get VariantAutoscaling")
-
-			// Query metrics using the actual Spec values from the CR (like successful tests)
-			currentReplicasProm, desiredReplicasProm, desiredRatioProm, err := utils.GetInfernoReplicaMetrics(
-				va.Name, namespace, va.Spec.Accelerator, va.Spec.VariantID)
-
-			if err != nil {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Metric query failed (Spec.Accelerator=%q, Spec.VariantID=%q): %v\n",
-					va.Spec.Accelerator, va.Spec.VariantID, err)
-				g.Expect(err).NotTo(HaveOccurred(), "Should be able to query Prometheus metrics")
-			}
-
-			_, _ = fmt.Fprintf(GinkgoWriter, "✓ Metrics found: current=%.0f, desired=%.0f, ratio=%.2f\n",
-				currentReplicasProm, desiredReplicasProm, desiredRatioProm)
-
-			// For scale-to-zero, we expect desired replicas to be 0
-			g.Expect(desiredReplicasProm).To(BeNumerically(">=", 0), "Desired replicas should be non-negative")
-		}, 2*time.Minute, 10*time.Second).Should(Succeed(), "Controller should emit metrics with correct labels")
-
-		// Also verify that we can query metrics without accelerator_type and variant_id (should fail or return different results)
-		By("verifying query without all labels returns empty or different results (diagnostic)")
-		partialQuery := fmt.Sprintf("inferno_desired_replicas{variant_name=\"%s\",exported_namespace=\"%s\"}", deployName, namespace)
-		promClient, err := utils.NewPrometheusClient("https://localhost:9090", true)
-		Expect(err).NotTo(HaveOccurred())
-		ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel2()
-		partialValue, partialErr := promClient.QueryWithRetry(ctx2, partialQuery)
-		if partialErr != nil {
-			_, _ = fmt.Fprintf(GinkgoWriter, "Partial query (without accelerator_type/variant_id) failed as expected: %v\n", partialErr)
-		} else {
-			_, _ = fmt.Fprintf(GinkgoWriter, "Partial query returned value: %.0f (may be different from full query)\n", partialValue)
-		}
-
-		By("creating KEDA ScaledObject for deployment")
-		scaledObject := &unstructured.Unstructured{}
-		scaledObject.SetGroupVersionKind(schema.GroupVersionKind{
-			Group:   "keda.sh",
-			Version: "v1alpha1",
-			Kind:    "ScaledObject",
-		})
-		scaledObject.SetName(deployName + "-scaler")
-		scaledObject.SetNamespace(namespace)
-		scaledObject.Object["spec"] = map[string]interface{}{
-			"scaleTargetRef": map[string]interface{}{
-				"apiVersion": "apps/v1",
-				"kind":       "Deployment",
-				"name":       deployName,
-			},
-			"pollingInterval": int64(5),
-			"cooldownPeriod":  int64(30),
-			"maxReplicaCount": int64(10),
-			"triggers": []interface{}{
-				map[string]interface{}{
-					"type": "prometheus",
-					"metadata": map[string]interface{}{
-						"serverAddress":       "https://kube-prometheus-stack-prometheus.workload-variant-autoscaler-monitoring.svc.cluster.local:9090",
-						"query":               fmt.Sprintf("inferno_desired_replicas{variant_name=\"%s\",exported_namespace=\"%s\",accelerator_type=\"%s\",variant_id=\"%s-%s-1\"}", deployName, namespace, accelerator, modelID, accelerator),
-						"threshold":           "1",
-						"activationThreshold": "0",
-						"metricType":          "AverageValue",
-						"unsafeSsl":           "true",
-					},
-				},
-			},
-		}
-		err = crClient.Create(ctx, scaledObject)
-		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to create ScaledObject: %s", deployName+"-scaler"))
-
-		By("waiting for KEDA ScaledObject to be ready")
-		Eventually(func(g Gomega) {
-			so := &unstructured.Unstructured{}
-			so.SetGroupVersionKind(schema.GroupVersionKind{
-				Group:   "keda.sh",
-				Version: "v1alpha1",
-				Kind:    "ScaledObject",
-			})
-			err := crClient.Get(ctx, client.ObjectKey{Name: deployName + "-scaler", Namespace: namespace}, so)
-			g.Expect(err).NotTo(HaveOccurred(), "Should be able to get ScaledObject")
-
-			// Check if ScaledObject has conditions and is ready
-			conditions, found, err := unstructured.NestedSlice(so.Object, "status", "conditions")
-			if err == nil && found {
-				for _, condition := range conditions {
-					condMap, ok := condition.(map[string]interface{})
-					if !ok {
-						continue
-					}
-					condType, _, _ := unstructured.NestedString(condMap, "type")
-					condStatus, _, _ := unstructured.NestedString(condMap, "status")
-					if condType == "Ready" && condStatus == "True" {
-						_, _ = fmt.Fprintf(GinkgoWriter, "✓ KEDA ScaledObject is ready\n")
-						return
-					}
-				}
-			}
-			_, _ = fmt.Fprintf(GinkgoWriter, "Waiting for KEDA ScaledObject to be ready...\n")
-			g.Expect(found).To(BeTrue(), "ScaledObject should have conditions")
-		}, 3*time.Minute, 5*time.Second).Should(Succeed())
-
-		// Note: Prometheus port-forward already set up earlier in the test for metric verification
-
-		By("waiting for retention period to pass with zero traffic")
-		_, _ = fmt.Fprintf(GinkgoWriter, "Waiting %v for retention period (no traffic simulated)...\n", retentionDuration)
-		time.Sleep(retentionDuration + 30*time.Second) // Add buffer for controller reconciliation
-
-		By("checking totalRequests from Prometheus (what optimizer sees)")
-		totalRequestsQuery := fmt.Sprintf(`sum(increase(vllm_request_success_total{model_name="%s",namespace="%s"}[2m]))`, modelID, namespace)
-		promClient2, err2 := utils.NewPrometheusClient("https://localhost:9090", true)
-		Expect(err2).NotTo(HaveOccurred())
-		ctx3, cancel3 := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel3()
-		totalRequests, err2 := promClient2.QueryWithRetry(ctx3, totalRequestsQuery)
-		if err2 != nil {
-			_, _ = fmt.Fprintf(GinkgoWriter, "⚠ Failed to query totalRequests: %v\n", err2)
-		} else {
-			_, _ = fmt.Fprintf(GinkgoWriter, "📊 totalRequests over retention period: %.0f (query: %s)\n", totalRequests, totalRequestsQuery)
-			if totalRequests > 0 {
-				_, _ = fmt.Fprintf(GinkgoWriter, "⚠ WARNING: totalRequests > 0 - optimizer will keep 1 replica even with zero user traffic!\n")
-			}
-		}
-
-		By("verifying controller sets desiredReplicas to 0 in VariantAutoscaling status")
-		var desiredReplicasProm float64
-		Eventually(func(g Gomega) {
-			va := &v1alpha1.VariantAutoscaling{}
-			err := crClient.Get(ctx, client.ObjectKey{Name: deployName, Namespace: namespace}, va)
-			g.Expect(err).NotTo(HaveOccurred(), "Should be able to get VariantAutoscaling")
-
-			// Debug output to understand the flow
-			_, _ = fmt.Fprintf(GinkgoWriter, "VA Status: DesiredOptimized=%d, Current=%d\n",
-				va.Status.DesiredOptimizedAlloc.NumReplicas,
-				va.Status.CurrentAlloc.NumReplicas)
-
-			// Check status conditions to see if optimizer is running or fallback is used
-			for _, cond := range va.Status.Conditions {
-				if cond.Type == "OptimizationReady" || cond.Type == "MetricsAvailable" {
-					_, _ = fmt.Fprintf(GinkgoWriter, "  Condition: %s=%s, Reason=%s, Message=%s\n",
-						cond.Type, cond.Status, cond.Reason, cond.Message)
-				}
-			}
-
-			// First check if optimizer recommended 0
-			g.Expect(va.Status.DesiredOptimizedAlloc.NumReplicas).To(Equal(int32(0)),
-				"Optimizer should recommend 0 replicas for scale-to-zero scenario")
-
-			// Check if status has current allocation with 0 desired replicas
-			if va.Status.CurrentAlloc.NumReplicas == 0 {
-				_, _ = fmt.Fprintf(GinkgoWriter, "✓ Controller set desiredReplicas to 0 in VariantAutoscaling status\n")
-			} else {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Current desiredReplicas: %d (expected 0)\n", va.Status.CurrentAlloc.NumReplicas)
-			}
-
-			g.Expect(va.Status.CurrentAlloc.NumReplicas).To(Equal(int32(0)),
-				"Controller should set desiredReplicas to 0 after idle period")
-
-			// Verify Prometheus has the correct metric value
-			_, desiredReplicasProm, _, err = utils.GetInfernoReplicaMetrics(va.Name, namespace, va.Spec.Accelerator, va.Spec.VariantID)
-			g.Expect(err).NotTo(HaveOccurred(), "Should be able to query Prometheus metrics")
-
-			// Verify that the desired number of replicas in Prometheus matches VA status
-			g.Expect(int32(desiredReplicasProm)).To(Equal(va.Status.CurrentAlloc.NumReplicas),
-				"Prometheus inferno_desired_replicas should match VA status (both should be 0)")
-		}, 3*time.Minute, 10*time.Second).Should(Succeed())
-
-		By("verifying Prometheus metric is set to 0")
-		_, _ = fmt.Fprintf(GinkgoWriter, "✓ Prometheus inferno_desired_replicas metric: %.0f\n", desiredReplicasProm)
-		Expect(int32(desiredReplicasProm)).To(Equal(int32(0)), "Prometheus metric should be 0")
-
-		By("verifying KEDA scales deployment to 0 replicas")
-		Eventually(func(g Gomega) {
-			deployment, err := k8sClient.AppsV1().Deployments(namespace).Get(ctx, deployName, metav1.GetOptions{})
-			g.Expect(err).NotTo(HaveOccurred(), "Should be able to get Deployment")
-
-			if deployment.Status.Replicas == 0 {
-				_, _ = fmt.Fprintf(GinkgoWriter, "✓ KEDA successfully scaled deployment to 0 replicas\n")
-			} else {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Current replicas: %d (expected 0)\n", deployment.Status.Replicas)
-			}
-
-			g.Expect(deployment.Status.Replicas).To(Equal(int32(0)),
-				"KEDA should scale deployment to 0 replicas")
-			g.Expect(deployment.Status.ReadyReplicas).To(Equal(int32(0)),
-				"Deployment should have 0 ready replicas")
-		}, 5*time.Minute, 15*time.Second).Should(Succeed())
-
-		By("verifying no pods are running")
-		Eventually(func(g Gomega) {
-			podList, err := k8sClient.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
-				LabelSelector: fmt.Sprintf("app=%s", appLabel),
-			})
-			g.Expect(err).NotTo(HaveOccurred(), "Should be able to list Pods")
-			g.Expect(podList.Items).To(BeEmpty(), "No pods should be running after scale-to-zero")
-		}, 2*time.Minute, 10*time.Second).Should(Succeed())
-
-		_, _ = fmt.Fprintf(GinkgoWriter, "✓ Scale-to-zero flow completed successfully\n")
-	})
-
-	AfterAll(func() {
-		By("cleaning up KEDA ScaledObject")
-		scaledObject := &unstructured.Unstructured{}
-		scaledObject.SetGroupVersionKind(schema.GroupVersionKind{
-			Group:   "keda.sh",
-			Version: "v1alpha1",
-			Kind:    "ScaledObject",
-		})
-		scaledObject.SetName(deployName + "-scaler")
-		scaledObject.SetNamespace(namespace)
-		err := crClient.Delete(ctx, scaledObject)
-		err = client.IgnoreNotFound(err)
-		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to delete ScaledObject: %s", deployName+"-scaler"))
-
-		By("cleaning up VariantAutoscaling resource")
-		variantAutoscaling := &v1alpha1.VariantAutoscaling{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      deployName,
-				Namespace: namespace,
-			},
-		}
-		err = crClient.Delete(ctx, variantAutoscaling)
-		err = client.IgnoreNotFound(err)
-		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to delete VariantAutoscaling: %s", deployName))
-
-		By("deleting InferenceModel")
-		err = crClient.Delete(ctx, inferenceModel)
-		err = client.IgnoreNotFound(err)
-		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to delete InferenceModel: %s", modelID))
-
-		By("cleaning up ServiceMonitor")
-		serviceMonitor := &unstructured.Unstructured{}
-		serviceMonitor.SetGroupVersionKind(schema.GroupVersionKind{
-			Group:   "monitoring.coreos.com",
-			Version: "v1",
-			Kind:    "ServiceMonitor",
-		})
-		serviceMonitor.SetName(serviceMonName)
-		serviceMonitor.SetNamespace(controllerMonitoringNamespace)
-		err = crClient.Delete(ctx, serviceMonitor)
-		err = client.IgnoreNotFound(err)
-		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to delete ServiceMonitor: %s", serviceMonName))
-
-		By("cleaning up Service")
-		err = k8sClient.CoreV1().Services(namespace).Delete(ctx, serviceName, metav1.DeleteOptions{})
-		err = client.IgnoreNotFound(err)
-		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to delete Service: %s", serviceName))
-
-		By("cleaning up Deployment")
-		err = k8sClient.AppsV1().Deployments(namespace).Delete(ctx, deployName, metav1.DeleteOptions{})
-		err = client.IgnoreNotFound(err)
-		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to delete Deployment: %s", deployName))
-
-		By("waiting for all pods to be deleted")
-		Eventually(func(g Gomega) {
-			podList, err := k8sClient.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
-				LabelSelector: fmt.Sprintf("app=%s", appLabel),
-			})
-			g.Expect(err).NotTo(HaveOccurred(), "Should be able to list Pods")
-			g.Expect(podList.Items).To(BeEmpty(), fmt.Sprintf("All Pods with label %s should be deleted", appLabel))
-		}, 2*time.Minute, 10*time.Second).Should(Succeed())
-
-		By("cleaning up ConfigMap")
-		err = k8sClient.CoreV1().ConfigMaps(controllerNamespace).Delete(ctx, configMapName, metav1.DeleteOptions{})
-		err = client.IgnoreNotFound(err)
-		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to delete ConfigMap: %s", configMapName))
-	})
-})
