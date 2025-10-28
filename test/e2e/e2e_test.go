@@ -864,6 +864,25 @@ var _ = Describe("Test idle scale-to-zero with KEDA", Ordered, func() {
 	})
 
 	It("should scale deployment to zero after idle period with no traffic", func() {
+		By("ensuring deployment starts at 1 replica for this test")
+		deployment, err := k8sClient.AppsV1().Deployments(namespace).Get(ctx, deployName, metav1.GetOptions{})
+		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to get Deployment: %s", deployName))
+
+		if *deployment.Spec.Replicas == 0 {
+			_, _ = fmt.Fprintf(GinkgoWriter, "Scaling deployment from 0 to 1 to test scale-to-zero flow\n")
+			deployment.Spec.Replicas = &initialReplicas
+			_, err = k8sClient.AppsV1().Deployments(namespace).Update(ctx, deployment, metav1.UpdateOptions{})
+			Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to scale up Deployment: %s", deployName))
+
+			By("waiting for deployment to have ready replicas")
+			Eventually(func(g Gomega) {
+				deployment, err := k8sClient.AppsV1().Deployments(namespace).Get(ctx, deployName, metav1.GetOptions{})
+				g.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to get Deployment: %s", deployName))
+				g.Expect(deployment.Status.ReadyReplicas).To(BeNumerically(">=", 1),
+					"Deployment should have at least 1 ready replica")
+			}, 8*time.Minute, 10*time.Second).Should(Succeed())
+		}
+
 		// Set up port-forwarding for Prometheus to enable metric verification
 		By("setting up port-forward to Prometheus service for metric verification")
 		prometheusPortForwardCmd := utils.SetUpPortForward(k8sClient, ctx, "kube-prometheus-stack-prometheus", controllerMonitoringNamespace, 9090, 9090)
@@ -873,7 +892,7 @@ var _ = Describe("Test idle scale-to-zero with KEDA", Ordered, func() {
 		}()
 
 		By("waiting for Prometheus port-forward to be ready")
-		err := utils.VerifyPortForwardReadiness(ctx, 9090, fmt.Sprintf("https://localhost:%d/api/v1/query?query=up", 9090))
+		err = utils.VerifyPortForwardReadiness(ctx, 9090, fmt.Sprintf("https://localhost:%d/api/v1/query?query=up", 9090))
 		Expect(err).NotTo(HaveOccurred(), "Prometheus port-forward should be ready within timeout")
 
 		// Wait for controller to reconcile and emit metrics
