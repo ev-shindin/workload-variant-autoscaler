@@ -1363,6 +1363,43 @@ var _ = Describe("Test traffic-based scale-to-zero with retention period", Order
 		Expect(service.Spec.Selector).To(HaveKeyWithValue("app", appLabel))
 	})
 
+	It("controller should emit baseline metrics before traffic test", func() {
+		// This test verifies Prometheus is scraping both controller and vLLM BEFORE traffic test
+		// Gives Prometheus time to discover ServiceMonitor (similar to working test pattern)
+		By("setting up port-forward to Prometheus for metric verification")
+		prometheusPortForwardCmd := utils.SetUpPortForward(k8sClient, ctx, "kube-prometheus-stack-prometheus", controllerMonitoringNamespace, 9090, 9090)
+		defer func() {
+			err := utils.StopCmd(prometheusPortForwardCmd)
+			Expect(err).NotTo(HaveOccurred(), "Should be able to stop Prometheus port-forwarding")
+		}()
+
+		By("waiting for Prometheus port-forward to be ready")
+		err := utils.VerifyPortForwardReadiness(ctx, 9090, fmt.Sprintf("https://localhost:%d/api/v1/query?query=up", 9090))
+		Expect(err).NotTo(HaveOccurred(), "Prometheus port-forward should be ready")
+
+		By("waiting for controller to emit baseline metrics")
+		Eventually(func(g Gomega) {
+			va := &v1alpha1.VariantAutoscaling{}
+			err := crClient.Get(ctx, client.ObjectKey{Name: deployName, Namespace: namespace}, va)
+			g.Expect(err).NotTo(HaveOccurred(), "Should be able to get VariantAutoscaling")
+
+			// Verify controller emitted metrics (Actuation.Applied = true)
+			g.Expect(va.Status.Actuation.Applied).To(BeTrue(),
+				"Controller should have emitted metrics before traffic test")
+
+			// Verify we can query controller-emitted metrics from Prometheus
+			_, desiredReplicasProm, _, err := utils.GetInfernoReplicaMetrics(va.Name, namespace, va.Spec.Accelerator, va.Spec.VariantID)
+			g.Expect(err).NotTo(HaveOccurred(), "Should be able to query controller metrics from Prometheus")
+
+			_, _ = fmt.Fprintf(GinkgoWriter, "✓ Controller emitting baseline metrics: desired=%.0f\n", desiredReplicasProm)
+		}, 3*time.Minute, 10*time.Second).Should(Succeed(), "Prometheus should be scraping controller metrics")
+
+		By("waiting for Prometheus to potentially discover and scrape vLLM pod")
+		// Additional time for Prometheus to discover ServiceMonitor and start scraping vLLM
+		_, _ = fmt.Fprintf(GinkgoWriter, "Waiting additional 2 minutes for Prometheus ServiceMonitor discovery...\n")
+		time.Sleep(2 * time.Minute)
+	})
+
 	It("should scale to zero after traffic stops and retention period expires", func() {
 		// This test verifies the complete scale-to-zero flow:
 		// 1. Start with traffic (30 seconds) -> optimizer keeps replicas
@@ -1494,12 +1531,11 @@ var _ = Describe("Test traffic-based scale-to-zero with retention period", Order
 
 		_, _ = fmt.Fprintf(GinkgoWriter, "Starting traffic generation at %d req/s...\n", loadRate)
 
-		// Wait for metrics pipeline: vLLM emits -> Prometheus scrapes -> Controller queries rate([1m])
-		// Prometheus needs: 1-2min to discover ServiceMonitor + 15-30s scrape interval + 60s for rate([1m]) data
-		// Unlike working tests (which have earlier It() blocks giving discovery time), this test runs immediately
-		By("waiting for Prometheus to discover ServiceMonitor, scrape vLLM metrics, and accumulate rate data")
-		_, _ = fmt.Fprintf(GinkgoWriter, "Waiting 3.5 minutes for Prometheus discovery + scraping + rate accumulation...\n")
-		time.Sleep(210 * time.Second) // 3.5 minutes
+		// Previous It() block gave Prometheus 5 minutes for ServiceMonitor discovery
+		// Now just wait for rate([1m]) data accumulation: 60s + scrape interval
+		By("waiting for vLLM metrics rate data to accumulate")
+		_, _ = fmt.Fprintf(GinkgoWriter, "Waiting 90 seconds for rate([1m]) data accumulation...\n")
+		time.Sleep(90 * time.Second)
 
 		By("waiting for controller to process traffic and emit metrics")
 		Eventually(func(g Gomega) {
