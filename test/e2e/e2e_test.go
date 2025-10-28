@@ -1438,9 +1438,10 @@ var _ = Describe("Test traffic-based scale-to-zero with retention period", Order
 			}
 		}()
 
-		By("waiting for load generator to install dependencies")
-		_, _ = fmt.Fprintf(GinkgoWriter, "Waiting 60 seconds for pip install to complete...\n")
-		time.Sleep(60 * time.Second)
+		By("waiting for load generator to install dependencies and traffic to accumulate")
+		_, _ = fmt.Fprintf(GinkgoWriter, "Waiting for pip install (60s) + traffic accumulation (90s)...\n")
+		_, _ = fmt.Fprintf(GinkgoWriter, "Controller needs 2-minute window of traffic data: increase(vllm_request_success_total[2m])\n")
+		time.Sleep(150 * time.Second) // 60s pip install + 90s for traffic data
 
 		By("waiting for load to be processed and scaling decision to be made")
 		Eventually(func(g Gomega) {
