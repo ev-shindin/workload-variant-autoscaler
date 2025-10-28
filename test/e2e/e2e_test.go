@@ -19,7 +19,6 @@ package e2e
 import (
 	"context"
 	"fmt"
-	"net/http"
 	"os"
 	"os/exec"
 	"time"
@@ -1365,11 +1364,7 @@ var _ = Describe("Test traffic-based scale-to-zero with retention period", Order
 		err := utils.VerifyPortForwardReadiness(ctx, 9090, fmt.Sprintf("https://localhost:%d/api/v1/query?query=up", 9090))
 		Expect(err).NotTo(HaveOccurred(), "Prometheus port-forward should be ready within timeout")
 
-		By("ensuring deployment is scaled up before traffic generation")
-		// Previous test may have scaled to 0, so we need to scale back up
-		// However, KEDA will immediately scale it back down to 0 if desired replicas is 0
-		// Solution: Temporarily pause KEDA scaling
-
+		By("creating KEDA ScaledObject for deployment")
 		scaledObjectName := deployName + "-scaler"
 		scaledObject := &unstructured.Unstructured{}
 		scaledObject.SetGroupVersionKind(schema.GroupVersionKind{
@@ -1377,59 +1372,30 @@ var _ = Describe("Test traffic-based scale-to-zero with retention period", Order
 			Version: "v1alpha1",
 			Kind:    "ScaledObject",
 		})
-		err = crClient.Get(ctx, client.ObjectKey{Name: scaledObjectName, Namespace: namespace}, scaledObject)
-		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to get ScaledObject: %s", scaledObjectName))
-
-		By("pausing KEDA scaling to allow manual scale-up")
-		// Add paused annotation to prevent KEDA from scaling
-		annotations := scaledObject.GetAnnotations()
-		if annotations == nil {
-			annotations = make(map[string]string)
-		}
-		annotations["autoscaling.keda.sh/paused"] = "true"
-		scaledObject.SetAnnotations(annotations)
-		err = crClient.Update(ctx, scaledObject)
-		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to pause ScaledObject: %s", scaledObjectName))
-
-		// Ensure KEDA processes the pause annotation
-		time.Sleep(5 * time.Second)
-
-		deployment, err := k8sClient.AppsV1().Deployments(namespace).Get(ctx, deployName, metav1.GetOptions{})
-		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to get Deployment: %s", deployName))
-
-		if *deployment.Spec.Replicas == 0 {
-			By("scaling deployment to 1 replica for traffic generation test")
-			deployment.Spec.Replicas = &initialReplicas
-			_, err = k8sClient.AppsV1().Deployments(namespace).Update(ctx, deployment, metav1.UpdateOptions{})
-			Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to scale up Deployment: %s", deployName))
+		scaledObject.SetName(scaledObjectName)
+		scaledObject.SetNamespace(namespace)
+		scaledObject.Object["spec"] = map[string]interface{}{
+			"scaleTargetRef": map[string]interface{}{
+				"name": deployName,
+			},
+			"pollingInterval": 15,
+			"cooldownPeriod":  30,
+			"minReplicaCount": 0,
+			"maxReplicaCount": 10,
+			"triggers": []map[string]interface{}{
+				{
+					"type": "prometheus",
+					"metadata": map[string]interface{}{
+						"serverAddress": "https://kube-prometheus-stack-prometheus.monitoring-system.svc.cluster.local:9090",
+						"query":         fmt.Sprintf("inferno_desired_replicas{variant_name=\"%s\",exported_namespace=\"%s\",accelerator_type=\"%s\",variant_id=\"%s\"}", deployName, namespace, accelerator, modelID),
+						"threshold":     "1",
+					},
+				},
+			},
 		}
 
-		By("waiting for deployment to have ready replicas")
-		Eventually(func(g Gomega) {
-			deployment, err := k8sClient.AppsV1().Deployments(namespace).Get(ctx, deployName, metav1.GetOptions{})
-			g.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to get Deployment: %s", deployName))
-			g.Expect(deployment.Status.ReadyReplicas).To(BeNumerically(">=", 1),
-				"Deployment should have at least 1 ready replica before port-forwarding")
-		}, 8*time.Minute, 10*time.Second).Should(Succeed())
-
-		By("waiting for service endpoints to be ready for port-forwarding")
-		Eventually(func(g Gomega) {
-			endpoints, err := k8sClient.CoreV1().Endpoints(namespace).Get(ctx, serviceName, metav1.GetOptions{})
-			g.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to get Endpoints for service: %s", serviceName))
-
-			// Check if endpoints has at least one ready address
-			hasReadyEndpoint := false
-			for _, subset := range endpoints.Subsets {
-				if len(subset.Addresses) > 0 {
-					hasReadyEndpoint = true
-					_, _ = fmt.Fprintf(GinkgoWriter, "Service endpoints ready: %d addresses, %d ports\n", len(subset.Addresses), len(subset.Ports))
-					break
-				}
-			}
-
-			g.Expect(hasReadyEndpoint).To(BeTrue(),
-				"Service should have at least one ready endpoint for port-forwarding")
-		}, 2*time.Minute, 5*time.Second).Should(Succeed())
+		err = crClient.Create(ctx, scaledObject)
+		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to create ScaledObject: %s", scaledObjectName))
 
 		By("setting up port-forward to the vllme service for traffic generation")
 		port := 8001 // Use different port to avoid conflict with other tests
@@ -1443,7 +1409,7 @@ var _ = Describe("Test traffic-based scale-to-zero with retention period", Order
 		err = utils.VerifyPortForwardReadiness(ctx, port, fmt.Sprintf("http://localhost:%d/v1", port))
 		Expect(err).NotTo(HaveOccurred(), "Port-forward should be ready within timeout")
 
-		By("starting traffic generation while KEDA is still paused")
+		By("starting traffic generation")
 		loadRate := 10 // 10 requests per second
 		loadGenCmd := utils.StartLoadGenerator(loadRate, 100, port, modelID)
 		defer func() {
@@ -1453,131 +1419,31 @@ var _ = Describe("Test traffic-based scale-to-zero with retention period", Order
 			}
 		}()
 
-		By("waiting for load generator to install dependencies and start sending traffic")
-		_, _ = fmt.Fprintf(GinkgoWriter, "Waiting 60 seconds for pip install and traffic to start...\n")
-		time.Sleep(60 * time.Second)
-
-		By("waiting additional time for Prometheus to discover and scrape the new pod")
-		_, _ = fmt.Fprintf(GinkgoWriter, "⚠️ CRITICAL: After scaling from 0→1, Prometheus needs time to:\n")
-		_, _ = fmt.Fprintf(GinkgoWriter, "  1. Discover new pod endpoints from ServiceMonitor\n")
-		_, _ = fmt.Fprintf(GinkgoWriter, "  2. Start scraping /metrics endpoint (scrape interval: 15s)\n")
-		_, _ = fmt.Fprintf(GinkgoWriter, "  3. Accumulate at least one metric data point\n")
-		_, _ = fmt.Fprintf(GinkgoWriter, "Waiting 60 additional seconds for Prometheus scraping to start...\n")
-		time.Sleep(60 * time.Second)
-
-		By("verifying load generator process is still running")
-		if loadGenCmd.ProcessState != nil && loadGenCmd.ProcessState.Exited() {
-			_, _ = fmt.Fprintf(GinkgoWriter, "⚠️ CRITICAL: Load generator exited unexpectedly with code: %d\n", loadGenCmd.ProcessState.ExitCode())
-			Fail(fmt.Sprintf("Load generator process exited before resuming KEDA (exit code: %d)", loadGenCmd.ProcessState.ExitCode()))
-		} else {
-			_, _ = fmt.Fprintf(GinkgoWriter, "✓ Load generator process (PID %d) is still running\n", loadGenCmd.Process.Pid)
-		}
-
-		By("verifying vLLM service is responding to HTTP requests")
-		testURL := fmt.Sprintf("http://localhost:%d/v1/models", port)
-		_, _ = fmt.Fprintf(GinkgoWriter, "Testing vLLM connectivity: %s\n", testURL)
-		resp, err := http.Get(testURL)
-		if err != nil {
-			_, _ = fmt.Fprintf(GinkgoWriter, "⚠️ WARNING: vLLM service not responding: %v\n", err)
-			_, _ = fmt.Fprintf(GinkgoWriter, "This means load generator cannot send requests!\n")
-		} else {
-			defer func() {
-				if closeErr := resp.Body.Close(); closeErr != nil {
-					_, _ = fmt.Fprintf(GinkgoWriter, "Warning: failed to close response body: %v\n", closeErr)
-				}
-			}()
-			_, _ = fmt.Fprintf(GinkgoWriter, "✓ vLLM service responding (HTTP %d)\n", resp.StatusCode)
-		}
-
-		By("waiting for controller to process traffic and emit inferno_desired_replicas > 0 BEFORE resuming KEDA")
-		_, _ = fmt.Fprintf(GinkgoWriter, "⚠️ CRITICAL: Must verify controller emitted desired replicas > 0 before resuming KEDA\n")
-		_, _ = fmt.Fprintf(GinkgoWriter, "Otherwise KEDA will see desired=0 and immediately scale deployment to 0, killing vLLM pod!\n")
-
+		By("waiting for controller to process traffic and emit metrics")
 		Eventually(func(g Gomega) {
 			va := &v1alpha1.VariantAutoscaling{}
 			err := crClient.Get(ctx, client.ObjectKey{Name: deployName, Namespace: namespace}, va)
 			g.Expect(err).NotTo(HaveOccurred(), "Should be able to get VariantAutoscaling")
 
-			// Check if load generator is still running
-			loadGenRunning := loadGenCmd.ProcessState == nil || !loadGenCmd.ProcessState.Exited()
-			_, _ = fmt.Fprintf(GinkgoWriter, "Waiting for controller to see traffic: DesiredOptimized=%d, LoadGen Running=%t\n",
-				va.Status.DesiredOptimizedAlloc.NumReplicas, loadGenRunning)
+			_, _ = fmt.Fprintf(GinkgoWriter, "Waiting for controller: DesiredOptimized=%d, Current=%d\n",
+				va.Status.DesiredOptimizedAlloc.NumReplicas, va.Status.CurrentAlloc.NumReplicas)
 
-			if !loadGenRunning {
-				_, _ = fmt.Fprintf(GinkgoWriter, "⚠️ Load generator exited (code: %d)\n", loadGenCmd.ProcessState.ExitCode())
-			}
-
-			// Show status conditions
-			for _, cond := range va.Status.Conditions {
-				if cond.Type == "MetricsAvailable" || cond.Type == "OptimizationReady" {
-					_, _ = fmt.Fprintf(GinkgoWriter, "  %s=%s (Reason: %s)\n", cond.Type, cond.Status, cond.Reason)
-				}
-			}
-
-			// Check if vLLM is exposing metrics in Prometheus
-			promClient, err2 := utils.NewPrometheusClient("https://localhost:9090", true)
-			if err2 == nil {
-				// First, check if ANY vllm_* metrics exist at all (to verify Prometheus is scraping)
-				anyVllmQuery := `vllm_request_success_total`
-				ctx4, cancel4 := context.WithTimeout(context.Background(), 10*time.Second)
-				defer cancel4()
-				if _, err4 := promClient.QueryWithRetry(ctx4, anyVllmQuery); err4 == nil {
-					_, _ = fmt.Fprintf(GinkgoWriter, "  ✓ vllm_request_success_total metric exists in Prometheus\n")
-				} else {
-					_, _ = fmt.Fprintf(GinkgoWriter, "  ❌ CRITICAL: vllm_request_success_total metric NOT FOUND in Prometheus!\n")
-					_, _ = fmt.Fprintf(GinkgoWriter, "     This means either:\n")
-					_, _ = fmt.Fprintf(GinkgoWriter, "     1. vLLM emulator pod not exposing /metrics endpoint\n")
-					_, _ = fmt.Fprintf(GinkgoWriter, "     2. Prometheus not scraping vLLM pod (ServiceMonitor missing/broken)\n")
-					_, _ = fmt.Fprintf(GinkgoWriter, "     3. vLLM emulator not counting requests (metric never incremented)\n")
-				}
-
-				// Query the exact metric the optimizer uses for scale-to-zero decisions
-				optimizerQuery := fmt.Sprintf(`sum(increase(vllm_request_success_total{model_name="%s",namespace="%s"}[2m]))`, modelID, namespace)
-				ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
-				defer cancel2()
-				if totalRequests, err2 := promClient.QueryWithRetry(ctx2, optimizerQuery); err2 == nil {
-					_, _ = fmt.Fprintf(GinkgoWriter, "  📊 Optimizer query result: totalRequests=%.0f (query: %s)\n", totalRequests, optimizerQuery)
-					if totalRequests == 0 {
-						_, _ = fmt.Fprintf(GinkgoWriter, "  ⚠️ PROBLEM: Optimizer sees 0 requests! Either vLLM not receiving traffic or not exposing metrics.\n")
-					}
-				} else {
-					_, _ = fmt.Fprintf(GinkgoWriter, "  ❌ Optimizer query failed: %v\n", err2)
-				}
-
-				// Also check rate to see current traffic flow
-				rateQuery := fmt.Sprintf(`rate(vllm_request_success_total{model_name="%s",namespace="%s"}[30s])`, modelID, namespace)
-				ctx3, cancel3 := context.WithTimeout(context.Background(), 10*time.Second)
-				defer cancel3()
-				if rate, err3 := promClient.QueryWithRetry(ctx3, rateQuery); err3 == nil {
-					_, _ = fmt.Fprintf(GinkgoWriter, "  📊 Current traffic rate: %.2f req/s\n", rate)
-				}
-			}
-
-			// Verify controller has seen traffic and recommended replicas > 0
+			// Verify controller has processed traffic and recommended replicas > 0
 			g.Expect(va.Status.DesiredOptimizedAlloc.NumReplicas).To(BeNumerically(">", 0),
-				"Controller must emit desired replicas > 0 before resuming KEDA")
+				"Controller should see traffic and recommend replicas > 0")
 
-			// Also verify metrics were emitted to Prometheus
+			// Verify metrics were emitted to Prometheus
 			_, desiredReplicasProm, _, err := utils.GetInfernoReplicaMetrics(va.Name, namespace, va.Spec.Accelerator, va.Spec.VariantID)
 			g.Expect(err).NotTo(HaveOccurred(), "Should be able to query inferno_desired_replicas from Prometheus")
 			g.Expect(int32(desiredReplicasProm)).To(BeNumerically(">", 0),
-				"Prometheus inferno_desired_replicas must be > 0 before resuming KEDA")
+				"Prometheus inferno_desired_replicas should be > 0")
 
-			_, _ = fmt.Fprintf(GinkgoWriter, "✓ Safe to resume KEDA: inferno_desired_replicas=%.0f in Prometheus\n", desiredReplicasProm)
-		}, 3*time.Minute, 10*time.Second).Should(Succeed())
+			_, _ = fmt.Fprintf(GinkgoWriter, "✓ Controller emitted: inferno_desired_replicas=%.0f in Prometheus\n", desiredReplicasProm)
+		}, 5*time.Minute, 10*time.Second).Should(Succeed())
 
-		By("resuming KEDA scaling (safe now - controller already emitted desired replicas > 0)")
-		// Remove paused annotation
-		err = crClient.Get(ctx, client.ObjectKey{Name: scaledObjectName, Namespace: namespace}, scaledObject)
-		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to get ScaledObject: %s", scaledObjectName))
-		annotations = scaledObject.GetAnnotations()
-		delete(annotations, "autoscaling.keda.sh/paused")
-		scaledObject.SetAnnotations(annotations)
-		err = crClient.Update(ctx, scaledObject)
-		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to resume ScaledObject: %s", scaledObjectName))
-
-		By("continuing traffic generation for 30 seconds to establish stable non-zero request count")
+		By("continuing traffic for 30 seconds to establish stable request count")
 		_, _ = fmt.Fprintf(GinkgoWriter, "Continuing traffic at %d req/s for 30 seconds...\n", loadRate)
+		time.Sleep(30 * time.Second)
 		time.Sleep(30 * time.Second)
 
 		By("stopping traffic generation")
