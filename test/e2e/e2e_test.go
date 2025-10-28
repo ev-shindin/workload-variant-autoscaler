@@ -703,7 +703,6 @@ var _ = Describe("Test workload-variant-autoscaler with vllme deployment - singl
 	})
 })
 
-
 var _ = Describe("Test idle scale-to-zero with KEDA", Ordered, func() {
 	var (
 		namespace         string
@@ -1729,7 +1728,6 @@ var _ = Describe("Test traffic-based scale-to-zero with retention period", Order
 	})
 })
 
-
 var _ = Describe("Test workload-variant-autoscaler with vllme deployment - multiple VAs - critical requests", Ordered, func() {
 	var (
 		namespace                string
@@ -2254,4 +2252,3 @@ var _ = Describe("Test workload-variant-autoscaler with vllme deployment - multi
 		}, 1*time.Minute, 1*time.Second).Should(Succeed())
 	})
 })
-
