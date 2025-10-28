@@ -1,48 +1,79 @@
 wva:
-  enabled: true
-
+  baseName: inference-scheduling
   image:
     repository: ghcr.io/llm-d/workload-variant-autoscaler
-    tag: latest
-  imagePullPolicy: Always
+    tag: v0.0.1
+
+  replicaCount: 1
+  modelName: ms-inference-scheduling-llm-d-modelservice
+
+  monitoringNamespace: openshift-user-workload-monitoring
 
   metrics:
     enabled: true
     port: 8443
     secure: true
-  
-  reconcileInterval: 60s
-    
-  prometheus:
-    monitoringNamespace: openshift-user-workload-monitoring
-    baseURL: "https://thanos-querier.openshift-monitoring.svc.cluster.local:9091"
-    # Security configuration
-    tls:
-      # Note: insecureSkipVerify defaults to true for backward compatibility
-      # Override to false in production deployments for strict TLS verification
-      caCertPath: "/etc/ssl/certs/prometheus-ca.crt"
-    # caCert: |  # Uncomment and provide your CA certificate
-    #   -----BEGIN CERTIFICATE-----
-    #   YOUR_CA_CERTIFICATE_HERE
-    #   -----END CERTIFICATE-----
-llmd:
-  namespace: llm-d-inference-scheduler
-  modelName: ms-inference-scheduling-llm-d-modelservice
-  modelID: "unsloth/Meta-Llama-3.1-8B"
 
-va:
+  hpa:
+    enabled: true
+
+  va:
+    enabled: true
+
+prometheusAdapter:
   enabled: true
-  accelerator: H100
-  sloTpot: 10
+  namespaceOverride: openshift-user-workload-monitoring
+
+llmd:
+  namespace: llm-d-inference-scheduling
+
+variantAutoscaling:
+  enabled: true
+  modelID: "unsloth/Meta-Llama-3.1-8B"
+  sloTpot: 9
   sloTtft: 1000
+  # Define multiple variants - one for each accelerator type
+  # Each variant will create a separate VariantAutoscaling resource
+  variants:
+    - accelerator: "L40S"
+      acceleratorCount: 1
+      maxBatchSize: 512
+      perfParms:
+        decodeParms:
+          alpha: "22.619"
+          beta: "0.181"
+        prefillParms:
+          gamma: "226.19"
+          delta: "0.018"
+    - accelerator: "H100"
+      acceleratorCount: 1
+      maxBatchSize: 512
+      perfParms:
+        decodeParms:
+          alpha: "6.958"
+          beta: "0.042"
+        prefillParms:
+          gamma: "5.2"
+          delta: "0.1"
 
 hpa:
-  enabled: true
   maxReplicas: 10
   targetAverageValue: "1"
+
+guidellm:
+  enabled: false
+  image: quay.io/vishakharamani/guidellm:latest
+  rate: 8
+  maxSeconds: 1800
 
 vllmService:
   enabled: true
   nodePort: 30000
   interval: 15s
-  scheme: http  # vLLM emulator runs on HTTP
+
+prometheus:
+  baseURL: "https://thanos-querier.openshift-monitoring.svc.cluster.local:9091"
+  caCert: |
+    -----BEGIN CERTIFICATE-----
+    placeholder...
+    -----END CERTIFICATE-----

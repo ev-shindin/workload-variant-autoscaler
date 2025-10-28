@@ -19,7 +19,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strconv"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -188,19 +187,18 @@ var _ = Describe("Optimizer", Ordered, func() {
 						},
 					},
 					Spec: llmdVariantAutoscalingV1alpha1.VariantAutoscalingSpec{
-						ModelID: "meta/llama0-70b",
-						ModelProfile: llmdVariantAutoscalingV1alpha1.ModelProfile{
-							Accelerators: []llmdVariantAutoscalingV1alpha1.AcceleratorProfile{
-								{
-									Acc:      "A100",
-									AccCount: 1,
-									PerfParms: llmdVariantAutoscalingV1alpha1.PerfParms{
-										DecodeParms:  map[string]string{"alpha": "20.28", "beta": "0.72"},
-										PrefillParms: map[string]string{"gamma": "0", "delta": "0"},
-									},
-									MaxBatchSize: 4,
-								},
+						ModelID:          "meta/llama0-70b",
+						VariantID:        "meta/llama0-70b-A100-1",
+						Accelerator:      "A100",
+						AcceleratorCount: 1,
+						VariantCost:      "10.5",
+						MinReplicas:      &minNumReplicas,
+						VariantProfile: llmdVariantAutoscalingV1alpha1.VariantProfile{
+							PerfParms: llmdVariantAutoscalingV1alpha1.PerfParms{
+								DecodeParms:  map[string]string{"alpha": "20.28", "beta": "0.72"},
+								PrefillParms: map[string]string{"gamma": "0", "delta": "0"},
 							},
+							MaxBatchSize: 4,
 						},
 						SLOClassRef: llmdVariantAutoscalingV1alpha1.ConfigMapKeyRef{
 							Name: "premium",
@@ -273,18 +271,11 @@ var _ = Describe("Optimizer", Ordered, func() {
 				_, className, err := utils.FindModelSLO(serviceClassCm, modelName)
 				Expect(err).NotTo(HaveOccurred(), "failed to find model SLO for model - ", modelName, ", variantAutoscaling - ", va.Name)
 
-				for _, modelAcceleratorProfile := range va.Spec.ModelProfile.Accelerators {
-					err = utils.AddModelAcceleratorProfileToSystemData(systemData, modelName, &modelAcceleratorProfile)
-					Expect(err).NotTo(HaveOccurred(), "failed to add model accelerator profile to system data for model - ", modelName, ", variantAutoscaling - ", va.Name)
-				}
+				// Single-variant architecture: add the variant profile to system data
+				err = utils.AddVariantProfileToSystemData(systemData, modelName, va.Spec.Accelerator, va.Spec.AcceleratorCount, &va.Spec.VariantProfile)
+				Expect(err).NotTo(HaveOccurred(), "failed to add variant profile to system data for model - ", modelName, ", variantAutoscaling - ", va.Name)
 
-				accName := va.Labels["inference.optimization/acceleratorName"]
-				Expect(accName).NotTo(BeEmpty(), "variantAutoscaling missing acceleratorName label, skipping optimization - ", "variantAutoscaling-name: ", va.Name)
-				acceleratorCostVal, ok := acceleratorCm[accName]["cost"]
-				Expect(ok).NotTo(BeFalse(), "variantAutoscaling missing accelerator cost in configMap, skipping optimization - ", "variantAutoscaling-name: ", va.Name)
-				acceleratorCostValFloat, err := strconv.ParseFloat(acceleratorCostVal, 32)
-				Expect(err).NotTo(HaveOccurred(), "failed to parse accelerator cost value to float for variantAutoscaling - ", "variantAutoscaling-name: ", va.Name)
-
+				// In single-variant architecture, cost is in spec, not extracted from ConfigMap
 				var deploy appsv1.Deployment
 				err = utils.GetDeploymentWithBackoff(ctx, k8sClient, va.Name, va.Namespace, &deploy)
 				Expect(err).NotTo(HaveOccurred(), "failed to get deployment for variantAutoscaling - ", "variantAutoscaling-name: ", va.Name)
@@ -293,11 +284,20 @@ var _ = Describe("Optimizer", Ordered, func() {
 				err = utils.GetVariantAutoscalingWithBackoff(ctx, k8sClient, deploy.Name, deploy.Namespace, &updateVA)
 				Expect(err).NotTo(HaveOccurred(), "failed to get variantAutoscaling for deployment - ", "deployment-name: ", deploy.Name)
 
-				currentAllocation, err := collector.AddMetricsToOptStatus(ctx, &updateVA, deploy, acceleratorCostValFloat, &testutils.MockPromAPI{})
-				Expect(err).NotTo(HaveOccurred(), "unable to fetch metrics and add to Optimizer status for variantAutoscaling - ", "variantAutoscaling-name: ", va.Name)
+				// Collect allocation and metrics using new API
+				// In single-variant architecture, cost is in spec, not passed to collector
+				currentAllocation, err := collector.CollectAllocationForDeployment(updateVA.Spec.VariantID, updateVA.Spec.Accelerator, deploy)
+				Expect(err).NotTo(HaveOccurred(), "unable to collect allocation data for variantAutoscaling - ", "variantAutoscaling-name: ", va.Name)
+				load, ttftAvg, itlAvg, err := collector.CollectAggregateMetrics(ctx, updateVA.Spec.ModelID, deploy.Namespace, &testutils.MockPromAPI{})
+				Expect(err).NotTo(HaveOccurred(), "unable to fetch aggregate metrics for variantAutoscaling - ", "variantAutoscaling-name: ", va.Name)
 				updateVA.Status.CurrentAlloc = currentAllocation
 
-				err = utils.AddServerInfoToSystemData(systemData, &updateVA, className)
+				// Extract metrics to internal structure (all metrics passed separately)
+				metrics, err := interfaces.NewVariantMetrics(load, ttftAvg, itlAvg)
+				Expect(err).NotTo(HaveOccurred(), "failed to parse variant metrics for variantAutoscaling - ", "variantAutoscaling-name: ", va.Name)
+
+				// Pass empty scale-to-zero config for this test
+				err = utils.AddServerInfoToSystemData(systemData, &updateVA, className, metrics, utils.ScaleToZeroConfigData{})
 				Expect(err).NotTo(HaveOccurred(), "failed to add server info to system data for variantAutoscaling - ", "variantAutoscaling-name: ", va.Name)
 
 				By("Updating system data with VariantAutoscaling info")
@@ -325,7 +325,9 @@ var _ = Describe("Optimizer", Ordered, func() {
 			}
 
 			By("Performing optimization")
-			optimizedAllocs, err := engine.Optimize(ctx, updateList, allAnalyzerResponses)
+			scaleToZeroConfigData := make(utils.ScaleToZeroConfigData)
+			scaleToZeroCache := collector.NewScaleToZeroMetricsCache()
+			optimizedAllocs, err := engine.Optimize(ctx, updateList, allAnalyzerResponses, &scaleToZeroConfigData, scaleToZeroCache)
 			Expect(err).NotTo(HaveOccurred(), "unable to perform model optimization")
 			Expect(len(optimizedAllocs)).To(Equal(len(updateList.Items)), "Expected optimized allocations for all VariantAutoscalings")
 			for key, value := range optimizedAllocs {
@@ -371,18 +373,11 @@ var _ = Describe("Optimizer", Ordered, func() {
 				_, className, err := utils.FindModelSLO(serviceClassCm, modelName)
 				Expect(err).NotTo(HaveOccurred(), "failed to find model SLO for model - ", modelName, ", variantAutoscaling - ", va.Name)
 
-				for _, modelAcceleratorProfile := range va.Spec.ModelProfile.Accelerators {
-					err = utils.AddModelAcceleratorProfileToSystemData(systemData, modelName, &modelAcceleratorProfile)
-					Expect(err).NotTo(HaveOccurred(), "failed to add model accelerator profile to system data for model - ", modelName, ", variantAutoscaling - ", va.Name)
-				}
+				// Single-variant architecture: add the variant profile to system data
+				err = utils.AddVariantProfileToSystemData(systemData, modelName, va.Spec.Accelerator, va.Spec.AcceleratorCount, &va.Spec.VariantProfile)
+				Expect(err).NotTo(HaveOccurred(), "failed to add variant profile to system data for model - ", modelName, ", variantAutoscaling - ", va.Name)
 
-				accName := va.Labels["inference.optimization/acceleratorName"]
-				Expect(accName).NotTo(BeEmpty(), "variantAutoscaling missing acceleratorName label, skipping optimization - ", "variantAutoscaling-name: ", va.Name)
-				acceleratorCostVal, ok := acceleratorCm[accName]["cost"]
-				Expect(ok).NotTo(BeFalse(), "variantAutoscaling missing accelerator cost in configMap, skipping optimization - ", "variantAutoscaling-name: ", va.Name)
-				acceleratorCostValFloat, err := strconv.ParseFloat(acceleratorCostVal, 32)
-				Expect(err).NotTo(HaveOccurred(), "failed to parse accelerator cost value to float for variantAutoscaling - ", "variantAutoscaling-name: ", va.Name)
-
+				// In single-variant architecture, cost is in spec, not extracted from ConfigMap
 				var deploy appsv1.Deployment
 				err = utils.GetDeploymentWithBackoff(ctx, k8sClient, va.Name, va.Namespace, &deploy)
 				Expect(err).NotTo(HaveOccurred(), "failed to get deployment for variantAutoscaling - ", "variantAutoscaling-name: ", va.Name)
@@ -394,19 +389,16 @@ var _ = Describe("Optimizer", Ordered, func() {
 				// Setup high load metrics for simulation
 				testNamespace := va.Namespace
 				arrivalQuery := testutils.CreateArrivalQuery(modelName, testNamespace)
-				avgDecToksQuery := testutils.CreateDecToksQuery(modelName, testNamespace)
-				avgPromptToksQuery := testutils.CreatePromptToksQuery(modelName, testNamespace)
-				ttftQuery := testutils.CreateTTFTQuery(modelName, testNamespace)
+				avgDecToksQuery := testutils.CreateTokenQuery(modelName, testNamespace)
+				ttftQuery := testutils.CreateWaitQuery(modelName, testNamespace)
 				itlQuery := testutils.CreateITLQuery(modelName, testNamespace)
+
 				// High load metrics that should trigger scaling up
 				mockProm.QueryResults[arrivalQuery] = model.Vector{
-					&model.Sample{Value: model.SampleValue(20.0)},
+					&model.Sample{Value: model.SampleValue(40.0)}, // 40 requests/min - high load
 				}
 				mockProm.QueryResults[avgDecToksQuery] = model.Vector{
 					&model.Sample{Value: model.SampleValue(200.0)},
-				}
-				mockProm.QueryResults[avgPromptToksQuery] = model.Vector{
-					&model.Sample{Value: model.SampleValue(20)},
 				}
 				mockProm.QueryResults[ttftQuery] = model.Vector{
 					&model.Sample{Value: model.SampleValue(0.02)},
@@ -415,11 +407,20 @@ var _ = Describe("Optimizer", Ordered, func() {
 					&model.Sample{Value: model.SampleValue(0.008)},
 				}
 
-				currentAllocation, err := collector.AddMetricsToOptStatus(ctx, &updateVA, deploy, acceleratorCostValFloat, mockProm)
-				Expect(err).NotTo(HaveOccurred(), "unable to fetch metrics and add to Optimizer status for variantAutoscaling - ", "variantAutoscaling-name: ", va.Name)
+				// Collect allocation and metrics using new API
+				// In single-variant architecture, cost is in spec, not passed to collector
+				currentAllocation, err := collector.CollectAllocationForDeployment(updateVA.Spec.VariantID, updateVA.Spec.Accelerator, deploy)
+				Expect(err).NotTo(HaveOccurred(), "unable to collect allocation data for variantAutoscaling - ", "variantAutoscaling-name: ", va.Name)
+				load, ttftAvg, itlAvg, err := collector.CollectAggregateMetrics(ctx, updateVA.Spec.ModelID, deploy.Namespace, mockProm)
+				Expect(err).NotTo(HaveOccurred(), "unable to fetch aggregate metrics for variantAutoscaling - ", "variantAutoscaling-name: ", va.Name)
 				updateVA.Status.CurrentAlloc = currentAllocation
 
-				err = utils.AddServerInfoToSystemData(systemData, &updateVA, className)
+				// Extract metrics to internal structure (all metrics passed separately)
+				metrics, err := interfaces.NewVariantMetrics(load, ttftAvg, itlAvg)
+				Expect(err).NotTo(HaveOccurred(), "failed to parse variant metrics for variantAutoscaling - ", "variantAutoscaling-name: ", va.Name)
+
+				// Pass empty scale-to-zero config for this test
+				err = utils.AddServerInfoToSystemData(systemData, &updateVA, className, metrics, utils.ScaleToZeroConfigData{})
 				Expect(err).NotTo(HaveOccurred(), "failed to add server info to system data for variantAutoscaling - ", "variantAutoscaling-name: ", va.Name)
 
 				By("Updating system data with VariantAutoscaling info")
@@ -447,7 +448,9 @@ var _ = Describe("Optimizer", Ordered, func() {
 			}
 
 			By("Performing optimization")
-			optimizedAllocs, err := engine.Optimize(ctx, updateList, allAnalyzerResponses)
+			scaleToZeroConfigData := make(utils.ScaleToZeroConfigData)
+			scaleToZeroCache := collector.NewScaleToZeroMetricsCache()
+			optimizedAllocs, err := engine.Optimize(ctx, updateList, allAnalyzerResponses, &scaleToZeroConfigData, scaleToZeroCache)
 			Expect(err).NotTo(HaveOccurred(), "unable to perform model optimization")
 			Expect(len(optimizedAllocs)).To(Equal(len(updateList.Items)), "Expected optimized allocations for all VariantAutoscalings")
 			for key, value := range optimizedAllocs {

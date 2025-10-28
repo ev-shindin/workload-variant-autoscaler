@@ -44,6 +44,14 @@ const (
 	// VLLMTimePerOutputTokenSecondsCount tracks the count of requests for time per output token.
 	// Used with VLLMTimePerOutputTokenSecondsSum to calculate ITL (Inter-Token Latency).
 	VLLMTimePerOutputTokenSecondsCount = "vllm:time_per_output_token_seconds_count"
+
+	// VLLMRequestQueueTimeSecondsSum tracks the sum of queue time across all requests.
+	// Used with VLLMRequestQueueTimeSecondsCount to calculate TTFT (Time To First Token).
+	VLLMRequestQueueTimeSecondsSum = "vllm:request_queue_time_seconds_sum"
+
+	// VLLMRequestQueueTimeSecondsCount tracks the count of requests for queue time.
+	// Used with VLLMRequestQueueTimeSecondsSum to calculate TTFT (Time To First Token).
+	VLLMRequestQueueTimeSecondsCount = "vllm:request_queue_time_seconds_count"
 )
 
 // Inferno Output Metrics
@@ -73,6 +81,7 @@ const (
 	LabelModelName       = "model_name"
 	LabelNamespace       = "namespace"
 	LabelVariantName     = "variant_name"
+	LabelVariantID       = "variant_id"
 	LabelDirection       = "direction"
 	LabelReason          = "reason"
 	LabelAcceleratorType = "accelerator_type"
