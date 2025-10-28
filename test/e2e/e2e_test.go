@@ -1419,6 +1419,10 @@ var _ = Describe("Test traffic-based scale-to-zero with retention period", Order
 			}
 		}()
 
+		By("waiting for load generator to install dependencies")
+		_, _ = fmt.Fprintf(GinkgoWriter, "Waiting 60 seconds for pip install to complete...\n")
+		time.Sleep(60 * time.Second)
+
 		By("waiting for load to be processed and scaling decision to be made")
 		Eventually(func(g Gomega) {
 			va := &v1alpha1.VariantAutoscaling{}
