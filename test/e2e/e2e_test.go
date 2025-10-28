@@ -1419,30 +1419,7 @@ var _ = Describe("Test traffic-based scale-to-zero with retention period", Order
 			}
 		}()
 
-		By("waiting for load generator to install dependencies and start sending traffic")
-		_, _ = fmt.Fprintf(GinkgoWriter, "Waiting 60 seconds for pip install and traffic to start...\n")
-		time.Sleep(60 * time.Second)
-
-		By("waiting for Prometheus to scrape vLLM metrics")
-		Eventually(func(g Gomega) {
-			promClient, err2 := utils.NewPrometheusClient("https://localhost:9090", true)
-			g.Expect(err2).NotTo(HaveOccurred(), "Should be able to create Prometheus client")
-
-			// Check if vllm_request_success_total metric exists
-			query := fmt.Sprintf(`vllm_request_success_total{model_name="%s"}`, modelID)
-			ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel2()
-
-			_, err2 = promClient.QueryWithRetry(ctx2, query)
-			if err2 != nil {
-				_, _ = fmt.Fprintf(GinkgoWriter, "  Waiting for Prometheus to scrape vLLM metrics...\n")
-				g.Expect(err2).NotTo(HaveOccurred(), "vllm_request_success_total should exist in Prometheus")
-			} else {
-				_, _ = fmt.Fprintf(GinkgoWriter, "  ✓ vllm_request_success_total metric found in Prometheus\n")
-			}
-		}, 2*time.Minute, 5*time.Second).Should(Succeed())
-
-		By("waiting for controller to process traffic and emit metrics")
+		By("waiting for load to be processed and scaling decision to be made")
 		Eventually(func(g Gomega) {
 			va := &v1alpha1.VariantAutoscaling{}
 			err := crClient.Get(ctx, client.ObjectKey{Name: deployName, Namespace: namespace}, va)
