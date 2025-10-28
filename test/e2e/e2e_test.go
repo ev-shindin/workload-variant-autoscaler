@@ -1252,7 +1252,11 @@ var _ = Describe("Test scale-to-zero flow - E2E integration", Ordered, func() {
 			_, _ = fmt.Fprintf(GinkgoWriter, "⚠️ WARNING: vLLM service not responding: %v\n", err)
 			_, _ = fmt.Fprintf(GinkgoWriter, "This means load generator cannot send requests!\n")
 		} else {
-			resp.Body.Close()
+			defer func() {
+				if closeErr := resp.Body.Close(); closeErr != nil {
+					_, _ = fmt.Fprintf(GinkgoWriter, "Warning: failed to close response body: %v\n", closeErr)
+				}
+			}()
 			_, _ = fmt.Fprintf(GinkgoWriter, "✓ vLLM service responding (HTTP %d)\n", resp.StatusCode)
 		}
 
