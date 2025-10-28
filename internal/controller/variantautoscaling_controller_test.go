@@ -1532,4 +1532,284 @@ retentionPeriod: "not-a-duration"`,
 			Expect(k8sClient.Delete(ctx, scaleToZeroConfigMap)).To(Succeed())
 		})
 	})
+
+	// Additional tests for improved coverage
+	Context("When testing utility functions", func() {
+		It("should correctly return max of two int32 values", func() {
+			// Test max function
+			result := max(5, 10)
+			Expect(result).To(Equal(int32(10)))
+
+			result = max(10, 5)
+			Expect(result).To(Equal(int32(10)))
+
+			result = max(7, 7)
+			Expect(result).To(Equal(int32(7)))
+
+			result = max(-5, 3)
+			Expect(result).To(Equal(int32(3)))
+		})
+	})
+
+	Context("When testing addVariantWithFallbackAllocation", func() {
+		It("should apply fallback allocation with scale-to-zero disabled", func() {
+			// Create a test VA
+			va := &llmdVariantAutoscalingV1alpha1.VariantAutoscaling{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-fallback-va",
+					Namespace: "default",
+				},
+				Spec: llmdVariantAutoscalingV1alpha1.VariantAutoscalingSpec{
+					ModelID:   "test-model",
+					VariantID: "test-variant",
+				},
+			}
+
+			// Create a deployment with 3 replicas
+			replicas := int32(3)
+			deploy := &appsv1.Deployment{
+				Spec: appsv1.DeploymentSpec{
+					Replicas: &replicas,
+				},
+				Status: appsv1.DeploymentStatus{
+					Replicas:           3,
+					ObservedGeneration: 1,
+				},
+			}
+
+			var updateList llmdVariantAutoscalingV1alpha1.VariantAutoscalingList
+			scaleToZeroConfig := make(utils.ScaleToZeroConfigData)
+
+			// Test with scale-to-zero disabled for non-cheapest variant
+			addVariantWithFallbackAllocation(va, deploy, "TestReason", "Test message",
+				&updateList, scaleToZeroConfig, "test-model", nil, false)
+
+			Expect(updateList.Items).To(HaveLen(1))
+			Expect(updateList.Items[0].Status.CurrentAlloc.NumReplicas).To(Equal(int32(3)))
+			Expect(updateList.Items[0].Status.DesiredOptimizedAlloc.NumReplicas).To(Equal(int32(3)))
+		})
+
+		It("should apply fallback allocation with scale-to-zero enabled and no load", func() {
+			va := &llmdVariantAutoscalingV1alpha1.VariantAutoscaling{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-fallback-va-zero",
+					Namespace: "default",
+				},
+				Spec: llmdVariantAutoscalingV1alpha1.VariantAutoscalingSpec{
+					ModelID:   "test-model",
+					VariantID: "test-variant",
+				},
+			}
+
+			replicas := int32(2)
+			deploy := &appsv1.Deployment{
+				Spec: appsv1.DeploymentSpec{
+					Replicas: &replicas,
+				},
+				Status: appsv1.DeploymentStatus{
+					Replicas:           2,
+					ObservedGeneration: 1,
+				},
+			}
+
+			var updateList llmdVariantAutoscalingV1alpha1.VariantAutoscalingList
+			scaleToZeroConfig := make(utils.ScaleToZeroConfigData)
+			enableScaleToZero := true
+			scaleToZeroConfig["test-model"] = utils.ModelScaleToZeroConfig{
+				ModelID:           "test-model",
+				EnableScaleToZero: &enableScaleToZero,
+				RetentionPeriod:   "10m",
+			}
+
+			// Test with zero load
+			zeroLoad := float64(0)
+			addVariantWithFallbackAllocation(va, deploy, "TestReason", "Test message",
+				&updateList, scaleToZeroConfig, "test-model", &zeroLoad, false)
+
+			Expect(updateList.Items).To(HaveLen(1))
+			Expect(updateList.Items[0].Status.CurrentAlloc.NumReplicas).To(Equal(int32(2)))
+			Expect(updateList.Items[0].Status.DesiredOptimizedAlloc.NumReplicas).To(Equal(int32(0)))
+		})
+
+		It("should apply fallback allocation with scale-to-zero enabled and active load", func() {
+			va := &llmdVariantAutoscalingV1alpha1.VariantAutoscaling{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-fallback-va-load",
+					Namespace: "default",
+				},
+				Spec: llmdVariantAutoscalingV1alpha1.VariantAutoscalingSpec{
+					ModelID:   "test-model",
+					VariantID: "test-variant",
+				},
+			}
+
+			replicas := int32(2)
+			deploy := &appsv1.Deployment{
+				Spec: appsv1.DeploymentSpec{
+					Replicas: &replicas,
+				},
+				Status: appsv1.DeploymentStatus{
+					Replicas:           2,
+					ObservedGeneration: 1,
+				},
+			}
+
+			var updateList llmdVariantAutoscalingV1alpha1.VariantAutoscalingList
+			scaleToZeroConfig := make(utils.ScaleToZeroConfigData)
+			enableScaleToZero := true
+			scaleToZeroConfig["test-model"] = utils.ModelScaleToZeroConfig{
+				ModelID:           "test-model",
+				EnableScaleToZero: &enableScaleToZero,
+				RetentionPeriod:   "10m",
+			}
+
+			// Test with active load
+			activeLoad := float64(5.5)
+			addVariantWithFallbackAllocation(va, deploy, "TestReason", "Test message",
+				&updateList, scaleToZeroConfig, "test-model", &activeLoad, false)
+
+			Expect(updateList.Items).To(HaveLen(1))
+			Expect(updateList.Items[0].Status.CurrentAlloc.NumReplicas).To(Equal(int32(2)))
+			Expect(updateList.Items[0].Status.DesiredOptimizedAlloc.NumReplicas).To(Equal(int32(2)))
+		})
+
+		It("should respect minReplicas when applying fallback", func() {
+			minReplicas := int32(2)
+			va := &llmdVariantAutoscalingV1alpha1.VariantAutoscaling{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-fallback-va-minreplicas",
+					Namespace: "default",
+				},
+				Spec: llmdVariantAutoscalingV1alpha1.VariantAutoscalingSpec{
+					ModelID:     "test-model",
+					VariantID:   "test-variant",
+					MinReplicas: &minReplicas,
+				},
+			}
+
+			replicas := int32(3)
+			deploy := &appsv1.Deployment{
+				Spec: appsv1.DeploymentSpec{
+					Replicas: &replicas,
+				},
+				Status: appsv1.DeploymentStatus{
+					Replicas:           3,
+					ObservedGeneration: 1,
+				},
+			}
+
+			var updateList llmdVariantAutoscalingV1alpha1.VariantAutoscalingList
+			scaleToZeroConfig := make(utils.ScaleToZeroConfigData)
+			enableScaleToZero := true
+			scaleToZeroConfig["test-model"] = utils.ModelScaleToZeroConfig{
+				ModelID:           "test-model",
+				EnableScaleToZero: &enableScaleToZero,
+				RetentionPeriod:   "10m",
+			}
+
+			// Test with zero load but minReplicas set
+			zeroLoad := float64(0)
+			addVariantWithFallbackAllocation(va, deploy, "TestReason", "Test message",
+				&updateList, scaleToZeroConfig, "test-model", &zeroLoad, false)
+
+			Expect(updateList.Items).To(HaveLen(1))
+			// Should be clamped to minReplicas
+			Expect(updateList.Items[0].Status.DesiredOptimizedAlloc.NumReplicas).To(Equal(int32(2)))
+		})
+
+		It("should respect maxReplicas when applying fallback", func() {
+			maxReplicas := int32(5)
+			va := &llmdVariantAutoscalingV1alpha1.VariantAutoscaling{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-fallback-va-maxreplicas",
+					Namespace: "default",
+				},
+				Spec: llmdVariantAutoscalingV1alpha1.VariantAutoscalingSpec{
+					ModelID:     "test-model",
+					VariantID:   "test-variant",
+					MaxReplicas: &maxReplicas,
+				},
+			}
+
+			replicas := int32(10)
+			deploy := &appsv1.Deployment{
+				Spec: appsv1.DeploymentSpec{
+					Replicas: &replicas,
+				},
+				Status: appsv1.DeploymentStatus{
+					Replicas:           10,
+					ObservedGeneration: 1,
+				},
+			}
+
+			var updateList llmdVariantAutoscalingV1alpha1.VariantAutoscalingList
+			scaleToZeroConfig := make(utils.ScaleToZeroConfigData)
+
+			// Test with current replicas exceeding maxReplicas
+			addVariantWithFallbackAllocation(va, deploy, "TestReason", "Test message",
+				&updateList, scaleToZeroConfig, "test-model", nil, false)
+
+			Expect(updateList.Items).To(HaveLen(1))
+			// Should be clamped to maxReplicas
+			Expect(updateList.Items[0].Status.DesiredOptimizedAlloc.NumReplicas).To(Equal(int32(5)))
+		})
+
+		It("should handle cheapest variant with scale-to-zero disabled", func() {
+			va := &llmdVariantAutoscalingV1alpha1.VariantAutoscaling{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-fallback-va-cheapest",
+					Namespace: "default",
+				},
+				Spec: llmdVariantAutoscalingV1alpha1.VariantAutoscalingSpec{
+					ModelID:   "test-model",
+					VariantID: "test-variant",
+				},
+			}
+
+			// Deployment with 0 replicas
+			replicas := int32(0)
+			deploy := &appsv1.Deployment{
+				Spec: appsv1.DeploymentSpec{
+					Replicas: &replicas,
+				},
+				Status: appsv1.DeploymentStatus{
+					Replicas:           0,
+					ObservedGeneration: 1,
+				},
+			}
+
+			var updateList llmdVariantAutoscalingV1alpha1.VariantAutoscalingList
+			scaleToZeroConfig := make(utils.ScaleToZeroConfigData)
+
+			// Test with cheapest variant - should maintain min 1 replica
+			addVariantWithFallbackAllocation(va, deploy, "TestReason", "Test message",
+				&updateList, scaleToZeroConfig, "test-model", nil, true)
+
+			Expect(updateList.Items).To(HaveLen(1))
+			Expect(updateList.Items[0].Status.DesiredOptimizedAlloc.NumReplicas).To(Equal(int32(1)))
+		})
+
+		It("should handle nil deployment", func() {
+			va := &llmdVariantAutoscalingV1alpha1.VariantAutoscaling{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-fallback-va-nil-deploy",
+					Namespace: "default",
+				},
+				Spec: llmdVariantAutoscalingV1alpha1.VariantAutoscalingSpec{
+					ModelID:   "test-model",
+					VariantID: "test-variant",
+				},
+			}
+
+			var updateList llmdVariantAutoscalingV1alpha1.VariantAutoscalingList
+			scaleToZeroConfig := make(utils.ScaleToZeroConfigData)
+
+			// Test with nil deployment
+			addVariantWithFallbackAllocation(va, nil, "TestReason", "Test message",
+				&updateList, scaleToZeroConfig, "test-model", nil, false)
+
+			Expect(updateList.Items).To(HaveLen(1))
+			Expect(updateList.Items[0].Status.CurrentAlloc.NumReplicas).To(Equal(int32(0)))
+		})
+	})
 })
