@@ -1494,6 +1494,12 @@ var _ = Describe("Test traffic-based scale-to-zero with retention period", Order
 
 		_, _ = fmt.Fprintf(GinkgoWriter, "Starting traffic generation at %d req/s...\n", loadRate)
 
+		// Wait for metrics pipeline: vLLM emits -> Prometheus scrapes -> Controller queries rate([1m])
+		// Controller needs at least 60s of data points + Prometheus scrape interval (15-30s) + controller reconciliation
+		By("waiting for vLLM metrics to be scraped and rate to accumulate")
+		_, _ = fmt.Fprintf(GinkgoWriter, "Waiting 2 minutes for Prometheus to scrape vLLM metrics and establish rate...\n")
+		time.Sleep(2 * time.Minute)
+
 		By("waiting for controller to process traffic and emit metrics")
 		Eventually(func(g Gomega) {
 			va := &v1alpha1.VariantAutoscaling{}
