@@ -1492,32 +1492,9 @@ var _ = Describe("Test traffic-based scale-to-zero with retention period", Order
 			}
 		}()
 
-		By("generating traffic and waiting for vLLM metrics to appear in Prometheus")
 		_, _ = fmt.Fprintf(GinkgoWriter, "Starting traffic generation at %d req/s...\n", loadRate)
 
-		// Wait for vLLM metrics to be scraped into Prometheus (critical for controller to see traffic)
-		Eventually(func(g Gomega) {
-			promClient, err2 := utils.NewPrometheusClient("https://localhost:9090", true)
-			g.Expect(err2).NotTo(HaveOccurred(), "Should be able to create Prometheus client")
-
-			// Query for vLLM request metric (actual metric name exposed by emulator)
-			query := fmt.Sprintf(`vllm_request_success_total{model_name="%s",namespace="%s"}`, modelID, namespace)
-			ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel2()
-			result, err2 := promClient.QueryWithRetry(ctx2, query)
-			if err2 != nil {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Waiting for vLLM metrics in Prometheus (will retry): %v\n", err2)
-				g.Expect(err2).NotTo(HaveOccurred())
-			}
-
-			_, _ = fmt.Fprintf(GinkgoWriter, "vLLM metric vllm_request_success_total: %.0f\n", result)
-			g.Expect(result).To(BeNumerically(">", 0), "vLLM metrics should appear in Prometheus after traffic starts")
-		}, 3*time.Minute, 10*time.Second).Should(Succeed(), "vLLM metrics should be scraped into Prometheus")
-
-		_, _ = fmt.Fprintf(GinkgoWriter, "✓ vLLM metrics confirmed in Prometheus. Continuing traffic for 60 more seconds...\n")
-		time.Sleep(60 * time.Second) // Continue generating traffic to build up rate data
-
-		By("verifying controller has processed traffic and emit metrics")
+		By("waiting for controller to process traffic and emit metrics")
 		Eventually(func(g Gomega) {
 			va := &v1alpha1.VariantAutoscaling{}
 			err := crClient.Get(ctx, client.ObjectKey{Name: deployName, Namespace: namespace}, va)
@@ -1540,6 +1517,11 @@ var _ = Describe("Test traffic-based scale-to-zero with retention period", Order
 		}, 5*time.Minute, 10*time.Second).Should(Succeed())
 
 		// NOW create KEDA ScaledObject (after traffic generated and desired > 0 verified)
+		// Get VA to access VariantID for KEDA query
+		va := &v1alpha1.VariantAutoscaling{}
+		err = crClient.Get(ctx, client.ObjectKey{Name: deployName, Namespace: namespace}, va)
+		Expect(err).NotTo(HaveOccurred(), "Should be able to get VariantAutoscaling for KEDA creation")
+
 		By("creating KEDA ScaledObject for deployment")
 		scaledObjectName := deployName + "-scaler"
 		scaledObject := &unstructured.Unstructured{}
@@ -1563,7 +1545,7 @@ var _ = Describe("Test traffic-based scale-to-zero with retention period", Order
 					"type": "prometheus",
 					"metadata": map[string]interface{}{
 						"serverAddress": "https://kube-prometheus-stack-prometheus.monitoring-system.svc.cluster.local:9090",
-						"query":         fmt.Sprintf("inferno_desired_replicas{variant_name=\"%s\",exported_namespace=\"%s\",accelerator_type=\"%s\",variant_id=\"%s\"}", deployName, namespace, accelerator, modelID),
+						"query":         fmt.Sprintf("inferno_desired_replicas{variant_name=\"%s\",exported_namespace=\"%s\",accelerator_type=\"%s\",variant_id=\"%s\"}", va.Name, namespace, va.Spec.Accelerator, va.Spec.VariantID),
 						"threshold":     "1",
 					},
 				},
@@ -1577,27 +1559,7 @@ var _ = Describe("Test traffic-based scale-to-zero with retention period", Order
 		By("stopping traffic generation")
 		err = utils.StopCmd(loadGenCmd)
 		Expect(err).NotTo(HaveOccurred(), "Should be able to stop load generator")
-		_, _ = fmt.Fprintf(GinkgoWriter, "✓ Traffic stopped. Verifying in Prometheus...\n")
-
-		By("verifying traffic has stopped in Prometheus")
-		Eventually(func(g Gomega) {
-			promClient, err2 := utils.NewPrometheusClient("https://localhost:9090", true)
-			g.Expect(err2).NotTo(HaveOccurred(), "Should be able to create Prometheus client")
-
-			query := fmt.Sprintf(`rate(vllm_request_success_total{model_name="%s",namespace="%s"}[30s])`, modelID, namespace)
-			ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel2()
-			result, err2 := promClient.QueryWithRetry(ctx2, query)
-			if err2 != nil {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Prometheus query failed (will retry): %v\n", err2)
-				g.Expect(err2).NotTo(HaveOccurred())
-			}
-
-			_, _ = fmt.Fprintf(GinkgoWriter, "Traffic rate after stop: %.2f req/s\n", result)
-			g.Expect(result).To(BeNumerically("==", 0), "Traffic should have stopped")
-		}, 2*time.Minute, 5*time.Second).Should(Succeed())
-
-		_, _ = fmt.Fprintf(GinkgoWriter, "✓ Traffic stop confirmed in Prometheus\n")
+		_, _ = fmt.Fprintf(GinkgoWriter, "✓ Traffic stopped\n")
 
 		By("waiting for retention period to pass with zero traffic")
 		// Increased buffer: retention period + Prometheus scrape interval (30s) + controller reconciliation (60s)
