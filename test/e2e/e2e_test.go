@@ -1495,10 +1495,11 @@ var _ = Describe("Test traffic-based scale-to-zero with retention period", Order
 		_, _ = fmt.Fprintf(GinkgoWriter, "Starting traffic generation at %d req/s...\n", loadRate)
 
 		// Wait for metrics pipeline: vLLM emits -> Prometheus scrapes -> Controller queries rate([1m])
-		// Controller needs at least 60s of data points + Prometheus scrape interval (15-30s) + controller reconciliation
-		By("waiting for vLLM metrics to be scraped and rate to accumulate")
-		_, _ = fmt.Fprintf(GinkgoWriter, "Waiting 2 minutes for Prometheus to scrape vLLM metrics and establish rate...\n")
-		time.Sleep(2 * time.Minute)
+		// Prometheus needs: 1-2min to discover ServiceMonitor + 15-30s scrape interval + 60s for rate([1m]) data
+		// Unlike working tests (which have earlier It() blocks giving discovery time), this test runs immediately
+		By("waiting for Prometheus to discover ServiceMonitor, scrape vLLM metrics, and accumulate rate data")
+		_, _ = fmt.Fprintf(GinkgoWriter, "Waiting 3.5 minutes for Prometheus discovery + scraping + rate accumulation...\n")
+		time.Sleep(210 * time.Second) // 3.5 minutes
 
 		By("waiting for controller to process traffic and emit metrics")
 		Eventually(func(g Gomega) {
