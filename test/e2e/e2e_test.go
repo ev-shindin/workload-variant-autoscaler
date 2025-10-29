@@ -1290,10 +1290,8 @@ var _ = Describe("Test traffic-based scale-to-zero with retention period", Order
 		err = crClient.Create(ctx, variantAutoscaling)
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to create VariantAutoscaling: %s", deployName))
 
-		By("creating InferenceModel with 0 traffic for scale-to-zero test")
-		inferenceModel = utils.CreateInferenceModel(deployName, namespace, modelID)
-		err = crClient.Create(ctx, inferenceModel)
-		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to create InferenceModel: %s", modelID))
+		// Note: InferenceModel and KEDA ScaledObject will be created later in the main test
+		// after traffic generation starts (matching the working test pattern in lines 1591-1629)
 
 		By("verifying KEDA is installed")
 		Eventually(func(g Gomega) {
@@ -1375,6 +1373,18 @@ var _ = Describe("Test traffic-based scale-to-zero with retention period", Order
 	It("controller should emit baseline metrics before traffic test", func() {
 		// This test verifies Prometheus is scraping both controller and vLLM BEFORE traffic test
 		// Gives Prometheus time to discover ServiceMonitor (similar to working test pattern)
+
+		// STEP 1: Ensure deployment is ready first
+		By("waiting for deployment to have ready replicas")
+		Eventually(func(g Gomega) {
+			deployment, err := k8sClient.AppsV1().Deployments(namespace).Get(ctx, deployName, metav1.GetOptions{})
+			g.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to get Deployment: %s", deployName))
+			_, _ = fmt.Fprintf(GinkgoWriter, "Deployment replicas: Ready=%d, Available=%d, Target=%d\n",
+				deployment.Status.ReadyReplicas, deployment.Status.AvailableReplicas, *deployment.Spec.Replicas)
+			g.Expect(deployment.Status.ReadyReplicas).To(BeNumerically(">=", 1),
+				"Deployment should have at least 1 ready replica before baseline metrics test")
+		}, 8*time.Minute, 10*time.Second).Should(Succeed())
+
 		By("setting up port-forward to Prometheus for metric verification")
 		prometheusPortForwardCmd := utils.SetUpPortForward(k8sClient, ctx, "kube-prometheus-stack-prometheus", controllerMonitoringNamespace, 9090, 9090)
 		defer func() {
@@ -1386,7 +1396,8 @@ var _ = Describe("Test traffic-based scale-to-zero with retention period", Order
 		err := utils.VerifyPortForwardReadiness(ctx, 9090, fmt.Sprintf("https://localhost:%d/api/v1/query?query=up", 9090))
 		Expect(err).NotTo(HaveOccurred(), "Prometheus port-forward should be ready")
 
-		By("waiting for controller to emit baseline metrics")
+		// STEP 2: Wait for controller to see deployment and emit metrics
+		By("waiting for controller to reconcile and emit metrics")
 		Eventually(func(g Gomega) {
 			va := &v1alpha1.VariantAutoscaling{}
 			err := crClient.Get(ctx, client.ObjectKey{Name: deployName, Namespace: namespace}, va)
@@ -1588,11 +1599,17 @@ var _ = Describe("Test traffic-based scale-to-zero with retention period", Order
 			_, _ = fmt.Fprintf(GinkgoWriter, "✓ Metrics: current=%.0f, desired=%.0f\n", currentReplicasProm, desiredReplicasProm)
 		}, 5*time.Minute, 10*time.Second).Should(Succeed())
 
-		// NOW create KEDA ScaledObject (after traffic generated and desired > 0 verified)
+		// NOW create InferenceModel and KEDA ScaledObject (after traffic generated and desired > 0 verified)
 		// Get VA to access VariantID for KEDA query
 		va := &v1alpha1.VariantAutoscaling{}
 		err = crClient.Get(ctx, client.ObjectKey{Name: deployName, Namespace: namespace}, va)
 		Expect(err).NotTo(HaveOccurred(), "Should be able to get VariantAutoscaling for KEDA creation")
+
+		By("creating InferenceModel (now that traffic is flowing)")
+		inferenceModel := utils.CreateInferenceModel(deployName, namespace, modelID)
+		err = crClient.Create(ctx, inferenceModel)
+		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to create InferenceModel: %s", modelID))
+		_, _ = fmt.Fprintf(GinkgoWriter, "✓ InferenceModel created\n")
 
 		By("creating KEDA ScaledObject for deployment")
 		scaledObjectName := deployName + "-scaler"
