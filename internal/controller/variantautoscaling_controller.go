@@ -336,14 +336,8 @@ func addVariantWithFallbackAllocation(
 		// Metrics unavailable - check retention period for scaling decisions
 
 		// Check if retention period has been exceeded (no activity detected)
-		retentionPeriodExceeded := false
 		lastUpdate := updateVA.Status.DesiredOptimizedAlloc.LastUpdate
-		if !lastUpdate.IsZero() {
-			timeSinceUpdate := time.Since(lastUpdate.Time)
-			if timeSinceUpdate > retentionPeriod {
-				retentionPeriodExceeded = true
-			}
-		}
+		retentionPeriodExceeded := isRetentionPeriodExceeded(lastUpdate, retentionPeriod)
 
 		// Apply retention period logic if threshold exceeded
 		if retentionPeriodExceeded {
@@ -460,26 +454,7 @@ func addVariantWithFallbackAllocation(
 	}
 
 	// Apply replica bounds (clamp to [minReplicas, maxReplicas])
-	if updateVA.Spec.MinReplicas != nil {
-		minReplicas := *updateVA.Spec.MinReplicas
-		if desiredReplicas < minReplicas {
-			logger.Log.Info("Clamping desired replicas to minReplicas",
-				"variant", updateVA.Name,
-				"original", desiredReplicas,
-				"clamped", minReplicas)
-			desiredReplicas = minReplicas
-		}
-	}
-	if updateVA.Spec.MaxReplicas != nil {
-		maxReplicas := *updateVA.Spec.MaxReplicas
-		if desiredReplicas > maxReplicas {
-			logger.Log.Info("Clamping desired replicas to maxReplicas",
-				"variant", updateVA.Name,
-				"original", desiredReplicas,
-				"clamped", maxReplicas)
-			desiredReplicas = maxReplicas
-		}
-	}
+	desiredReplicas, _ = applyReplicaBounds(desiredReplicas, updateVA.Spec.MinReplicas, updateVA.Spec.MaxReplicas, updateVA.Name)
 
 	// Set current allocation
 	updateVA.Status.CurrentAlloc = llmdVariantAutoscalingV1alpha1.Allocation{
@@ -529,6 +504,16 @@ func max(a, b int32) int32 {
 		return a
 	}
 	return b
+}
+
+// isRetentionPeriodExceeded checks if the retention period has been exceeded since lastUpdate.
+// Returns true if lastUpdate is set and the time since lastUpdate exceeds retentionPeriod.
+// Returns false if lastUpdate is zero (never set) or if within retention period.
+func isRetentionPeriodExceeded(lastUpdate metav1.Time, retentionPeriod time.Duration) bool {
+	if lastUpdate.IsZero() {
+		return false
+	}
+	return time.Since(lastUpdate.Time) > retentionPeriod
 }
 
 // applyRetentionPeriodScaling applies scale-to-zero logic when retention period is exceeded.
@@ -630,6 +615,134 @@ func applyReplicaBounds(
 	}
 
 	return clampedReplicas, boundsApplied
+}
+
+// applyFallbackAllocation applies fallback allocation logic when optimizer doesn't run.
+// This consolidates Path 2 (has precomputed fallback) and Path 3 (no precomputed fallback).
+// Returns error if allocation computation fails.
+func applyFallbackAllocation(
+	updateVa *llmdVariantAutoscalingV1alpha1.VariantAutoscaling,
+	va *llmdVariantAutoscalingV1alpha1.VariantAutoscaling,
+	allVariants []llmdVariantAutoscalingV1alpha1.VariantAutoscaling,
+	scaleToZeroConfigData utils.ScaleToZeroConfigData,
+	hasPrecomputedFallback bool,
+	pathLabel string, // "Fallback" or "Last resort"
+) {
+	modelName := va.Spec.ModelID
+	retentionPeriod := utils.GetScaleToZeroRetentionPeriod(scaleToZeroConfigData, modelName)
+	previousAlloc := updateVa.Status.DesiredOptimizedAlloc
+
+	// Check if retention period has been exceeded
+	retentionPeriodExceeded := isRetentionPeriodExceeded(previousAlloc.LastUpdate, retentionPeriod)
+
+	var desiredReplicas int32
+	var reason string
+
+	if retentionPeriodExceeded {
+		// Retention period exceeded - apply scale-to-zero logic
+		desiredReplicas, reason = applyRetentionPeriodScaling(
+			updateVa,
+			allVariants,
+			scaleToZeroConfigData,
+			retentionPeriod,
+			pathLabel,
+		)
+
+		// Apply maxReplicas bound (minReplicas already applied in scale-to-zero logic)
+		clampedReplicas, boundsApplied := applyReplicaBounds(desiredReplicas, nil, va.Spec.MaxReplicas, va.Name)
+		if boundsApplied {
+			reason = fmt.Sprintf("%s (clamped to maxReplicas=%d)", reason, clampedReplicas)
+			desiredReplicas = clampedReplicas
+		}
+
+		// Create allocation with helper
+		updateVa.Status.DesiredOptimizedAlloc = createOptimizedAllocWithUpdate(desiredReplicas, reason, previousAlloc)
+	} else {
+		// Retention period NOT exceeded
+		if hasPrecomputedFallback {
+			// PATH 2: Use cached allocation from preparation phase
+			updateVa.Status.DesiredOptimizedAlloc = va.Status.DesiredOptimizedAlloc
+
+			// Re-apply bounds to respect any CRD changes since the allocation was computed
+			originalReplicas := updateVa.Status.DesiredOptimizedAlloc.NumReplicas
+			clampedReplicas, boundsApplied := applyReplicaBounds(
+				originalReplicas,
+				va.Spec.MinReplicas,
+				va.Spec.MaxReplicas,
+				va.Name,
+			)
+
+			// Update allocation if bounds were applied
+			if boundsApplied {
+				updateVa.Status.DesiredOptimizedAlloc.NumReplicas = clampedReplicas
+				updateVa.Status.DesiredOptimizedAlloc.Reason = fmt.Sprintf("%s (clamped from %d to %d for bounds)",
+					updateVa.Status.DesiredOptimizedAlloc.Reason, originalReplicas, clampedReplicas)
+				updateVa.Status.DesiredOptimizedAlloc.LastUpdate = metav1.Now()
+			}
+
+			// If Reason is empty, set a default reason
+			if updateVa.Status.DesiredOptimizedAlloc.Reason == "" {
+				updateVa.Status.DesiredOptimizedAlloc.Reason = "Fallback: preserving previous allocation (no optimizer solution)"
+				if previousAlloc.Reason != updateVa.Status.DesiredOptimizedAlloc.Reason {
+					updateVa.Status.DesiredOptimizedAlloc.LastUpdate = metav1.Now()
+				}
+			}
+
+			// If LastUpdate is still zero, set it now
+			if updateVa.Status.DesiredOptimizedAlloc.LastUpdate.IsZero() {
+				updateVa.Status.DesiredOptimizedAlloc.LastUpdate = metav1.Now()
+			}
+
+			logger.Log.Info("Using fallback allocation (retention period not exceeded)",
+				"variantName", va.Name,
+				"currentReplicas", va.Status.CurrentAlloc.NumReplicas,
+				"desiredReplicas", updateVa.Status.DesiredOptimizedAlloc.NumReplicas,
+				"boundChanged", boundsApplied,
+				"timeSinceUpdate", time.Since(previousAlloc.LastUpdate.Time),
+				"retentionPeriod", retentionPeriod)
+		} else {
+			// PATH 3: Controller-centric approach
+			minReplicasValue := int32(0)
+			if va.Spec.MinReplicas != nil {
+				minReplicasValue = *va.Spec.MinReplicas
+			}
+
+			var baselineReplicas int32
+			if !previousAlloc.LastRunTime.IsZero() || previousAlloc.NumReplicas >= 0 {
+				// Use previous optimized allocation - maintain controller intent
+				baselineReplicas = previousAlloc.NumReplicas
+				logger.Log.Info("Last resort - using previous optimized allocation as baseline",
+					"variantName", va.Name,
+					"previousOptimized", baselineReplicas,
+					"currentReplicas", updateVa.Status.CurrentAlloc.NumReplicas)
+				reason = fmt.Sprintf("Last resort: maintaining controller intent: max(minReplicas=%d, previousOptimized=%d)",
+					minReplicasValue, baselineReplicas)
+			} else {
+				// First run - use current deployment state as baseline
+				baselineReplicas = updateVa.Status.CurrentAlloc.NumReplicas
+				logger.Log.Info("Last resort - first run, using current deployment replicas as baseline",
+					"variantName", va.Name,
+					"currentReplicas", updateVa.Status.CurrentAlloc.NumReplicas)
+				reason = fmt.Sprintf("Last resort: first run, using max(minReplicas=%d, current=%d)",
+					minReplicasValue, baselineReplicas)
+			}
+
+			desiredReplicas = max(minReplicasValue, baselineReplicas)
+
+			// Apply maxReplicas bound
+			clampedReplicas, boundsApplied := applyReplicaBounds(desiredReplicas, nil, va.Spec.MaxReplicas, va.Name)
+			if boundsApplied {
+				reason = fmt.Sprintf("%s (clamped to maxReplicas=%d)", reason, clampedReplicas)
+				desiredReplicas = clampedReplicas
+			} else {
+				// Complete the reason message for non-retention case
+				reason = fmt.Sprintf("%s = %d", reason, desiredReplicas)
+			}
+
+			// Create allocation with helper
+			updateVa.Status.DesiredOptimizedAlloc = createOptimizedAllocWithUpdate(desiredReplicas, reason, previousAlloc)
+		}
+	}
 }
 
 // createOptimizedAllocWithUpdate creates an OptimizedAlloc and updates LastUpdate timestamp
@@ -1191,156 +1304,16 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 				"desiredReplicas", newAlloc.NumReplicas,
 				"reason", newAlloc.Reason)
 		} else {
+			// No optimizer solution - apply fallback allocation logic
 			// Check if fallback allocation was set in updateList (from addVariantWithFallbackAllocation or previous reconciliation)
-			if va.Status.DesiredOptimizedAlloc.NumReplicas >= 0 || !va.Status.DesiredOptimizedAlloc.LastRunTime.IsZero() {
-				// Check if we need to apply retention period and scale-to-zero logic
-				modelName := va.Spec.ModelID
-				retentionPeriod := utils.GetScaleToZeroRetentionPeriod(scaleToZeroConfigData, modelName)
-				previousAlloc := va.Status.DesiredOptimizedAlloc
+			hasPrecomputedFallback := va.Status.DesiredOptimizedAlloc.NumReplicas >= 0 || !va.Status.DesiredOptimizedAlloc.LastRunTime.IsZero()
 
-				// Check if retention period has been exceeded
-				retentionPeriodExceeded := false
-				if !previousAlloc.LastUpdate.IsZero() {
-					timeSinceUpdate := time.Since(previousAlloc.LastUpdate.Time)
-					if timeSinceUpdate > retentionPeriod {
-						retentionPeriodExceeded = true
-					}
-				}
-
-				var desiredReplicas int32
-				var reason string
-
-				if retentionPeriodExceeded {
-					// Retention period exceeded - apply scale-to-zero logic using helper
-					desiredReplicas, reason = applyRetentionPeriodScaling(
-						&updateVa,
-						allVariants,
-						scaleToZeroConfigData,
-						retentionPeriod,
-						"Fallback",
-					)
-
-					// Apply maxReplicas bound (minReplicas already applied in scale-to-zero logic)
-					clampedReplicas, boundsApplied := applyReplicaBounds(desiredReplicas, nil, va.Spec.MaxReplicas, va.Name)
-					if boundsApplied {
-						reason = fmt.Sprintf("%s (clamped to maxReplicas=%d)", reason, clampedReplicas)
-						desiredReplicas = clampedReplicas
-					}
-
-					// Create allocation with helper
-					updateVa.Status.DesiredOptimizedAlloc = createOptimizedAllocWithUpdate(desiredReplicas, reason, previousAlloc)
-				} else {
-					// Retention period NOT exceeded - use cached allocation
-					updateVa.Status.DesiredOptimizedAlloc = va.Status.DesiredOptimizedAlloc
-
-					// Re-apply bounds to respect any CRD changes since the allocation was computed
-					originalReplicas := updateVa.Status.DesiredOptimizedAlloc.NumReplicas
-					clampedReplicas, boundsApplied := applyReplicaBounds(
-						originalReplicas,
-						va.Spec.MinReplicas,
-						va.Spec.MaxReplicas,
-						va.Name,
-					)
-
-					// Update allocation if bounds were applied
-					if boundsApplied {
-						updateVa.Status.DesiredOptimizedAlloc.NumReplicas = clampedReplicas
-						updateVa.Status.DesiredOptimizedAlloc.Reason = fmt.Sprintf("%s (clamped from %d to %d for bounds)",
-							updateVa.Status.DesiredOptimizedAlloc.Reason, originalReplicas, clampedReplicas)
-						updateVa.Status.DesiredOptimizedAlloc.LastUpdate = metav1.Now()
-					}
-
-					// If Reason is empty, set a default reason (happens when metrics were collected but optimizer didn't run)
-					if updateVa.Status.DesiredOptimizedAlloc.Reason == "" {
-						updateVa.Status.DesiredOptimizedAlloc.Reason = "Fallback: preserving previous allocation (no optimizer solution)"
-						if previousAlloc.Reason != updateVa.Status.DesiredOptimizedAlloc.Reason {
-							updateVa.Status.DesiredOptimizedAlloc.LastUpdate = metav1.Now()
-						}
-					}
-
-					// If LastUpdate is still zero (can happen with old CRDs or uninitialized data), set it now
-					if updateVa.Status.DesiredOptimizedAlloc.LastUpdate.IsZero() {
-						updateVa.Status.DesiredOptimizedAlloc.LastUpdate = metav1.Now()
-					}
-
-					logger.Log.Info("Using fallback allocation (retention period not exceeded)",
-						"variantName", va.Name,
-						"currentReplicas", va.Status.CurrentAlloc.NumReplicas,
-						"desiredReplicas", updateVa.Status.DesiredOptimizedAlloc.NumReplicas,
-						"boundChanged", boundsApplied,
-						"timeSinceUpdate", time.Since(previousAlloc.LastUpdate.Time),
-						"retentionPeriod", retentionPeriod)
-				}
+			if hasPrecomputedFallback {
+				// PATH 2: Has precomputed fallback allocation
+				applyFallbackAllocation(&updateVa, va, allVariants, scaleToZeroConfigData, true, "Fallback")
 			} else {
-				// No optimization and no fallback - apply retention period and scale-to-zero logic
-				modelName := va.Spec.ModelID
-				retentionPeriod := utils.GetScaleToZeroRetentionPeriod(scaleToZeroConfigData, modelName)
-				previousAlloc := updateVa.Status.DesiredOptimizedAlloc
-
-				// Check if retention period has been exceeded
-				retentionPeriodExceeded := false
-				if !previousAlloc.LastUpdate.IsZero() {
-					timeSinceUpdate := time.Since(previousAlloc.LastUpdate.Time)
-					if timeSinceUpdate > retentionPeriod {
-						retentionPeriodExceeded = true
-					}
-				}
-
-				var desiredReplicas int32
-				var reason string
-
-				if retentionPeriodExceeded {
-					// Retention period exceeded - apply scale-to-zero logic using helper
-					desiredReplicas, reason = applyRetentionPeriodScaling(
-						&updateVa,
-						allVariants,
-						scaleToZeroConfigData,
-						retentionPeriod,
-						"Last resort",
-					)
-				} else {
-					// Retention period NOT exceeded - use controller-centric approach
-					// Determine baseline replicas: use previous optimized if available, else current
-					minReplicasValue := int32(0)
-					if va.Spec.MinReplicas != nil {
-						minReplicasValue = *va.Spec.MinReplicas
-					}
-
-					var baselineReplicas int32
-					if !previousAlloc.LastRunTime.IsZero() || previousAlloc.NumReplicas >= 0 {
-						// Use previous optimized allocation - maintain controller intent
-						baselineReplicas = previousAlloc.NumReplicas
-						logger.Log.Info("Last resort - using previous optimized allocation as baseline",
-							"variantName", va.Name,
-							"previousOptimized", baselineReplicas,
-							"currentReplicas", updateVa.Status.CurrentAlloc.NumReplicas)
-						reason = fmt.Sprintf("Last resort: maintaining controller intent: max(minReplicas=%d, previousOptimized=%d)",
-							minReplicasValue, baselineReplicas)
-					} else {
-						// First run - use current deployment state as baseline
-						baselineReplicas = updateVa.Status.CurrentAlloc.NumReplicas
-						logger.Log.Info("Last resort - first run, using current deployment replicas as baseline",
-							"variantName", va.Name,
-							"currentReplicas", updateVa.Status.CurrentAlloc.NumReplicas)
-						reason = fmt.Sprintf("Last resort: first run, using max(minReplicas=%d, current=%d)",
-							minReplicasValue, baselineReplicas)
-					}
-
-					desiredReplicas = max(minReplicasValue, baselineReplicas)
-				}
-
-				// Apply maxReplicas bound (applies to both retention and non-retention cases) using helper
-				clampedReplicas, boundsApplied := applyReplicaBounds(desiredReplicas, nil, va.Spec.MaxReplicas, va.Name)
-				if boundsApplied {
-					reason = fmt.Sprintf("%s (clamped to maxReplicas=%d)", reason, clampedReplicas)
-					desiredReplicas = clampedReplicas
-				} else if !retentionPeriodExceeded {
-					// Complete the reason message for non-retention case
-					reason = fmt.Sprintf("%s = %d", reason, desiredReplicas)
-				}
-
-				// Create allocation with helper
-				updateVa.Status.DesiredOptimizedAlloc = createOptimizedAllocWithUpdate(desiredReplicas, reason, previousAlloc)
+				// PATH 3: No precomputed fallback - use last resort logic
+				applyFallbackAllocation(&updateVa, va, allVariants, scaleToZeroConfigData, false, "Last resort")
 			}
 		}
 
