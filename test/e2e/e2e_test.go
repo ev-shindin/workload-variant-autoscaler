@@ -1068,16 +1068,23 @@ var _ = Describe("Test idle scale-to-zero with KEDA", Ordered, func() {
 			g.Expect(err).NotTo(HaveOccurred(), "Should be able to get VariantAutoscaling")
 
 			// Debug output to understand the flow
-			_, _ = fmt.Fprintf(GinkgoWriter, "VA Status: DesiredOptimized=%d, Current=%d, Reason=%q\n",
+			_, _ = fmt.Fprintf(GinkgoWriter, "VA Status: DesiredOptimized=%d, Current=%d, Reason=%q, LastUpdate=%v\n",
 				va.Status.DesiredOptimizedAlloc.NumReplicas,
 				va.Status.CurrentAlloc.NumReplicas,
-				va.Status.DesiredOptimizedAlloc.Reason)
+				va.Status.DesiredOptimizedAlloc.Reason,
+				va.Status.DesiredOptimizedAlloc.LastUpdate.Time)
 
 			// Check status conditions to see if optimizer is running or fallback is used
+			_, _ = fmt.Fprintf(GinkgoWriter, "  Total Conditions: %d\n", len(va.Status.Conditions))
+			if len(va.Status.Conditions) == 0 {
+				_, _ = fmt.Fprintf(GinkgoWriter, "  ⚠ WARNING: No status conditions set on VA resource\n")
+			}
 			for _, cond := range va.Status.Conditions {
 				if cond.Type == "OptimizationReady" || cond.Type == "MetricsAvailable" {
 					_, _ = fmt.Fprintf(GinkgoWriter, "  Condition: %s=%s, Reason=%s, Message=%s\n",
 						cond.Type, cond.Status, cond.Reason, cond.Message)
+				} else {
+					_, _ = fmt.Fprintf(GinkgoWriter, "  Other Condition: %s=%s\n", cond.Type, cond.Status)
 				}
 			}
 
@@ -1638,10 +1645,25 @@ var _ = Describe("Test traffic-based scale-to-zero with retention period", Order
 			err := crClient.Get(ctx, client.ObjectKey{Name: deployName, Namespace: namespace}, va)
 			g.Expect(err).NotTo(HaveOccurred(), "Should be able to get VariantAutoscaling")
 
-			_, _ = fmt.Fprintf(GinkgoWriter, "VA Status: DesiredOptimized=%d, Current=%d, Reason=%q\n",
+			_, _ = fmt.Fprintf(GinkgoWriter, "VA Status: DesiredOptimized=%d, Current=%d, Reason=%q, LastUpdate=%v\n",
 				va.Status.DesiredOptimizedAlloc.NumReplicas,
 				va.Status.CurrentAlloc.NumReplicas,
-				va.Status.DesiredOptimizedAlloc.Reason)
+				va.Status.DesiredOptimizedAlloc.Reason,
+				va.Status.DesiredOptimizedAlloc.LastUpdate.Time)
+
+			// Check status conditions
+			_, _ = fmt.Fprintf(GinkgoWriter, "  Total Conditions: %d\n", len(va.Status.Conditions))
+			if len(va.Status.Conditions) == 0 {
+				_, _ = fmt.Fprintf(GinkgoWriter, "  ⚠ WARNING: No status conditions set on VA resource\n")
+			}
+			for _, cond := range va.Status.Conditions {
+				if cond.Type == "OptimizationReady" || cond.Type == "MetricsAvailable" {
+					_, _ = fmt.Fprintf(GinkgoWriter, "  Condition: %s=%s, Reason=%s, Message=%s\n",
+						cond.Type, cond.Status, cond.Reason, cond.Message)
+				} else {
+					_, _ = fmt.Fprintf(GinkgoWriter, "  Other Condition: %s=%s\n", cond.Type, cond.Status)
+				}
+			}
 
 			// Verify optimizer recommends 0
 			g.Expect(va.Status.DesiredOptimizedAlloc.NumReplicas).To(Equal(int32(0)),
