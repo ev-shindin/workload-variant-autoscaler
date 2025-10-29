@@ -29,9 +29,28 @@ When metrics are available, the controller uses a mathematical optimizer to dete
 
 **Result**: The optimizer produces a cost-optimal allocation that meets all performance constraints.
 
-**Status indicator**: `desiredOptimizedAlloc.reason` will show:
+### Retention Period Protection
+
+Even when the optimizer runs successfully, the controller applies an additional time-based retention period check to prevent premature scale-to-zero:
+
+- **If optimizer returns 0 replicas**:
+  - Controller checks if retention period has expired since `lastUpdate`
+  - **First run** (when `lastUpdate` is zero): Preserves current deployment replicas as grace period for Prometheus discovery
+  - **Retention period NOT exceeded**: Preserves previous allocation (doesn't scale to zero yet)
+  - **Retention period EXCEEDED**: Applies optimizer's 0 replicas recommendation
+
+This ensures consistent retention period semantics across all decision paths and prevents the optimizer's metrics-based scale-to-zero logic from conflicting with time-based retention requirements.
+
+**Status indicators**: `desiredOptimizedAlloc.reason` will show:
 ```
+# Normal optimizer solution
 Optimizer solution: cost and latency optimized allocation
+
+# First run grace period
+First run: preserving current replicas for Prometheus discovery grace period
+
+# When retention period blocks scale-to-zero
+Optimizer returned 0 but retention period not exceeded (1m30s < 5m), preserving allocation
 ```
 
 ## 2. Fallback Allocation (Controller-Centric Approach)
@@ -362,8 +381,9 @@ Both controllers can coexist, with WVA managing the strategic allocation based o
 The VariantAutoscaling controller provides intelligent, cost-optimized scaling with robust fallback behavior:
 
 **Key Features:**
+- **Consistent retention period enforcement**: All decision paths (optimizer, fallback, last resort) use time-based retention checks to prevent premature scale-to-zero
 - **Controller-centric approach**: Maintains optimization intent during transient issues
-- **Retention period awareness**: Scales to zero when no activity for extended periods
+- **Retention period awareness**: Scales to zero only after retention period expires with no activity
 - **Bounds enforcement**: Always respects `minReplicas` and `maxReplicas` across all paths
 - **Scale-to-zero integration**: Conserves resources while maintaining essential capacity
 

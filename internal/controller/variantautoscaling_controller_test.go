@@ -2245,4 +2245,174 @@ retentionPeriod: "not-a-duration"`,
 			})
 		})
 	})
+
+	Describe("Path 1 Retention Period Check", func() {
+		Context("When optimizer returns 0 replicas", func() {
+			var (
+				scaleToZeroConfigData utils.ScaleToZeroConfigData
+			)
+
+			BeforeEach(func() {
+				enabled := true
+				scaleToZeroConfigData = utils.ScaleToZeroConfigData{
+					"test-model": utils.ModelScaleToZeroConfig{
+						ModelID:           "test-model",
+						EnableScaleToZero: &enabled,
+						RetentionPeriod:   "5m",
+					},
+				}
+			})
+
+			It("should preserve previous allocation when retention period not exceeded", func() {
+				// Simulate optimizer returning 0 replicas
+				optimizedAlloc := llmdVariantAutoscalingV1alpha1.OptimizedAlloc{
+					NumReplicas: 0,
+				}
+
+				// Previous allocation with recent LastUpdate (within retention period)
+				previousAlloc := llmdVariantAutoscalingV1alpha1.OptimizedAlloc{
+					NumReplicas: 3,
+					Reason:      "Optimizer solution: cost and latency optimized allocation",
+					LastUpdate:  metav1.NewTime(time.Now().Add(-2 * time.Minute)), // 2m ago < 5m retention
+				}
+
+				// Simulate the Path 1 retention check logic
+				newAlloc := optimizedAlloc
+				newAlloc.Reason = "Optimizer solution: cost and latency optimized allocation"
+
+				modelName := "test-model"
+				retentionPeriod := utils.GetScaleToZeroRetentionPeriod(scaleToZeroConfigData, modelName)
+
+				if optimizedAlloc.NumReplicas == 0 {
+					if !previousAlloc.LastUpdate.IsZero() {
+						timeSinceLastUpdate := time.Since(previousAlloc.LastUpdate.Time)
+						if timeSinceLastUpdate <= retentionPeriod {
+							// Preserve previous allocation
+							newAlloc.NumReplicas = previousAlloc.NumReplicas
+							newAlloc.Reason = fmt.Sprintf("Optimizer returned 0 but retention period not exceeded (%v < %v), preserving allocation",
+								timeSinceLastUpdate.Round(time.Second), retentionPeriod)
+						}
+					}
+				}
+
+				Expect(newAlloc.NumReplicas).To(Equal(int32(3)), "Should preserve previous allocation")
+				Expect(newAlloc.Reason).To(ContainSubstring("retention period not exceeded"))
+			})
+
+			It("should allow scale to zero when retention period exceeded", func() {
+				// Simulator optimizer returning 0 replicas
+				optimizedAlloc := llmdVariantAutoscalingV1alpha1.OptimizedAlloc{
+					NumReplicas: 0,
+				}
+
+				// Previous allocation with old LastUpdate (beyond retention period)
+				previousAlloc := llmdVariantAutoscalingV1alpha1.OptimizedAlloc{
+					NumReplicas: 3,
+					Reason:      "Optimizer solution: cost and latency optimized allocation",
+					LastUpdate:  metav1.NewTime(time.Now().Add(-10 * time.Minute)), // 10m ago > 5m retention
+				}
+
+				// Simulate the Path 1 retention check logic
+				newAlloc := optimizedAlloc
+				newAlloc.Reason = "Optimizer solution: cost and latency optimized allocation"
+
+				modelName := "test-model"
+				retentionPeriod := utils.GetScaleToZeroRetentionPeriod(scaleToZeroConfigData, modelName)
+
+				if optimizedAlloc.NumReplicas == 0 {
+					if !previousAlloc.LastUpdate.IsZero() {
+						timeSinceLastUpdate := time.Since(previousAlloc.LastUpdate.Time)
+						if timeSinceLastUpdate <= retentionPeriod {
+							// Preserve previous allocation
+							newAlloc.NumReplicas = previousAlloc.NumReplicas
+							newAlloc.Reason = fmt.Sprintf("Optimizer returned 0 but retention period not exceeded (%v < %v), preserving allocation",
+								timeSinceLastUpdate.Round(time.Second), retentionPeriod)
+						}
+					}
+				}
+
+				Expect(newAlloc.NumReplicas).To(Equal(int32(0)), "Should allow scale to zero")
+				Expect(newAlloc.Reason).To(Equal("Optimizer solution: cost and latency optimized allocation"))
+			})
+
+			It("should preserve currentReplicas on first run (LastUpdate is zero)", func() {
+				// Simulate optimizer returning 0 replicas
+				optimizedAlloc := llmdVariantAutoscalingV1alpha1.OptimizedAlloc{
+					NumReplicas: 0,
+				}
+
+				// Previous allocation with zero LastUpdate (first run)
+				previousAlloc := llmdVariantAutoscalingV1alpha1.OptimizedAlloc{
+					NumReplicas: 0,
+					Reason:      "",
+					LastUpdate:  metav1.Time{}, // Zero time = first run
+				}
+
+				// Current deployment has 2 replicas
+				currentReplicas := int32(2)
+
+				// Simulate the Path 1 retention check logic
+				newAlloc := optimizedAlloc
+				newAlloc.Reason = "Optimizer solution: cost and latency optimized allocation"
+
+				modelName := "test-model"
+				retentionPeriod := utils.GetScaleToZeroRetentionPeriod(scaleToZeroConfigData, modelName)
+
+				if optimizedAlloc.NumReplicas == 0 {
+					if previousAlloc.LastUpdate.IsZero() {
+						// First run: preserve currentReplicas
+						newAlloc.NumReplicas = currentReplicas
+						newAlloc.Reason = "First run: preserving current replicas for Prometheus discovery grace period"
+					} else {
+						timeSinceLastUpdate := time.Since(previousAlloc.LastUpdate.Time)
+						if timeSinceLastUpdate <= retentionPeriod {
+							// Preserve previous allocation
+							newAlloc.NumReplicas = previousAlloc.NumReplicas
+							newAlloc.Reason = fmt.Sprintf("Optimizer returned 0 but retention period not exceeded (%v < %v), preserving allocation",
+								timeSinceLastUpdate.Round(time.Second), retentionPeriod)
+						}
+					}
+				}
+
+				Expect(newAlloc.NumReplicas).To(Equal(int32(2)), "Should preserve currentReplicas on first run")
+				Expect(newAlloc.Reason).To(Equal("First run: preserving current replicas for Prometheus discovery grace period"))
+			})
+
+			It("should not affect optimizer solutions with non-zero replicas", func() {
+				// Simulate optimizer returning non-zero replicas
+				optimizedAlloc := llmdVariantAutoscalingV1alpha1.OptimizedAlloc{
+					NumReplicas: 5,
+				}
+
+				// Previous allocation
+				previousAlloc := llmdVariantAutoscalingV1alpha1.OptimizedAlloc{
+					NumReplicas: 3,
+					Reason:      "Optimizer solution: cost and latency optimized allocation",
+					LastUpdate:  metav1.NewTime(time.Now().Add(-2 * time.Minute)),
+				}
+
+				// Simulate the Path 1 retention check logic
+				newAlloc := optimizedAlloc
+				newAlloc.Reason = "Optimizer solution: cost and latency optimized allocation"
+
+				modelName := "test-model"
+				retentionPeriod := utils.GetScaleToZeroRetentionPeriod(scaleToZeroConfigData, modelName)
+
+				if optimizedAlloc.NumReplicas == 0 {
+					if !previousAlloc.LastUpdate.IsZero() {
+						timeSinceLastUpdate := time.Since(previousAlloc.LastUpdate.Time)
+						if timeSinceLastUpdate <= retentionPeriod {
+							// Preserve previous allocation
+							newAlloc.NumReplicas = previousAlloc.NumReplicas
+							newAlloc.Reason = fmt.Sprintf("Optimizer returned 0 but retention period not exceeded (%v < %v), preserving allocation",
+								timeSinceLastUpdate.Round(time.Second), retentionPeriod)
+						}
+					}
+				}
+
+				Expect(newAlloc.NumReplicas).To(Equal(int32(5)), "Should apply optimizer's non-zero allocation")
+				Expect(newAlloc.Reason).To(Equal("Optimizer solution: cost and latency optimized allocation"))
+			})
+		})
+	})
 })

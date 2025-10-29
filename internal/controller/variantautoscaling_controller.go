@@ -1115,6 +1115,47 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 			newAlloc := optimizedAlloc
 			newAlloc.Reason = "Optimizer solution: cost and latency optimized allocation"
 
+			// PATH 1 RETENTION PERIOD CHECK:
+			// If optimizer returns 0 replicas, verify time-based retention period has expired
+			// This ensures consistency with Path 2 and Path 3 fallback logic
+			if optimizedAlloc.NumReplicas == 0 {
+				previousAlloc := va.Status.DesiredOptimizedAlloc
+				modelName := va.Spec.ModelID
+				retentionPeriod := utils.GetScaleToZeroRetentionPeriod(scaleToZeroConfigData, modelName)
+
+				// Check if this is first run (LastUpdate is zero) or retention period not exceeded
+				if previousAlloc.LastUpdate.IsZero() {
+					// First run: preserve currentReplicas as grace period for Prometheus discovery
+					logger.Log.Info("Optimizer returned 0 replicas but this is first run, preserving current deployment replicas",
+						"variantName", va.Name,
+						"currentReplicas", currentReplicas)
+
+					newAlloc.NumReplicas = currentReplicas
+					newAlloc.Reason = "First run: preserving current replicas for Prometheus discovery grace period"
+				} else {
+					timeSinceLastUpdate := time.Since(previousAlloc.LastUpdate.Time)
+					if timeSinceLastUpdate <= retentionPeriod {
+						// Retention period NOT exceeded - preserve previous allocation
+						logger.Log.Info("Optimizer returned 0 replicas but retention period not exceeded, preserving previous allocation",
+							"variantName", va.Name,
+							"previousReplicas", previousAlloc.NumReplicas,
+							"timeSinceLastUpdate", timeSinceLastUpdate.Round(time.Second),
+							"retentionPeriod", retentionPeriod)
+
+						// Preserve previous allocation (don't scale to zero yet)
+						newAlloc.NumReplicas = previousAlloc.NumReplicas
+						newAlloc.Reason = fmt.Sprintf("Optimizer returned 0 but retention period not exceeded (%v < %v), preserving allocation",
+							timeSinceLastUpdate.Round(time.Second), retentionPeriod)
+					} else {
+						logger.Log.Info("Optimizer returned 0 replicas and retention period exceeded, scaling to zero",
+							"variantName", va.Name,
+							"previousReplicas", previousAlloc.NumReplicas,
+							"timeSinceLastUpdate", timeSinceLastUpdate.Round(time.Second),
+							"retentionPeriod", retentionPeriod)
+					}
+				}
+			}
+
 			// Update LastUpdate only if NumReplicas or Reason changed
 			previousAlloc := va.Status.DesiredOptimizedAlloc
 			if previousAlloc.NumReplicas != newAlloc.NumReplicas || previousAlloc.Reason != newAlloc.Reason {
@@ -1128,7 +1169,8 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 			logger.Log.Info("Using optimized allocation from optimizer",
 				"variantName", va.Name,
 				"currentReplicas", updateVa.Status.CurrentAlloc.NumReplicas,
-				"desiredReplicas", optimizedAlloc.NumReplicas)
+				"desiredReplicas", newAlloc.NumReplicas,
+				"reason", newAlloc.Reason)
 		} else {
 			// Check if fallback allocation was set in updateList (from addVariantWithFallbackAllocation or previous reconciliation)
 			if va.Status.DesiredOptimizedAlloc.NumReplicas >= 0 || !va.Status.DesiredOptimizedAlloc.LastRunTime.IsZero() {
