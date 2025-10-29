@@ -112,6 +112,7 @@ func (engine *VariantAutoscalingsEngine) Optimize(ctx context.Context,
 				"error", err)
 			optimizedAllocation = &llmdOptv1alpha1.OptimizedAlloc{
 				NumReplicas: va.Status.CurrentAlloc.NumReplicas,
+				Reason:      "Optimizer fallback: no solution found, using current replicas",
 			}
 		}
 
