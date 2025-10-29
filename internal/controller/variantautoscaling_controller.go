@@ -993,6 +993,16 @@ func (r *VariantAutoscalingReconciler) prepareVariantAutoscalings(
 		}
 
 		vaFullName := utils.FullName(va.Name, va.Namespace)
+
+		// Ensure DesiredOptimizedAlloc has Reason and LastUpdate initialized
+		// This handles cases where optimizer might not run or old CRDs without these fields
+		if updateVA.Status.DesiredOptimizedAlloc.Reason == "" {
+			updateVA.Status.DesiredOptimizedAlloc.Reason = "Metrics collected, awaiting optimizer decision"
+		}
+		if updateVA.Status.DesiredOptimizedAlloc.LastUpdate.IsZero() && updateVA.Status.DesiredOptimizedAlloc.NumReplicas >= 0 {
+			updateVA.Status.DesiredOptimizedAlloc.LastUpdate = metav1.Now()
+		}
+
 		updateList.Items = append(updateList.Items, updateVA)
 		vaMap[vaFullName] = &va
 	}
