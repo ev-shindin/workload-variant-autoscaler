@@ -10,10 +10,13 @@ The VariantAutoscaling controller manages the number of replicas for model varia
 
 The controller follows this decision hierarchy (in order of priority):
 
-1. **Optimizer Solution** (when metrics are available)
-2. **Fallback Allocation** (when metrics are temporarily unavailable)
-3. **Retention Period Logic** (when metrics are unavailable for extended periods)
-4. **Last Resort** (when no other mechanism provides an allocation)
+1. **Optimizer Solution** (when metrics are available and optimizer runs)
+2. **Fallback Allocation** (when optimizer doesn't run but fallback allocation exists)
+   - Includes retention period awareness and scale-to-zero logic
+3. **Last Resort** (when no optimizer solution or fallback allocation)
+   - Uses controller-centric approach with retention period awareness
+
+All paths enforce `minReplicas` and `maxReplicas` bounds and apply scale-to-zero logic when the retention period is exceeded.
 
 ## 1. Optimizer Solution
 
@@ -33,15 +36,28 @@ Optimizer solution: cost and latency optimized allocation
 
 ## 2. Fallback Allocation (Controller-Centric Approach)
 
-When metrics become temporarily unavailable (e.g., Prometheus connectivity issues, metric collection delays), the controller enters fallback mode to maintain service stability.
+When the optimizer doesn't run but a fallback allocation exists (from preparation phase or previous reconciliation), the controller enters fallback mode to maintain service stability.
 
 ### Behavior
 
-The controller uses a **controller-centric approach** that prioritizes maintaining the controller's intended allocation:
+The controller uses a **controller-centric approach** with two stages:
 
-- **First run**: Uses current deployment replica count as baseline
-- **Subsequent runs**: Uses previous optimized allocation to maintain controller intent
-- **Bounds enforcement**: Applies `max(minReplicas, baseline)` to respect configured bounds
+#### Stage 1: Check Retention Period
+
+First, the controller checks if the retention period has been exceeded since the last allocation update:
+
+- **Retention period NOT exceeded**: Use cached allocation with controller-centric approach
+  - **First run**: Uses current deployment replica count as baseline
+  - **Subsequent runs**: Uses previous optimized allocation to maintain controller intent
+  - **Bounds enforcement**: Applies `minReplicas` and `maxReplicas` bounds
+
+- **Retention period EXCEEDED**: Apply scale-to-zero logic (same as Retention Period Logic below)
+
+#### Stage 2: Bounds Re-enforcement
+
+Even when using cached allocations, bounds are re-applied to respect any CRD changes:
+- If admin changed `minReplicas` or `maxReplicas`, allocation is clamped immediately
+- Ensures administrator bounds are always respected
 
 ### Why Controller-Centric?
 
@@ -50,24 +66,28 @@ This approach ensures that:
 - The controller's optimization intent is preserved during transient issues
 - External manual scaling changes are eventually reconciled back to the controller's decision
 - Service stability is maintained during metric collection gaps
+- Scale-to-zero still occurs when no activity is detected for extended periods
 
 ### Example
 
 ```yaml
 # Current state
 currentAlloc: 5 replicas
-desiredOptimizedAlloc: 8 replicas
+desiredOptimizedAlloc: 8 replicas (lastUpdate: 2 minutes ago)
 minReplicas: 2
+retentionPeriod: 5m
 
-# Metrics become unavailable
-# Fallback uses previous optimized (8) rather than current (5)
-# Result: maintains 8 replicas
+# Optimizer doesn't run, fallback allocation exists
+# Retention period NOT exceeded (2m < 5m)
+# Result: maintains 8 replicas (controller intent)
 ```
 
 **Status indicator**: `desiredOptimizedAlloc.reason` will show:
 ```
-Fallback: metrics unavailable, using max(minReplicas=2, baseline=8) = 8
+Fallback: preserving previous allocation (no optimizer solution)
 ```
+
+**If retention period exceeded**: See Retention Period Logic section below.
 
 ## 3. Retention Period Logic
 
@@ -140,15 +160,65 @@ On first reconciliation, `lastUpdate` is zero, so retention period checks are sk
 
 ## 4. Last Resort Allocation
 
-If no optimizer solution or fallback allocation is provided, the controller uses:
+If no optimizer solution or fallback allocation is provided, the controller applies the same logic as Fallback Allocation.
+
+### Behavior
+
+The controller uses a **controller-centric approach** with retention period awareness:
+
+#### When Retention Period NOT Exceeded
+
+Uses previous optimized allocation if available, otherwise uses current deployment state:
 
 ```
-desiredReplicas = max(minReplicas, currentReplicas)
+IF previousOptimized exists:
+    baseline = previousOptimized.NumReplicas  # Maintain controller intent
+ELSE:
+    baseline = currentDeploymentReplicas     # First run
+
+desiredReplicas = clamp(baseline, minReplicas, maxReplicas)
 ```
 
-**Status indicator**:
+#### When Retention Period EXCEEDED
+
+Applies scale-to-zero logic (same as Retention Period Logic):
+- All minReplicas=0 + scaleToZero enabled → scale to 0
+- All minReplicas=0 + scaleToZero disabled → cheapest to 1, others to 0
+- Some minReplicas>0 → use minReplicas
+
+### Example
+
+```yaml
+# Scenario 1: Retention period NOT exceeded
+previousOptimized: 10 replicas (lastUpdate: 2 minutes ago)
+currentDeployment: 5 replicas
+minReplicas: 2
+maxReplicas: 12
+retentionPeriod: 5m
+
+# Result: 10 replicas (maintains controller intent, not current state)
 ```
-Last resort: no optimizer/fallback, using max(minReplicas=2, current=3) = 3
+
+```yaml
+# Scenario 2: Retention period EXCEEDED
+previousOptimized: 10 replicas (lastUpdate: 6 minutes ago)
+minReplicas: 0 (all variants)
+scaleToZero: enabled
+retentionPeriod: 5m
+
+# Result: 0 replicas (scale-to-zero logic applied)
+```
+
+**Status indicators**:
+```
+# Retention period not exceeded
+Last resort: maintaining controller intent: max(minReplicas=2, previousOptimized=10) = 10
+
+# First run
+Last resort: first run, using max(minReplicas=2, current=5) = 5
+
+# Retention period exceeded with scale-to-zero
+Last resort: retention period exceeded (>5m), scale-to-zero enabled, scaling to 0
 ```
 
 ## Administrator Guidelines
@@ -289,10 +359,18 @@ Both controllers can coexist, with WVA managing the strategic allocation based o
 
 ## Summary
 
-The VariantAutoscaling controller provides intelligent, cost-optimized scaling with robust fallback behavior. Administrators should:
+The VariantAutoscaling controller provides intelligent, cost-optimized scaling with robust fallback behavior:
 
+**Key Features:**
+- **Controller-centric approach**: Maintains optimization intent during transient issues
+- **Retention period awareness**: Scales to zero when no activity for extended periods
+- **Bounds enforcement**: Always respects `minReplicas` and `maxReplicas` across all paths
+- **Scale-to-zero integration**: Conserves resources while maintaining essential capacity
+
+**Administrator Guidelines:**
 - ✅ Use `minReplicas`, `maxReplicas`, and `scaleToZero` for capacity control
 - ✅ Monitor `desiredOptimizedAlloc.reason` to understand scaling decisions
+- ✅ Monitor `desiredOptimizedAlloc.lastUpdate` to track allocation changes
 - ✅ Configure retention period appropriately for your environment
 - ❌ Avoid manual deployment scaling (will be overridden)
 - ❌ Don't rely on external scaling tools that conflict with WVA's decisions

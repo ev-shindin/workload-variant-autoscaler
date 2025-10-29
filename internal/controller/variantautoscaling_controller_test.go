@@ -2059,4 +2059,190 @@ retentionPeriod: "not-a-duration"`,
 			Expect(updateList.Items[0].Status.DesiredOptimizedAlloc.NumReplicas).To(Equal(int32(2)))
 		})
 	})
+
+	Describe("Helper Functions", func() {
+		Context("applyRetentionPeriodScaling", func() {
+			var (
+				va                    *llmdVariantAutoscalingV1alpha1.VariantAutoscaling
+				allVariants           []llmdVariantAutoscalingV1alpha1.VariantAutoscaling
+				scaleToZeroConfigData utils.ScaleToZeroConfigData
+				retentionPeriod       time.Duration
+			)
+
+			BeforeEach(func() {
+				minReplicas := int32(0)
+				enabled := true
+				va = &llmdVariantAutoscalingV1alpha1.VariantAutoscaling{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "test-va",
+					},
+					Spec: llmdVariantAutoscalingV1alpha1.VariantAutoscalingSpec{
+						ModelID:          "test-model",
+						MinReplicas:      &minReplicas,
+						AcceleratorCount: 4,
+					},
+				}
+				allVariants = []llmdVariantAutoscalingV1alpha1.VariantAutoscaling{*va}
+				scaleToZeroConfigData = utils.ScaleToZeroConfigData{
+					"test-model": utils.ModelScaleToZeroConfig{
+						ModelID:           "test-model",
+						EnableScaleToZero: &enabled,
+						RetentionPeriod:   "5m",
+					},
+				}
+				retentionPeriod = 5 * time.Minute
+			})
+
+			It("should scale to zero when scaleToZero enabled and all minReplicas are zero", func() {
+				replicas, reason := applyRetentionPeriodScaling(va, allVariants, scaleToZeroConfigData, retentionPeriod, "Test")
+
+				Expect(replicas).To(Equal(int32(0)))
+				Expect(reason).To(ContainSubstring("scale-to-zero enabled"))
+				Expect(reason).To(ContainSubstring("scaling to 0"))
+			})
+
+			It("should set cheapest variant to 1 when scaleToZero disabled", func() {
+				disabled := false
+				scaleToZeroConfigData["test-model"] = utils.ModelScaleToZeroConfig{
+					ModelID:           "test-model",
+					EnableScaleToZero: &disabled,
+					RetentionPeriod:   "5m",
+				}
+
+				replicas, reason := applyRetentionPeriodScaling(va, allVariants, scaleToZeroConfigData, retentionPeriod, "Test")
+
+				Expect(replicas).To(Equal(int32(1)))
+				Expect(reason).To(ContainSubstring("cheapest variant set to 1"))
+			})
+
+			It("should use minReplicas when some variants have minReplicas > 0", func() {
+				minReplicas := int32(3)
+				va.Spec.MinReplicas = &minReplicas
+				// Update allVariants to reflect the change
+				allVariants[0].Spec.MinReplicas = &minReplicas
+
+				replicas, reason := applyRetentionPeriodScaling(va, allVariants, scaleToZeroConfigData, retentionPeriod, "Test")
+
+				Expect(replicas).To(Equal(int32(3)))
+				Expect(reason).To(ContainSubstring("using minReplicas=3"))
+			})
+
+			It("should include path name in reason message", func() {
+				_, reason := applyRetentionPeriodScaling(va, allVariants, scaleToZeroConfigData, retentionPeriod, "Fallback")
+
+				Expect(reason).To(ContainSubstring("Fallback:"))
+			})
+		})
+
+		Context("applyReplicaBounds", func() {
+			It("should not change replicas when within bounds", func() {
+				minReplicas := int32(2)
+				maxReplicas := int32(10)
+
+				clamped, changed := applyReplicaBounds(5, &minReplicas, &maxReplicas, "test-va")
+
+				Expect(clamped).To(Equal(int32(5)))
+				Expect(changed).To(BeFalse())
+			})
+
+			It("should clamp to minReplicas when below minimum", func() {
+				minReplicas := int32(5)
+
+				clamped, changed := applyReplicaBounds(2, &minReplicas, nil, "test-va")
+
+				Expect(clamped).To(Equal(int32(5)))
+				Expect(changed).To(BeTrue())
+			})
+
+			It("should clamp to maxReplicas when above maximum", func() {
+				maxReplicas := int32(10)
+
+				clamped, changed := applyReplicaBounds(15, nil, &maxReplicas, "test-va")
+
+				Expect(clamped).To(Equal(int32(10)))
+				Expect(changed).To(BeTrue())
+			})
+
+			It("should handle nil minReplicas and maxReplicas", func() {
+				clamped, changed := applyReplicaBounds(5, nil, nil, "test-va")
+
+				Expect(clamped).To(Equal(int32(5)))
+				Expect(changed).To(BeFalse())
+			})
+
+			It("should apply both bounds when needed", func() {
+				minReplicas := int32(5)
+				maxReplicas := int32(10)
+
+				// Test below minimum
+				clamped, changed := applyReplicaBounds(2, &minReplicas, &maxReplicas, "test-va")
+				Expect(clamped).To(Equal(int32(5)))
+				Expect(changed).To(BeTrue())
+
+				// Test above maximum
+				clamped, changed = applyReplicaBounds(15, &minReplicas, &maxReplicas, "test-va")
+				Expect(clamped).To(Equal(int32(10)))
+				Expect(changed).To(BeTrue())
+			})
+		})
+
+		Context("createOptimizedAllocWithUpdate", func() {
+			It("should update LastUpdate when NumReplicas changes", func() {
+				previousAlloc := llmdVariantAutoscalingV1alpha1.OptimizedAlloc{
+					NumReplicas: 5,
+					Reason:      "Previous reason",
+					LastUpdate:  metav1.NewTime(time.Now().Add(-1 * time.Hour)),
+				}
+
+				newAlloc := createOptimizedAllocWithUpdate(8, "New reason", previousAlloc)
+
+				Expect(newAlloc.NumReplicas).To(Equal(int32(8)))
+				Expect(newAlloc.Reason).To(Equal("New reason"))
+				Expect(newAlloc.LastUpdate.Time).To(BeTemporally(">", previousAlloc.LastUpdate.Time))
+			})
+
+			It("should update LastUpdate when Reason changes", func() {
+				previousAlloc := llmdVariantAutoscalingV1alpha1.OptimizedAlloc{
+					NumReplicas: 5,
+					Reason:      "Previous reason",
+					LastUpdate:  metav1.NewTime(time.Now().Add(-1 * time.Hour)),
+				}
+
+				newAlloc := createOptimizedAllocWithUpdate(5, "New reason", previousAlloc)
+
+				Expect(newAlloc.NumReplicas).To(Equal(int32(5)))
+				Expect(newAlloc.Reason).To(Equal("New reason"))
+				Expect(newAlloc.LastUpdate.Time).To(BeTemporally(">", previousAlloc.LastUpdate.Time))
+			})
+
+			It("should preserve LastUpdate when nothing changes", func() {
+				previousTime := metav1.NewTime(time.Now().Add(-1 * time.Hour))
+				previousAlloc := llmdVariantAutoscalingV1alpha1.OptimizedAlloc{
+					NumReplicas: 5,
+					Reason:      "Same reason",
+					LastUpdate:  previousTime,
+				}
+
+				newAlloc := createOptimizedAllocWithUpdate(5, "Same reason", previousAlloc)
+
+				Expect(newAlloc.NumReplicas).To(Equal(int32(5)))
+				Expect(newAlloc.Reason).To(Equal("Same reason"))
+				Expect(newAlloc.LastUpdate).To(Equal(previousTime))
+			})
+
+			It("should handle zero NumReplicas", func() {
+				previousAlloc := llmdVariantAutoscalingV1alpha1.OptimizedAlloc{
+					NumReplicas: 5,
+					Reason:      "Previous reason",
+					LastUpdate:  metav1.NewTime(time.Now().Add(-1 * time.Hour)),
+				}
+
+				newAlloc := createOptimizedAllocWithUpdate(0, "Scaled to zero", previousAlloc)
+
+				Expect(newAlloc.NumReplicas).To(Equal(int32(0)))
+				Expect(newAlloc.Reason).To(Equal("Scaled to zero"))
+				Expect(newAlloc.LastUpdate.Time).To(BeTemporally(">", previousAlloc.LastUpdate.Time))
+			})
+		})
+	})
 })
