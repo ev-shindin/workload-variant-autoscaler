@@ -1088,6 +1088,15 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 			continue
 		}
 
+		// Preserve Reason and LastUpdate from preparation phase initialization
+		// The fresh copy from API server won't have these fields if they were just initialized
+		if updateVa.Status.DesiredOptimizedAlloc.Reason == "" && va.Status.DesiredOptimizedAlloc.Reason != "" {
+			updateVa.Status.DesiredOptimizedAlloc.Reason = va.Status.DesiredOptimizedAlloc.Reason
+		}
+		if updateVa.Status.DesiredOptimizedAlloc.LastUpdate.IsZero() && !va.Status.DesiredOptimizedAlloc.LastUpdate.IsZero() {
+			updateVa.Status.DesiredOptimizedAlloc.LastUpdate = va.Status.DesiredOptimizedAlloc.LastUpdate
+		}
+
 		// Note: ownerReference is now set earlier in prepareVariantAutoscalings
 		// This ensures it's set even if metrics aren't available yet
 
