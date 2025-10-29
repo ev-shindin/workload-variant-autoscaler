@@ -908,6 +908,8 @@ var _ = Describe("Test idle scale-to-zero with KEDA", Ordered, func() {
 				va.Status.CurrentAlloc.NumReplicas, va.Status.DesiredOptimizedAlloc.NumReplicas, va.Status.Actuation.Applied)
 			_, _ = fmt.Fprintf(GinkgoWriter, "VariantAutoscaling Spec: Accelerator=%q, VariantID=%q, ModelID=%q\n",
 				va.Spec.Accelerator, va.Spec.VariantID, va.Spec.ModelID)
+			_, _ = fmt.Fprintf(GinkgoWriter, "DesiredOptimizedAlloc Reason: %q\n",
+				va.Status.DesiredOptimizedAlloc.Reason)
 
 			// Check if metric emission condition would be satisfied
 			if va.Status.DesiredOptimizedAlloc.NumReplicas < 0 {
@@ -1066,9 +1068,10 @@ var _ = Describe("Test idle scale-to-zero with KEDA", Ordered, func() {
 			g.Expect(err).NotTo(HaveOccurred(), "Should be able to get VariantAutoscaling")
 
 			// Debug output to understand the flow
-			_, _ = fmt.Fprintf(GinkgoWriter, "VA Status: DesiredOptimized=%d, Current=%d\n",
+			_, _ = fmt.Fprintf(GinkgoWriter, "VA Status: DesiredOptimized=%d, Current=%d, Reason=%q\n",
 				va.Status.DesiredOptimizedAlloc.NumReplicas,
-				va.Status.CurrentAlloc.NumReplicas)
+				va.Status.CurrentAlloc.NumReplicas,
+				va.Status.DesiredOptimizedAlloc.Reason)
 
 			// Check status conditions to see if optimizer is running or fallback is used
 			for _, cond := range va.Status.Conditions {
@@ -1482,8 +1485,9 @@ var _ = Describe("Test traffic-based scale-to-zero with retention period", Order
 			err := crClient.Get(ctx, client.ObjectKey{Name: deployName, Namespace: namespace}, va)
 			g.Expect(err).NotTo(HaveOccurred(), "Should be able to get VariantAutoscaling")
 
-			_, _ = fmt.Fprintf(GinkgoWriter, "VariantAutoscaling Status: CurrentReplicas=%d, DesiredReplicas=%d, Actuation.Applied=%t\n",
-				va.Status.CurrentAlloc.NumReplicas, va.Status.DesiredOptimizedAlloc.NumReplicas, va.Status.Actuation.Applied)
+			_, _ = fmt.Fprintf(GinkgoWriter, "VariantAutoscaling Status: CurrentReplicas=%d, DesiredReplicas=%d, Actuation.Applied=%t, Reason=%q\n",
+				va.Status.CurrentAlloc.NumReplicas, va.Status.DesiredOptimizedAlloc.NumReplicas, va.Status.Actuation.Applied,
+				va.Status.DesiredOptimizedAlloc.Reason)
 
 			// CRITICAL: Wait for controller to see the current replica count
 			g.Expect(va.Status.CurrentAlloc.NumReplicas).To(BeNumerically(">=", 1),
@@ -1560,8 +1564,9 @@ var _ = Describe("Test traffic-based scale-to-zero with retention period", Order
 			err := crClient.Get(ctx, client.ObjectKey{Name: deployName, Namespace: namespace}, va)
 			g.Expect(err).NotTo(HaveOccurred(), "Should be able to get VariantAutoscaling")
 
-			_, _ = fmt.Fprintf(GinkgoWriter, "Waiting for controller: DesiredOptimized=%d, Current=%d\n",
-				va.Status.DesiredOptimizedAlloc.NumReplicas, va.Status.CurrentAlloc.NumReplicas)
+			_, _ = fmt.Fprintf(GinkgoWriter, "Waiting for controller: DesiredOptimized=%d, Current=%d, Reason=%q\n",
+				va.Status.DesiredOptimizedAlloc.NumReplicas, va.Status.CurrentAlloc.NumReplicas,
+				va.Status.DesiredOptimizedAlloc.Reason)
 
 			// Verify controller has processed traffic and recommended replicas > 0
 			g.Expect(va.Status.DesiredOptimizedAlloc.NumReplicas).To(BeNumerically(">", 0),
@@ -1633,9 +1638,10 @@ var _ = Describe("Test traffic-based scale-to-zero with retention period", Order
 			err := crClient.Get(ctx, client.ObjectKey{Name: deployName, Namespace: namespace}, va)
 			g.Expect(err).NotTo(HaveOccurred(), "Should be able to get VariantAutoscaling")
 
-			_, _ = fmt.Fprintf(GinkgoWriter, "VA Status: DesiredOptimized=%d, Current=%d\n",
+			_, _ = fmt.Fprintf(GinkgoWriter, "VA Status: DesiredOptimized=%d, Current=%d, Reason=%q\n",
 				va.Status.DesiredOptimizedAlloc.NumReplicas,
-				va.Status.CurrentAlloc.NumReplicas)
+				va.Status.CurrentAlloc.NumReplicas,
+				va.Status.DesiredOptimizedAlloc.Reason)
 
 			// Verify optimizer recommends 0
 			g.Expect(va.Status.DesiredOptimizedAlloc.NumReplicas).To(Equal(int32(0)),

@@ -280,10 +280,17 @@ func filterActiveVariantAutoscalings(items []llmdVariantAutoscalingV1alpha1.Vari
 // even when optimization cannot proceed normally.
 //
 // Fallback logic:
-// 1. Respect replica bounds (minReplicas, maxReplicas)
-// 2. If scale-to-zero is disabled and no minReplicas: set 1 replica for cheapest variant only
-// 3. If scale-to-zero is enabled AND aggregate metrics available: scale to zero only if load == 0
-// 4. If aggregate metrics not available: can set to 0 for all variants
+//  1. Respect replica bounds (minReplicas, maxReplicas)
+//  2. If scale-to-zero is disabled and no minReplicas: set 1 replica for cheapest variant only
+//  3. If scale-to-zero is enabled AND aggregate metrics available: scale to zero only if load == 0
+//  4. Controller-centric approach (when aggregateLoad is nil and retention NOT exceeded):
+//     a) First run: use current deployment replicas as baseline
+//     b) Subsequent runs: use previous optimized allocation to maintain controller intent
+//     c) Apply max(minReplicas, baseline) to respect bounds
+//  5. Retention period checks (when aggregateLoad is nil and time since LastUpdate > retentionPeriod):
+//     a) If scale-to-zero enabled AND all variants have minReplicas=0 → scale all to 0
+//     b) If scale-to-zero disabled AND all variants have minReplicas=0 → cheapest to 1, others to 0
+//     c) If any variant has minReplicas > 0 → set each variant to its minReplicas value
 func addVariantWithFallbackAllocation(
 	updateVA *llmdVariantAutoscalingV1alpha1.VariantAutoscaling,
 	deploy *appsv1.Deployment,
@@ -294,6 +301,8 @@ func addVariantWithFallbackAllocation(
 	modelName string,
 	aggregateLoad *float64,
 	isCheapestVariant bool,
+	allVariants []llmdVariantAutoscalingV1alpha1.VariantAutoscaling,
+	retentionPeriod time.Duration,
 ) {
 	// Log warning about using fallback allocation
 	logger.Log.Warnw("Using fallback allocation for variant - optimization data unavailable",
@@ -314,41 +323,139 @@ func addVariantWithFallbackAllocation(
 		}
 	}
 
-	// Determine desired replicas based on scale-to-zero config and aggregate metrics
+	// Systematic fallback logic:
+	// Priority 1: Determine desired replicas based on load (without bounds)
+	// Priority 2: Enforce minReplicas (always respected)
+	// Priority 3: Enforce maxReplicas (always respected)
+
 	var desiredReplicas int32
 	scaleToZeroEnabled := utils.IsScaleToZeroEnabled(scaleToZeroConfigData, modelName)
 
-	if !scaleToZeroEnabled {
-		// Scale-to-zero is disabled
-		// If no minReplicas set and this is the cheapest variant, maintain at least 1 replica
-		if updateVA.Spec.MinReplicas == nil {
-			if isCheapestVariant {
-				desiredReplicas = max(1, currentReplicas)
-				message = fmt.Sprintf("%s. Scale-to-zero disabled, maintaining cheapest variant with min 1 replica", message)
-			} else {
-				desiredReplicas = currentReplicas // Other variants can be 0
+	// Step 1: Determine desired replicas based on load conditions
+	if aggregateLoad == nil {
+		// Metrics unavailable - check retention period for scaling decisions
+
+		// Check if retention period has been exceeded (no activity detected)
+		retentionPeriodExceeded := false
+		lastUpdate := updateVA.Status.DesiredOptimizedAlloc.LastUpdate
+		if !lastUpdate.IsZero() {
+			timeSinceUpdate := time.Since(lastUpdate.Time)
+			if timeSinceUpdate > retentionPeriod {
+				retentionPeriodExceeded = true
 			}
-		} else {
-			// MinReplicas is set, respect it
-			desiredReplicas = currentReplicas
 		}
-	} else {
-		// Scale-to-zero is enabled
-		if aggregateLoad != nil {
-			// Aggregate metrics available - check load
-			if *aggregateLoad > 0 {
-				// There is load - maintain current replicas
-				desiredReplicas = currentReplicas
-				message = fmt.Sprintf("%s. Scale-to-zero enabled but load > 0 (%.2f), maintaining current replicas", message, *aggregateLoad)
-			} else {
-				// No load - can scale to zero
+
+		// Apply retention period logic if threshold exceeded
+		if retentionPeriodExceeded {
+			allMinReplicasZero := allVariantsHaveMinReplicasZero(allVariants, modelName)
+
+			if allMinReplicasZero && scaleToZeroEnabled {
+				// Case 1: Scale-to-zero enabled, all minReplicas=0 → scale all to 0
 				desiredReplicas = 0
-				message = fmt.Sprintf("%s. Scale-to-zero enabled and load == 0, scaling to zero", message)
+				message = fmt.Sprintf("%s. Metrics unavailable, no activity for %v (> retention period %v), scale-to-zero enabled, scaling to 0",
+					message, time.Since(lastUpdate.Time), retentionPeriod)
+				logger.Log.Info("Scaling to zero based on retention period (scale-to-zero enabled)",
+					"variant", updateVA.Name,
+					"modelID", modelName,
+					"timeSinceUpdate", time.Since(lastUpdate.Time),
+					"retentionPeriod", retentionPeriod)
+			} else if allMinReplicasZero && !scaleToZeroEnabled {
+				// Case 2: Scale-to-zero disabled, all minReplicas=0 → cheapest to 1, others to 0
+				if isCheapestVariant {
+					desiredReplicas = 1
+					message = fmt.Sprintf("%s. Metrics unavailable, no activity for %v (> retention period %v), scale-to-zero disabled, setting cheapest variant to 1",
+						message, time.Since(lastUpdate.Time), retentionPeriod)
+				} else {
+					desiredReplicas = 0
+					message = fmt.Sprintf("%s. Metrics unavailable, no activity for %v (> retention period %v), scale-to-zero disabled, setting non-cheapest variant to 0",
+						message, time.Since(lastUpdate.Time), retentionPeriod)
+				}
+				logger.Log.Info("Applying retention period logic with scale-to-zero disabled",
+					"variant", updateVA.Name,
+					"modelID", modelName,
+					"isCheapest", isCheapestVariant,
+					"desiredReplicas", desiredReplicas,
+					"timeSinceUpdate", time.Since(lastUpdate.Time),
+					"retentionPeriod", retentionPeriod)
+			} else {
+				// Case 3: Some variant has minReplicas > 0 → use this variant's minReplicas
+				var minReplicasValue int32
+				if updateVA.Spec.MinReplicas != nil {
+					minReplicasValue = *updateVA.Spec.MinReplicas
+				}
+				desiredReplicas = minReplicasValue
+				message = fmt.Sprintf("%s. Metrics unavailable, no activity for %v (> retention period %v), some variants have minReplicas > 0, using minReplicas=%d",
+					message, time.Since(lastUpdate.Time), retentionPeriod, minReplicasValue)
+				logger.Log.Info("Applying retention period logic with minReplicas bounds",
+					"variant", updateVA.Name,
+					"modelID", modelName,
+					"minReplicas", minReplicasValue,
+					"desiredReplicas", desiredReplicas,
+					"timeSinceUpdate", time.Since(lastUpdate.Time),
+					"retentionPeriod", retentionPeriod)
 			}
 		} else {
-			// Aggregate metrics not available - safe to scale to zero
+			// Retention period NOT exceeded - use controller-centric approach
+			// Priority: previous optimized decision > current deployment state
+
+			var minReplicasValue int32
+			if updateVA.Spec.MinReplicas != nil {
+				minReplicasValue = *updateVA.Spec.MinReplicas
+			}
+
+			// Determine baseline replicas: use previous optimized if available, else current
+			var baselineReplicas int32
+			if !updateVA.Status.DesiredOptimizedAlloc.LastRunTime.IsZero() {
+				// Use previous optimized allocation - maintain controller intent
+				baselineReplicas = updateVA.Status.DesiredOptimizedAlloc.NumReplicas
+				logger.Log.Info("Using previous optimized allocation as baseline during metrics unavailability",
+					"variant", updateVA.Name,
+					"previousOptimized", baselineReplicas,
+					"currentReplicas", currentReplicas)
+			} else {
+				// First run - use current deployment state as baseline
+				baselineReplicas = currentReplicas
+				logger.Log.Info("First run: using current deployment replicas as baseline",
+					"variant", updateVA.Name,
+					"currentReplicas", currentReplicas)
+			}
+
+			desiredReplicas = max(minReplicasValue, baselineReplicas)
+
+			// Model-level safety: If result is 0 and scale-to-zero is disabled, ensure cheapest variant has 1 replica
+			// This prevents all variants from being 0 when we don't know the load
+			if desiredReplicas == 0 && !scaleToZeroEnabled && isCheapestVariant {
+				desiredReplicas = 1
+				message = fmt.Sprintf("%s. Metrics unavailable, scale-to-zero disabled, ensuring cheapest variant has 1 replica", message)
+			} else {
+				if !updateVA.Status.DesiredOptimizedAlloc.LastRunTime.IsZero() {
+					message = fmt.Sprintf("%s. Metrics unavailable, maintaining controller intent: max(minReplicas=%d, previousOptimized=%d) = %d",
+						message, minReplicasValue, baselineReplicas, desiredReplicas)
+				} else {
+					message = fmt.Sprintf("%s. Metrics unavailable (first run), using max(minReplicas=%d, current=%d) = %d",
+						message, minReplicasValue, currentReplicas, desiredReplicas)
+				}
+			}
+		}
+	} else if *aggregateLoad > 0 {
+		// Active load - preserve current state
+		desiredReplicas = currentReplicas
+		message = fmt.Sprintf("%s. Active load detected (%.2f), maintaining current replicas (%d)", message, *aggregateLoad, currentReplicas)
+	} else {
+		// aggregateLoad == 0 (no load)
+		if scaleToZeroEnabled {
+			// Scale-to-zero enabled and no load -> set to 0 (will be bounded by minReplicas later)
 			desiredReplicas = 0
-			message = fmt.Sprintf("%s. Scale-to-zero enabled, aggregate metrics unavailable, scaling to zero", message)
+			message = fmt.Sprintf("%s. Scale-to-zero enabled and no load, setting to 0 (subject to minReplicas)", message)
+		} else {
+			// Scale-to-zero disabled and no load -> keep 1 replica on cheapest variant
+			if isCheapestVariant {
+				desiredReplicas = 1
+				message = fmt.Sprintf("%s. Scale-to-zero disabled, no load, setting cheapest variant to 1 replica", message)
+			} else {
+				desiredReplicas = 0
+				message = fmt.Sprintf("%s. Scale-to-zero disabled, no load, setting non-cheapest variant to 0 (subject to minReplicas)", message)
+			}
 		}
 	}
 
@@ -380,10 +487,22 @@ func addVariantWithFallbackAllocation(
 	}
 
 	// Set desired allocation with computed fallback value
-	updateVA.Status.DesiredOptimizedAlloc = llmdVariantAutoscalingV1alpha1.OptimizedAlloc{
+	newAlloc := llmdVariantAutoscalingV1alpha1.OptimizedAlloc{
 		NumReplicas: desiredReplicas,
 		LastRunTime: metav1.Now(),
+		Reason:      message,
 	}
+
+	// Update LastUpdate only if NumReplicas or Reason changed
+	previousAlloc := updateVA.Status.DesiredOptimizedAlloc
+	if previousAlloc.NumReplicas != newAlloc.NumReplicas || previousAlloc.Reason != newAlloc.Reason {
+		newAlloc.LastUpdate = metav1.Now()
+	} else {
+		// Preserve previous LastUpdate if nothing changed
+		newAlloc.LastUpdate = previousAlloc.LastUpdate
+	}
+
+	updateVA.Status.DesiredOptimizedAlloc = newAlloc
 
 	// Mark optimization as succeeded with fallback explanation
 	llmdVariantAutoscalingV1alpha1.SetCondition(updateVA,
@@ -435,9 +554,12 @@ func (r *VariantAutoscalingReconciler) addVariantWithFallback(
 		updateVA = va
 	}
 
+	// Get retention period for this model
+	retentionPeriod := utils.GetScaleToZeroRetentionPeriod(scaleToZeroConfigData, va.Spec.ModelID)
+
 	isCheapest := isCheapestVariantForModel(&updateVA, allVariants, va.Spec.ModelID)
 	addVariantWithFallbackAllocation(&updateVA, deploy, reason, message, updateList,
-		scaleToZeroConfigData, va.Spec.ModelID, aggregateLoad, isCheapest)
+		scaleToZeroConfigData, va.Spec.ModelID, aggregateLoad, isCheapest, allVariants, retentionPeriod)
 }
 
 // isCheapestVariantForModel determines if the given variant is the cheapest among all variants for the same model.
@@ -471,6 +593,30 @@ func isCheapestVariantForModel(
 	}
 
 	return currentVariant.Spec.VariantID == cheapestVariantID
+}
+
+// allVariantsHaveMinReplicasZero checks if all variants for the given model have minReplicas set to 0 or nil.
+// This is used to determine if scale-to-zero based on retention period is safe for the entire model.
+func allVariantsHaveMinReplicasZero(
+	allVariants []llmdVariantAutoscalingV1alpha1.VariantAutoscaling,
+	modelName string,
+) bool {
+	// Find at least one variant for this model
+	foundVariant := false
+	for _, va := range allVariants {
+		if va.Spec.ModelID != modelName {
+			continue // Different model
+		}
+		foundVariant = true
+
+		// If any variant has minReplicas > 0, return false
+		if va.Spec.MinReplicas != nil && *va.Spec.MinReplicas > 0 {
+			return false
+		}
+	}
+
+	// Return true only if we found at least one variant and all had minReplicas == 0 or nil
+	return foundVariant
 }
 
 // prepareVariantAutoscalings collects and prepares all data for optimization.
@@ -587,6 +733,7 @@ func (r *VariantAutoscalingReconciler) prepareVariantAutoscalings(
 				metricsValidation.Message)
 
 			// Add to updateList with fallback allocation for metric emission
+			retentionPeriod := utils.GetScaleToZeroRetentionPeriod(scaleToZeroConfigData, modelName)
 			isCheapest := isCheapestVariantForModel(&updateVA, activeVAs, modelName)
 			addVariantWithFallbackAllocation(&updateVA, &deploy,
 				llmdVariantAutoscalingV1alpha1.ReasonMetricsUnavailable,
@@ -595,7 +742,9 @@ func (r *VariantAutoscalingReconciler) prepareVariantAutoscalings(
 				scaleToZeroConfigData,
 				modelName,
 				nil, // No aggregate load available
-				isCheapest)
+				isCheapest,
+				activeVAs,
+				retentionPeriod)
 			continue
 		}
 
@@ -615,7 +764,9 @@ func (r *VariantAutoscalingReconciler) prepareVariantAutoscalings(
 				scaleToZeroConfigData,
 				modelName,
 				nil, // No aggregate load available
-				isCheapest)
+				isCheapest,
+				activeVAs,
+				retentionPeriod)
 			continue
 		}
 
@@ -636,7 +787,9 @@ func (r *VariantAutoscalingReconciler) prepareVariantAutoscalings(
 				scaleToZeroConfigData,
 				modelName,
 				nil, // No aggregate load available
-				isCheapest)
+				isCheapest,
+				activeVAs,
+				retentionPeriod)
 			continue
 		}
 
@@ -659,7 +812,9 @@ func (r *VariantAutoscalingReconciler) prepareVariantAutoscalings(
 				scaleToZeroConfigData,
 				modelName,
 				loadValue, // We have load but failed to parse full metrics
-				isCheapest)
+				isCheapest,
+				activeVAs,
+				retentionPeriod)
 			continue
 		}
 
@@ -684,7 +839,9 @@ func (r *VariantAutoscalingReconciler) prepareVariantAutoscalings(
 				scaleToZeroConfigData,
 				modelName,
 				loadValue,
-				isCheapest)
+				isCheapest,
+				activeVAs,
+				retentionPeriod)
 			continue
 		}
 
@@ -705,7 +862,9 @@ func (r *VariantAutoscalingReconciler) prepareVariantAutoscalings(
 				scaleToZeroConfigData,
 				modelName,
 				loadValue, // We have load and metrics but validation failed
-				isCheapest)
+				isCheapest,
+				activeVAs,
+				retentionPeriod)
 			continue
 		}
 
@@ -826,7 +985,20 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 		// Use optimized allocation if available, otherwise preserve fallback from updateList
 		// This ensures metrics are always emitted, even for zero-traffic scenarios
 		if hasOptimizedAlloc {
-			updateVa.Status.DesiredOptimizedAlloc = optimizedAlloc
+			// Add reason and conditional LastUpdate to optimizer allocation
+			newAlloc := optimizedAlloc
+			newAlloc.Reason = "Optimizer solution: cost and latency optimized allocation"
+
+			// Update LastUpdate only if NumReplicas or Reason changed
+			previousAlloc := va.Status.DesiredOptimizedAlloc
+			if previousAlloc.NumReplicas != newAlloc.NumReplicas || previousAlloc.Reason != newAlloc.Reason {
+				newAlloc.LastUpdate = metav1.Now()
+			} else {
+				// Preserve previous LastUpdate if nothing changed
+				newAlloc.LastUpdate = previousAlloc.LastUpdate
+			}
+
+			updateVa.Status.DesiredOptimizedAlloc = newAlloc
 			logger.Log.Info("Using optimized allocation from optimizer",
 				"variantName", va.Name,
 				"currentReplicas", updateVa.Status.CurrentAlloc.NumReplicas,
@@ -841,13 +1013,41 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 					"currentReplicas", va.Status.CurrentAlloc.NumReplicas,
 					"desiredReplicas", va.Status.DesiredOptimizedAlloc.NumReplicas)
 			} else {
-				// No optimization and no fallback - use 0 replicas as last resort
-				updateVa.Status.DesiredOptimizedAlloc = llmdVariantAutoscalingV1alpha1.OptimizedAlloc{
-					NumReplicas: 0,
+				// No optimization and no fallback - preserve current replicas with minReplicas enforcement
+				desiredReplicas := updateVa.Status.CurrentAlloc.NumReplicas
+				minReplicasValue := int32(0)
+				if va.Spec.MinReplicas != nil {
+					minReplicasValue = *va.Spec.MinReplicas
+					if desiredReplicas < minReplicasValue {
+						desiredReplicas = minReplicasValue
+					}
 				}
-				logger.Log.Debug("No optimized allocation or fallback found, using 0 replicas",
+
+				// Build reason message
+				reason := fmt.Sprintf("Last resort: no optimizer/fallback, using max(minReplicas=%d, current=%d) = %d",
+					minReplicasValue, updateVa.Status.CurrentAlloc.NumReplicas, desiredReplicas)
+
+				newAlloc := llmdVariantAutoscalingV1alpha1.OptimizedAlloc{
+					NumReplicas: desiredReplicas,
+					Reason:      reason,
+				}
+
+				// Update LastUpdate only if NumReplicas or Reason changed
+				previousAlloc := va.Status.DesiredOptimizedAlloc
+				if previousAlloc.NumReplicas != newAlloc.NumReplicas || previousAlloc.Reason != newAlloc.Reason {
+					newAlloc.LastUpdate = metav1.Now()
+				} else {
+					// Preserve previous LastUpdate if nothing changed
+					newAlloc.LastUpdate = previousAlloc.LastUpdate
+				}
+
+				updateVa.Status.DesiredOptimizedAlloc = newAlloc
+				logger.Log.Info("No optimized allocation or fallback found, preserving current replicas with minReplicas enforcement",
 					"variantName", va.Name,
-					"accelerator", va.Spec.Accelerator)
+					"accelerator", va.Spec.Accelerator,
+					"currentReplicas", updateVa.Status.CurrentAlloc.NumReplicas,
+					"desiredReplicas", desiredReplicas,
+					"minReplicas", va.Spec.MinReplicas)
 			}
 		}
 
