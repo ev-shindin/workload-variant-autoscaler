@@ -1372,6 +1372,26 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 
 		updateVa.Status.Actuation.Applied = false // No longer directly applying changes
 
+		// CRITICAL FIX: Ensure Reason and LastUpdate are set before persisting status
+		// This is a safety net to catch any cases where these fields might be lost
+		if updateVa.Status.DesiredOptimizedAlloc.Reason == "" {
+			// If Reason is still empty at this point, something went wrong in the allocation logic
+			// Set a clear fallback value so we never persist empty Reason
+			updateVa.Status.DesiredOptimizedAlloc.Reason = "Fallback: allocation set but reason missing (controller bug)"
+			updateVa.Status.DesiredOptimizedAlloc.LastUpdate = metav1.Now()
+			logger.Log.Error(nil, "CRITICAL: DesiredOptimizedAlloc.Reason was empty before status update!",
+				"variantName", updateVa.Name,
+				"numReplicas", updateVa.Status.DesiredOptimizedAlloc.NumReplicas,
+				"hasOptimizedAlloc", hasOptimizedAlloc)
+		}
+		if updateVa.Status.DesiredOptimizedAlloc.LastUpdate.IsZero() && updateVa.Status.DesiredOptimizedAlloc.NumReplicas >= 0 {
+			// LastUpdate should always be set when NumReplicas is set
+			updateVa.Status.DesiredOptimizedAlloc.LastUpdate = metav1.Now()
+			logger.Log.Warn("LastUpdate was zero before status update, setting it now",
+				"variantName", updateVa.Name,
+				"reason", updateVa.Status.DesiredOptimizedAlloc.Reason)
+		}
+
 		// Update conditions based on allocation decision path
 		// Preserves MetricsAvailable from preparation and sets OptimizationReady appropriately
 		updateConditionsForAllocation(&updateVa, va, hasOptimizedAlloc)
