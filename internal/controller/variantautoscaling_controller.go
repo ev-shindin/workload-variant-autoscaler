@@ -768,6 +768,47 @@ func createOptimizedAllocWithUpdate(
 	return newAlloc
 }
 
+// updateConditionsForAllocation updates the conditions for a VA based on the allocation decision path.
+// Preserves MetricsAvailable from preparation phase and sets OptimizationReady based on the path.
+func updateConditionsForAllocation(
+	updateVa *llmdVariantAutoscalingV1alpha1.VariantAutoscaling,
+	preparedVa *llmdVariantAutoscalingV1alpha1.VariantAutoscaling,
+	hasOptimizedAlloc bool,
+) {
+	// Copy MetricsAvailable condition from preparation phase
+	if metricsCond := llmdVariantAutoscalingV1alpha1.GetCondition(preparedVa, llmdVariantAutoscalingV1alpha1.TypeMetricsAvailable); metricsCond != nil {
+		llmdVariantAutoscalingV1alpha1.SetCondition(updateVa,
+			llmdVariantAutoscalingV1alpha1.TypeMetricsAvailable,
+			metricsCond.Status, metricsCond.Reason, metricsCond.Message)
+	}
+
+	// Set OptimizationReady condition based on allocation path
+	desiredAlloc := updateVa.Status.DesiredOptimizedAlloc
+	if hasOptimizedAlloc {
+		// Path 1: Optimizer solution
+		llmdVariantAutoscalingV1alpha1.SetCondition(updateVa,
+			llmdVariantAutoscalingV1alpha1.TypeOptimizationReady,
+			metav1.ConditionTrue,
+			llmdVariantAutoscalingV1alpha1.ReasonOptimizationSucceeded,
+			fmt.Sprintf("Optimization completed: %d replicas on %s",
+				desiredAlloc.NumReplicas, updateVa.Spec.Accelerator))
+	} else if desiredAlloc.Reason != "" {
+		// Path 2/Path 3: Fallback or Last Resort
+		llmdVariantAutoscalingV1alpha1.SetCondition(updateVa,
+			llmdVariantAutoscalingV1alpha1.TypeOptimizationReady,
+			metav1.ConditionTrue,
+			llmdVariantAutoscalingV1alpha1.ReasonFallbackUsed,
+			fmt.Sprintf("%s (%d replicas)", desiredAlloc.Reason, desiredAlloc.NumReplicas))
+	} else {
+		// Fallback: copy from preparation phase if available
+		if optCond := llmdVariantAutoscalingV1alpha1.GetCondition(preparedVa, llmdVariantAutoscalingV1alpha1.TypeOptimizationReady); optCond != nil {
+			llmdVariantAutoscalingV1alpha1.SetCondition(updateVa,
+				llmdVariantAutoscalingV1alpha1.TypeOptimizationReady,
+				optCond.Status, optCond.Reason, optCond.Message)
+		}
+	}
+}
+
 // addVariantWithFallback is a helper function that safely fetches the latest VA and adds it with fallback allocation.
 // If the fetch fails, it uses the provided VA object as fallback to ensure metrics are always emitted.
 func (r *VariantAutoscalingReconciler) addVariantWithFallback(
@@ -1319,40 +1360,9 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 
 		updateVa.Status.Actuation.Applied = false // No longer directly applying changes
 
-		// Selectively copy conditions set during preparation to avoid overwriting other conditions
-		// This preserves MetricsAvailable and OptimizationReady from preparation phase
-		// while keeping any other conditions that may have been set externally
-		for _, condType := range []string{
-			llmdVariantAutoscalingV1alpha1.TypeMetricsAvailable,
-			llmdVariantAutoscalingV1alpha1.TypeOptimizationReady,
-		} {
-			if cond := llmdVariantAutoscalingV1alpha1.GetCondition(va, condType); cond != nil {
-				llmdVariantAutoscalingV1alpha1.SetCondition(&updateVa,
-					condType, cond.Status, cond.Reason, cond.Message)
-			}
-		}
-
-		// Override OptimizationReady condition to match DesiredOptimizedAlloc
-		// This ensures condition message reflects the actual allocation decision
-		desiredAlloc := updateVa.Status.DesiredOptimizedAlloc
-		if hasOptimizedAlloc {
-			// Path 1: Optimizer solution
-			llmdVariantAutoscalingV1alpha1.SetCondition(&updateVa,
-				llmdVariantAutoscalingV1alpha1.TypeOptimizationReady,
-				metav1.ConditionTrue,
-				llmdVariantAutoscalingV1alpha1.ReasonOptimizationSucceeded,
-				fmt.Sprintf("Optimization completed: %d replicas on %s",
-					desiredAlloc.NumReplicas,
-					updateVa.Spec.Accelerator)) // Use spec field (single-variant architecture)
-		} else if desiredAlloc.Reason != "" {
-			// Path 2/Path 3: Fallback or Last Resort
-			// Update condition to match DesiredOptimizedAlloc.Reason
-			llmdVariantAutoscalingV1alpha1.SetCondition(&updateVa,
-				llmdVariantAutoscalingV1alpha1.TypeOptimizationReady,
-				metav1.ConditionTrue,
-				llmdVariantAutoscalingV1alpha1.ReasonFallbackUsed,
-				fmt.Sprintf("%s (%d replicas)", desiredAlloc.Reason, desiredAlloc.NumReplicas))
-		}
+		// Update conditions based on allocation decision path
+		// Preserves MetricsAvailable from preparation and sets OptimizationReady appropriately
+		updateConditionsForAllocation(&updateVa, va, hasOptimizedAlloc)
 
 		// ALWAYS emit optimization signals for external autoscalers (KEDA, HPA, etc.)
 		// This is critical for scale-to-zero scenarios where metrics must exist even with no traffic
