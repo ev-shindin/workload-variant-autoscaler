@@ -1249,6 +1249,11 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 						}
 					}
 
+					// If LastUpdate is still zero (can happen with old CRDs or uninitialized data), set it now
+					if updateVa.Status.DesiredOptimizedAlloc.LastUpdate.IsZero() {
+						updateVa.Status.DesiredOptimizedAlloc.LastUpdate = metav1.Now()
+					}
+
 					logger.Log.Info("Using fallback allocation (retention period not exceeded)",
 						"variantName", va.Name,
 						"currentReplicas", va.Status.CurrentAlloc.NumReplicas,
