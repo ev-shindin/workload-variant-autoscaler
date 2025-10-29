@@ -904,8 +904,9 @@ var _ = Describe("Test idle scale-to-zero with KEDA", Ordered, func() {
 			err := crClient.Get(ctx, client.ObjectKey{Name: deployName, Namespace: namespace}, va)
 			g.Expect(err).NotTo(HaveOccurred(), "Should be able to get VariantAutoscaling")
 
-			_, _ = fmt.Fprintf(GinkgoWriter, "VariantAutoscaling Status: CurrentReplicas=%d, DesiredReplicas=%d, Actuation.Applied=%t\n",
-				va.Status.CurrentAlloc.NumReplicas, va.Status.DesiredOptimizedAlloc.NumReplicas, va.Status.Actuation.Applied)
+			_, _ = fmt.Fprintf(GinkgoWriter, "VariantAutoscaling Status: CurrentReplicas=%d, DesiredReplicas=%d, Actuation.Applied=%t, LastUpdate=%v\n",
+				va.Status.CurrentAlloc.NumReplicas, va.Status.DesiredOptimizedAlloc.NumReplicas, va.Status.Actuation.Applied,
+				va.Status.DesiredOptimizedAlloc.LastUpdate.Time)
 			_, _ = fmt.Fprintf(GinkgoWriter, "VariantAutoscaling Spec: Accelerator=%q, VariantID=%q, ModelID=%q\n",
 				va.Spec.Accelerator, va.Spec.VariantID, va.Spec.ModelID)
 			_, _ = fmt.Fprintf(GinkgoWriter, "DesiredOptimizedAlloc Reason: %q\n",
@@ -1503,9 +1504,9 @@ var _ = Describe("Test traffic-based scale-to-zero with retention period", Order
 			err := crClient.Get(ctx, client.ObjectKey{Name: deployName, Namespace: namespace}, va)
 			g.Expect(err).NotTo(HaveOccurred(), "Should be able to get VariantAutoscaling")
 
-			_, _ = fmt.Fprintf(GinkgoWriter, "VariantAutoscaling Status: CurrentReplicas=%d, DesiredReplicas=%d, Actuation.Applied=%t, Reason=%q\n",
+			_, _ = fmt.Fprintf(GinkgoWriter, "VariantAutoscaling Status: CurrentReplicas=%d, DesiredReplicas=%d, Actuation.Applied=%t, Reason=%q, LastUpdate=%v\n",
 				va.Status.CurrentAlloc.NumReplicas, va.Status.DesiredOptimizedAlloc.NumReplicas, va.Status.Actuation.Applied,
-				va.Status.DesiredOptimizedAlloc.Reason)
+				va.Status.DesiredOptimizedAlloc.Reason, va.Status.DesiredOptimizedAlloc.LastUpdate.Time)
 
 			// CRITICAL: Wait for controller to see the current replica count
 			g.Expect(va.Status.CurrentAlloc.NumReplicas).To(BeNumerically(">=", 1),
@@ -1582,9 +1583,9 @@ var _ = Describe("Test traffic-based scale-to-zero with retention period", Order
 			err := crClient.Get(ctx, client.ObjectKey{Name: deployName, Namespace: namespace}, va)
 			g.Expect(err).NotTo(HaveOccurred(), "Should be able to get VariantAutoscaling")
 
-			_, _ = fmt.Fprintf(GinkgoWriter, "Waiting for controller: DesiredOptimized=%d, Current=%d, Reason=%q\n",
+			_, _ = fmt.Fprintf(GinkgoWriter, "Waiting for controller: DesiredOptimized=%d, Current=%d, Reason=%q, LastUpdate=%v\n",
 				va.Status.DesiredOptimizedAlloc.NumReplicas, va.Status.CurrentAlloc.NumReplicas,
-				va.Status.DesiredOptimizedAlloc.Reason)
+				va.Status.DesiredOptimizedAlloc.Reason, va.Status.DesiredOptimizedAlloc.LastUpdate.Time)
 
 			// Verify controller has processed traffic and recommended replicas > 0
 			g.Expect(va.Status.DesiredOptimizedAlloc.NumReplicas).To(BeNumerically(">", 0),
