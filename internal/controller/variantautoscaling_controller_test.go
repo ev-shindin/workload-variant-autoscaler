@@ -2415,4 +2415,180 @@ retentionPeriod: "not-a-duration"`,
 			})
 		})
 	})
+
+	// Tests for refactored helper functions
+	Describe("Helper Functions", func() {
+		Describe("isRetentionPeriodExceeded", func() {
+			It("should return false when lastUpdate is zero", func() {
+				retentionPeriod := 5 * time.Minute
+				lastUpdate := metav1.Time{}
+
+				result := isRetentionPeriodExceeded(lastUpdate, retentionPeriod)
+
+				Expect(result).To(BeFalse(), "Should return false when lastUpdate is zero (never set)")
+			})
+
+			It("should return false when time since lastUpdate is within retention period", func() {
+				retentionPeriod := 5 * time.Minute
+				lastUpdate := metav1.NewTime(time.Now().Add(-2 * time.Minute))
+
+				result := isRetentionPeriodExceeded(lastUpdate, retentionPeriod)
+
+				Expect(result).To(BeFalse(), "Should return false when within retention period")
+			})
+
+			It("should return true when time since lastUpdate exceeds retention period", func() {
+				retentionPeriod := 5 * time.Minute
+				lastUpdate := metav1.NewTime(time.Now().Add(-10 * time.Minute))
+
+				result := isRetentionPeriodExceeded(lastUpdate, retentionPeriod)
+
+				Expect(result).To(BeTrue(), "Should return true when retention period exceeded")
+			})
+
+			It("should return false at exactly retention period boundary", func() {
+				retentionPeriod := 5 * time.Minute
+				// Set to just under retention period to avoid timing issues
+				lastUpdate := metav1.NewTime(time.Now().Add(-5*time.Minute + 100*time.Millisecond))
+
+				result := isRetentionPeriodExceeded(lastUpdate, retentionPeriod)
+
+				Expect(result).To(BeFalse(), "Should return false at retention period boundary")
+			})
+		})
+
+		Describe("createOptimizedAllocWithUpdate", func() {
+			It("should set LastUpdate when NumReplicas changes", func() {
+				previousAlloc := llmdVariantAutoscalingV1alpha1.OptimizedAlloc{
+					NumReplicas: 3,
+					Reason:      "Previous reason",
+					LastUpdate:  metav1.NewTime(time.Now().Add(-10 * time.Minute)),
+				}
+
+				newAlloc := createOptimizedAllocWithUpdate(5, "New reason", previousAlloc)
+
+				Expect(newAlloc.NumReplicas).To(Equal(int32(5)))
+				Expect(newAlloc.Reason).To(Equal("New reason"))
+				Expect(newAlloc.LastUpdate.IsZero()).To(BeFalse(), "LastUpdate should be set")
+				Expect(newAlloc.LastUpdate.Time).To(BeTemporally("~", time.Now(), 2*time.Second))
+			})
+
+			It("should set LastUpdate when Reason changes", func() {
+				oldTime := metav1.NewTime(time.Now().Add(-10 * time.Minute))
+				previousAlloc := llmdVariantAutoscalingV1alpha1.OptimizedAlloc{
+					NumReplicas: 5,
+					Reason:      "Previous reason",
+					LastUpdate:  oldTime,
+				}
+
+				newAlloc := createOptimizedAllocWithUpdate(5, "New reason", previousAlloc)
+
+				Expect(newAlloc.NumReplicas).To(Equal(int32(5)))
+				Expect(newAlloc.Reason).To(Equal("New reason"))
+				Expect(newAlloc.LastUpdate.Time).To(BeTemporally("~", time.Now(), 2*time.Second))
+				Expect(newAlloc.LastUpdate.Time).NotTo(Equal(oldTime.Time))
+			})
+
+			It("should preserve LastUpdate when nothing changes", func() {
+				oldTime := metav1.NewTime(time.Now().Add(-10 * time.Minute))
+				previousAlloc := llmdVariantAutoscalingV1alpha1.OptimizedAlloc{
+					NumReplicas: 5,
+					Reason:      "Same reason",
+					LastUpdate:  oldTime,
+				}
+
+				newAlloc := createOptimizedAllocWithUpdate(5, "Same reason", previousAlloc)
+
+				Expect(newAlloc.NumReplicas).To(Equal(int32(5)))
+				Expect(newAlloc.Reason).To(Equal("Same reason"))
+				Expect(newAlloc.LastUpdate).To(Equal(oldTime), "LastUpdate should be preserved when nothing changes")
+			})
+		})
+
+		Describe("updateConditionsForAllocation", func() {
+			var updateVa, preparedVa *llmdVariantAutoscalingV1alpha1.VariantAutoscaling
+
+			BeforeEach(func() {
+				updateVa = &llmdVariantAutoscalingV1alpha1.VariantAutoscaling{
+					Spec: llmdVariantAutoscalingV1alpha1.VariantAutoscalingSpec{
+						Accelerator: "A100",
+					},
+					Status: llmdVariantAutoscalingV1alpha1.VariantAutoscalingStatus{
+						DesiredOptimizedAlloc: llmdVariantAutoscalingV1alpha1.OptimizedAlloc{
+							NumReplicas: 5,
+							Reason:      "Test reason",
+						},
+					},
+				}
+
+				preparedVa = &llmdVariantAutoscalingV1alpha1.VariantAutoscaling{
+					Status: llmdVariantAutoscalingV1alpha1.VariantAutoscalingStatus{
+						Conditions: []metav1.Condition{
+							{
+								Type:    llmdVariantAutoscalingV1alpha1.TypeMetricsAvailable,
+								Status:  metav1.ConditionTrue,
+								Reason:  llmdVariantAutoscalingV1alpha1.ReasonMetricsFound,
+								Message: "Metrics available",
+							},
+						},
+					},
+				}
+			})
+
+			It("should set optimizer success condition when hasOptimizedAlloc is true", func() {
+				updateConditionsForAllocation(updateVa, preparedVa, true)
+
+				metricsCond := llmdVariantAutoscalingV1alpha1.GetCondition(updateVa, llmdVariantAutoscalingV1alpha1.TypeMetricsAvailable)
+				Expect(metricsCond).NotTo(BeNil(), "MetricsAvailable condition should be copied")
+				Expect(metricsCond.Status).To(Equal(metav1.ConditionTrue))
+
+				optCond := llmdVariantAutoscalingV1alpha1.GetCondition(updateVa, llmdVariantAutoscalingV1alpha1.TypeOptimizationReady)
+				Expect(optCond).NotTo(BeNil(), "OptimizationReady condition should be set")
+				Expect(optCond.Status).To(Equal(metav1.ConditionTrue))
+				Expect(optCond.Reason).To(Equal(llmdVariantAutoscalingV1alpha1.ReasonOptimizationSucceeded))
+				Expect(optCond.Message).To(ContainSubstring("Optimization completed"))
+				Expect(optCond.Message).To(ContainSubstring("5 replicas"))
+			})
+
+			It("should set fallback condition when hasOptimizedAlloc is false and Reason is set", func() {
+				updateConditionsForAllocation(updateVa, preparedVa, false)
+
+				optCond := llmdVariantAutoscalingV1alpha1.GetCondition(updateVa, llmdVariantAutoscalingV1alpha1.TypeOptimizationReady)
+				Expect(optCond).NotTo(BeNil(), "OptimizationReady condition should be set")
+				Expect(optCond.Status).To(Equal(metav1.ConditionTrue))
+				Expect(optCond.Reason).To(Equal(llmdVariantAutoscalingV1alpha1.ReasonFallbackUsed))
+				Expect(optCond.Message).To(ContainSubstring("Test reason"))
+				Expect(optCond.Message).To(ContainSubstring("5 replicas"))
+			})
+
+			It("should copy OptimizationReady from preparation when Reason is empty", func() {
+				updateVa.Status.DesiredOptimizedAlloc.Reason = ""
+
+				preparedVa.Status.Conditions = append(preparedVa.Status.Conditions, metav1.Condition{
+					Type:    llmdVariantAutoscalingV1alpha1.TypeOptimizationReady,
+					Status:  metav1.ConditionFalse,
+					Reason:  llmdVariantAutoscalingV1alpha1.ReasonOptimizationFailed,
+					Message: "Preparation phase message",
+				})
+
+				updateConditionsForAllocation(updateVa, preparedVa, false)
+
+				optCond := llmdVariantAutoscalingV1alpha1.GetCondition(updateVa, llmdVariantAutoscalingV1alpha1.TypeOptimizationReady)
+				Expect(optCond).NotTo(BeNil(), "OptimizationReady should be copied from preparation")
+				Expect(optCond.Status).To(Equal(metav1.ConditionFalse))
+				Expect(optCond.Reason).To(Equal(llmdVariantAutoscalingV1alpha1.ReasonOptimizationFailed))
+				Expect(optCond.Message).To(Equal("Preparation phase message"))
+			})
+
+			It("should preserve MetricsAvailable from preparation phase", func() {
+				updateConditionsForAllocation(updateVa, preparedVa, true)
+
+				metricsCond := llmdVariantAutoscalingV1alpha1.GetCondition(updateVa, llmdVariantAutoscalingV1alpha1.TypeMetricsAvailable)
+				Expect(metricsCond).NotTo(BeNil())
+				Expect(metricsCond.Status).To(Equal(metav1.ConditionTrue))
+				Expect(metricsCond.Reason).To(Equal(llmdVariantAutoscalingV1alpha1.ReasonMetricsFound))
+				Expect(metricsCond.Message).To(Equal("Metrics available"))
+			})
+		})
+	})
 })
