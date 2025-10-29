@@ -1345,9 +1345,11 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 			}
 		}
 
-		// Override OptimizationReady if we have fresh optimized allocation
+		// Override OptimizationReady condition to match DesiredOptimizedAlloc
+		// This ensures condition message reflects the actual allocation decision
+		desiredAlloc := updateVa.Status.DesiredOptimizedAlloc
 		if hasOptimizedAlloc {
-			desiredAlloc := updateVa.Status.DesiredOptimizedAlloc
+			// Path 1: Optimizer solution
 			llmdVariantAutoscalingV1alpha1.SetCondition(&updateVa,
 				llmdVariantAutoscalingV1alpha1.TypeOptimizationReady,
 				metav1.ConditionTrue,
@@ -1355,6 +1357,14 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 				fmt.Sprintf("Optimization completed: %d replicas on %s",
 					desiredAlloc.NumReplicas,
 					updateVa.Spec.Accelerator)) // Use spec field (single-variant architecture)
+		} else if desiredAlloc.Reason != "" {
+			// Path 2/Path 3: Fallback or Last Resort
+			// Update condition to match DesiredOptimizedAlloc.Reason
+			llmdVariantAutoscalingV1alpha1.SetCondition(&updateVa,
+				llmdVariantAutoscalingV1alpha1.TypeOptimizationReady,
+				metav1.ConditionTrue,
+				llmdVariantAutoscalingV1alpha1.ReasonFallbackUsed,
+				fmt.Sprintf("%s (%d replicas)", desiredAlloc.Reason, desiredAlloc.NumReplicas))
 		}
 
 		// ALWAYS emit optimization signals for external autoscalers (KEDA, HPA, etc.)

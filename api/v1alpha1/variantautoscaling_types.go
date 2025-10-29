@@ -245,4 +245,6 @@ const (
 	ReasonOptimizationFailed = "OptimizationFailed"
 	// ReasonMetricsUnavailable indicates optimization cannot run due to missing metrics
 	ReasonMetricsUnavailable = "MetricsUnavailable"
+	// ReasonFallbackUsed indicates fallback allocation is being used
+	ReasonFallbackUsed = "FallbackUsed"
 )
