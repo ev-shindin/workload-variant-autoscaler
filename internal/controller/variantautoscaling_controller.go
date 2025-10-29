@@ -67,6 +67,9 @@ const (
 	// Cache TTL settings
 	MinCacheTTL = 5 * time.Second
 
+	// Setup timeout for API calls during controller initialization
+	SetupTimeout = 30 * time.Second
+
 	// Default values
 	DefaultVariantCost = "10"
 )
@@ -79,6 +82,9 @@ type VariantAutoscalingReconciler struct {
 	PromAPI                 promv1.API
 	MetricsCache            *collector.ModelMetricsCache       // Cache for model-level Prometheus metrics
 	ScaleToZeroMetricsCache *collector.ScaleToZeroMetricsCache // Cache for scale-to-zero internal metrics
+
+	// Shutdown channel for graceful cleanup goroutine termination
+	cacheCleanupDone chan struct{}
 }
 
 // +kubebuilder:rbac:groups=llmd.ai,resources=variantautoscalings,verbs=get;list;watch;create;update;patch;delete
@@ -708,7 +714,10 @@ func applyFallbackAllocation(
 			}
 
 			var baselineReplicas int32
-			if !previousAlloc.LastRunTime.IsZero() || previousAlloc.NumReplicas >= 0 {
+			// Note: We check LastRunTime (not NumReplicas >= 0) because NumReplicas defaults to 0,
+			// and would incorrectly treat first-run scenarios as having a previous allocation.
+			// LastRunTime is only set when a controller decision was actually made.
+			if !previousAlloc.LastRunTime.IsZero() {
 				// Use previous optimized allocation - maintain controller intent
 				baselineReplicas = previousAlloc.NumReplicas
 				logger.Log.Info("Last resort - using previous optimized allocation as baseline",
@@ -1347,7 +1356,10 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 		} else {
 			// No optimizer solution - apply fallback allocation logic
 			// Check if fallback allocation was set in updateList (from addVariantWithFallbackAllocation or previous reconciliation)
-			hasPrecomputedFallback := va.Status.DesiredOptimizedAlloc.NumReplicas >= 0 || !va.Status.DesiredOptimizedAlloc.LastRunTime.IsZero()
+			// Note: We check LastRunTime (not NumReplicas >= 0) because NumReplicas defaults to 0,
+			// and would incorrectly treat first-run scenarios as having a precomputed fallback.
+			// LastRunTime is only set when addVariantWithFallbackAllocation actually runs or optimizer runs.
+			hasPrecomputedFallback := !va.Status.DesiredOptimizedAlloc.LastRunTime.IsZero()
 
 			if hasPrecomputedFallback {
 				// PATH 2: Has precomputed fallback allocation
@@ -1407,7 +1419,11 @@ func (r *VariantAutoscalingReconciler) SetupWithManager(mgr ctrl.Manager) error 
 	initMetricsEmitter()
 
 	// Configure Prometheus client using flexible configuration with TLS support
-	promConfig, err := r.getPrometheusConfig(context.Background())
+	// Use context with timeout to prevent hanging during setup
+	ctx, cancel := context.WithTimeout(context.Background(), SetupTimeout)
+	defer cancel()
+
+	promConfig, err := r.getPrometheusConfig(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get Prometheus configuration: %w", err)
 	}
@@ -1443,7 +1459,8 @@ func (r *VariantAutoscalingReconciler) SetupWithManager(mgr ctrl.Manager) error 
 	logger.Log.Info("Scale-to-zero metrics cache initialized")
 
 	// Validate that the API is working by testing a simple query with retry logic
-	if err := utils.ValidatePrometheusAPI(context.Background(), r.PromAPI); err != nil {
+	// Use the same context with timeout to prevent hanging
+	if err := utils.ValidatePrometheusAPI(ctx, r.PromAPI); err != nil {
 		logger.Log.Error(err, "CRITICAL: Failed to connect to Prometheus - Inferno requires Prometheus connectivity for autoscaling decisions")
 		return fmt.Errorf("critical: failed to validate Prometheus API connection - autoscaling functionality requires Prometheus: %w", err)
 	}
@@ -1451,7 +1468,8 @@ func (r *VariantAutoscalingReconciler) SetupWithManager(mgr ctrl.Manager) error 
 
 	// Read reconciliation interval from ConfigMap to calculate optimal cache TTL
 	// This ensures cache expires between reconciliation loops for fresh Prometheus data
-	intervalStr, err := r.readOptimizationConfig(context.Background())
+	// Use the same context with timeout to prevent hanging
+	intervalStr, err := r.readOptimizationConfig(ctx)
 	if err != nil {
 		logger.Log.Warn("Failed to read optimization config, using default reconciliation interval",
 			"error", err.Error())
@@ -1506,17 +1524,30 @@ func (r *VariantAutoscalingReconciler) SetupWithManager(mgr ctrl.Manager) error 
 		"reconciliationInterval", reconciliationInterval.String(),
 		"ratio", "TTL = interval / 2")
 
+	// Initialize shutdown channel for cleanup goroutine
+	r.cacheCleanupDone = make(chan struct{})
+
 	// Start background goroutine to periodically clean up stale cache entries
 	// This prevents unbounded memory growth from models that are no longer active
+	// The goroutine will stop gracefully when cacheCleanupDone is closed
 	go func() {
 		ticker := time.NewTicker(cacheTTL)
 		defer ticker.Stop()
-		for range ticker.C {
-			r.MetricsCache.Cleanup()
-			logger.Log.Debug("Metrics cache cleanup completed")
+		defer close(r.cacheCleanupDone)
+
+		for {
+			select {
+			case <-ticker.C:
+				r.MetricsCache.Cleanup()
+				logger.Log.Debug("Metrics cache cleanup completed")
+			case <-mgr.Elected():
+				// Manager shutdown signal received
+				logger.Log.Info("Stopping metrics cache cleanup goroutine due to manager shutdown")
+				return
+			}
 		}
 	}()
-	logger.Log.Info("Metrics cache cleanup goroutine started",
+	logger.Log.Info("Metrics cache cleanup goroutine started with graceful shutdown support",
 		"cleanupInterval", cacheTTL.String())
 
 	//logger.Log.Info("Prometheus client initialized (validation skipped)")
