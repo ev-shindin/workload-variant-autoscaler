@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"os"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -931,21 +930,37 @@ func (r *VariantAutoscalingReconciler) prepareVariantAutoscalings(
 
 		modelName := va.Spec.ModelID
 		if modelName == "" {
-			logger.Log.Warn("variantAutoscaling missing modelName, using fallback allocation for metric emission - ", "variantAutoscaling-name: ", va.Name)
-			r.addVariantWithFallback(ctx, va, nil,
+			logger.Log.Warn("variantAutoscaling missing modelName, adding to updateList for fallback allocation - ", "variantAutoscaling-name: ", va.Name)
+			// Add to updateList without allocation - will be handled in applyOptimizedAllocations
+			var updateVA llmdVariantAutoscalingV1alpha1.VariantAutoscaling
+			if err := utils.GetVariantAutoscalingWithBackoff(ctx, r.Client, va.Name, va.Namespace, &updateVA); err != nil {
+				logger.Log.Error(err, "unable to get variantAutoscaling - ", "variantAutoscaling-name: ", va.Name)
+				continue
+			}
+			llmdVariantAutoscalingV1alpha1.SetCondition(&updateVA,
+				llmdVariantAutoscalingV1alpha1.TypeOptimizationReady,
+				metav1.ConditionFalse,
 				llmdVariantAutoscalingV1alpha1.ReasonOptimizationFailed,
-				"ModelID is empty - cannot optimize",
-				&updateList, activeVAs, scaleToZeroConfigData, nil)
+				"ModelID is empty - cannot optimize")
+			updateList.Items = append(updateList.Items, updateVA)
 			continue
 		}
 
 		entry, className, err := utils.FindModelSLO(serviceClassCm, modelName)
 		if err != nil {
-			logger.Log.Error(err, "failed to locate SLO for model, using fallback allocation for metric emission - ", "variantAutoscaling-name: ", va.Name, "modelName: ", modelName)
-			r.addVariantWithFallback(ctx, va, nil,
+			logger.Log.Error(err, "failed to locate SLO for model, adding to updateList for fallback allocation - ", "variantAutoscaling-name: ", va.Name, "modelName: ", modelName)
+			// Add to updateList without allocation - will be handled in applyOptimizedAllocations
+			var updateVA llmdVariantAutoscalingV1alpha1.VariantAutoscaling
+			if err := utils.GetVariantAutoscalingWithBackoff(ctx, r.Client, va.Name, va.Namespace, &updateVA); err != nil {
+				logger.Log.Error(err, "unable to get variantAutoscaling - ", "variantAutoscaling-name: ", va.Name)
+				continue
+			}
+			llmdVariantAutoscalingV1alpha1.SetCondition(&updateVA,
+				llmdVariantAutoscalingV1alpha1.TypeOptimizationReady,
+				metav1.ConditionFalse,
 				llmdVariantAutoscalingV1alpha1.ReasonOptimizationFailed,
-				fmt.Sprintf("SLO not found for model %s", modelName),
-				&updateList, activeVAs, scaleToZeroConfigData, nil)
+				fmt.Sprintf("SLO not found for model %s", modelName))
+			updateList.Items = append(updateList.Items, updateVA)
 			continue
 		}
 		logger.Log.Info("Found SLO for model - ", "model: ", modelName, ", class: ", className, ", slo-tpot: ", entry.SLOTPOT, ", slo-ttft: ", entry.SLOTTFT)
@@ -953,11 +968,19 @@ func (r *VariantAutoscalingReconciler) prepareVariantAutoscalings(
 		var deploy appsv1.Deployment
 		err = utils.GetDeploymentWithBackoff(ctx, r.Client, va.Name, va.Namespace, &deploy)
 		if err != nil {
-			logger.Log.Error(err, "failed to get Deployment after retries, using fallback allocation for metric emission - ", "variantAutoscaling-name: ", va.Name)
-			r.addVariantWithFallback(ctx, va, nil,
+			logger.Log.Error(err, "failed to get Deployment after retries, adding to updateList for fallback allocation - ", "variantAutoscaling-name: ", va.Name)
+			// Add to updateList without allocation - will be handled in applyOptimizedAllocations
+			var updateVA llmdVariantAutoscalingV1alpha1.VariantAutoscaling
+			if err := utils.GetVariantAutoscalingWithBackoff(ctx, r.Client, va.Name, va.Namespace, &updateVA); err != nil {
+				logger.Log.Error(err, "unable to get variantAutoscaling - ", "variantAutoscaling-name: ", va.Name)
+				continue
+			}
+			llmdVariantAutoscalingV1alpha1.SetCondition(&updateVA,
+				llmdVariantAutoscalingV1alpha1.TypeOptimizationReady,
+				metav1.ConditionFalse,
 				llmdVariantAutoscalingV1alpha1.ReasonOptimizationFailed,
-				"Deployment not found - using 0 replicas as fallback",
-				&updateList, activeVAs, scaleToZeroConfigData, nil)
+				"Deployment not found")
+			updateList.Items = append(updateList.Items, updateVA)
 			continue
 		}
 
@@ -1004,8 +1027,8 @@ func (r *VariantAutoscalingReconciler) prepareVariantAutoscalings(
 				metricsValidation.Reason,
 				metricsValidation.Message)
 		} else {
-			// Metrics unavailable - emit fallback metrics to prevent external autoscalers from breaking
-			logger.Log.Warnw("Metrics unavailable, using fallback allocation for metric emission",
+			// Metrics unavailable - add to updateList for fallback allocation
+			logger.Log.Warnw("Metrics unavailable, adding to updateList for fallback allocation",
 				"variant", updateVA.Name,
 				"namespace", updateVA.Namespace,
 				"model", modelName,
@@ -1019,19 +1042,8 @@ func (r *VariantAutoscalingReconciler) prepareVariantAutoscalings(
 				metricsValidation.Reason,
 				metricsValidation.Message)
 
-			// Add to updateList with fallback allocation for metric emission
-			retentionPeriod := utils.GetScaleToZeroRetentionPeriod(scaleToZeroConfigData, modelName)
-			isCheapest := isCheapestVariantForModel(&updateVA, activeVAs, modelName)
-			addVariantWithFallbackAllocation(&updateVA, &deploy,
-				llmdVariantAutoscalingV1alpha1.ReasonMetricsUnavailable,
-				fmt.Sprintf("Metrics unavailable (%s)", metricsValidation.Reason),
-				&updateList,
-				scaleToZeroConfigData,
-				modelName,
-				nil, // No aggregate load available
-				isCheapest,
-				activeVAs,
-				retentionPeriod)
+			// Add to updateList without allocation - will be handled in applyOptimizedAllocations
+			updateList.Items = append(updateList.Items, updateVA)
 			continue
 		}
 
@@ -1041,19 +1053,15 @@ func (r *VariantAutoscalingReconciler) prepareVariantAutoscalings(
 		// Collect allocation and scale-to-zero metrics for this variant
 		allocation, err := collector.AddMetricsToOptStatus(ctx, &updateVA, deploy, r.PromAPI, r.ScaleToZeroMetricsCache, retentionPeriod)
 		if err != nil {
-			logger.Log.Error(err, "unable to collect allocation data, using fallback allocation for metric emission")
-			// Add to updateList with fallback allocation for metric emission
-			isCheapest := isCheapestVariantForModel(&updateVA, activeVAs, modelName)
-			addVariantWithFallbackAllocation(&updateVA, &deploy,
-				llmdVariantAutoscalingV1alpha1.ReasonMetricsUnavailable,
-				fmt.Sprintf("Failed to collect allocation data: %v", err),
-				&updateList,
-				scaleToZeroConfigData,
-				modelName,
-				nil, // No aggregate load available
-				isCheapest,
-				activeVAs,
-				retentionPeriod)
+			logger.Log.Error(err, "unable to collect allocation data, adding to updateList for fallback allocation")
+			// Set MetricsAvailable condition to False
+			llmdVariantAutoscalingV1alpha1.SetCondition(&updateVA,
+				llmdVariantAutoscalingV1alpha1.TypeMetricsAvailable,
+				metav1.ConditionFalse,
+				llmdVariantAutoscalingV1alpha1.ReasonPrometheusError,
+				fmt.Sprintf("Failed to collect allocation data: %v", err))
+			// Add to updateList without allocation - will be handled in applyOptimizedAllocations
+			updateList.Items = append(updateList.Items, updateVA)
 			continue
 		}
 
@@ -1064,19 +1072,15 @@ func (r *VariantAutoscalingReconciler) prepareVariantAutoscalings(
 		// Use cache to avoid redundant Prometheus queries for same model
 		load, ttftAvg, itlAvg, err := collector.CollectAggregateMetricsWithCache(ctx, modelName, deploy.Namespace, r.PromAPI, r.MetricsCache)
 		if err != nil {
-			logger.Log.Error(err, "unable to fetch aggregate metrics, using fallback allocation for metric emission")
-			// Add to updateList with fallback allocation for metric emission
-			isCheapest := isCheapestVariantForModel(&updateVA, activeVAs, modelName)
-			addVariantWithFallbackAllocation(&updateVA, &deploy,
-				llmdVariantAutoscalingV1alpha1.ReasonMetricsUnavailable,
-				fmt.Sprintf("Failed to collect aggregate metrics: %v", err),
-				&updateList,
-				scaleToZeroConfigData,
-				modelName,
-				nil, // No aggregate load available
-				isCheapest,
-				activeVAs,
-				retentionPeriod)
+			logger.Log.Error(err, "unable to fetch aggregate metrics, adding to updateList for fallback allocation")
+			// Set MetricsAvailable condition to False
+			llmdVariantAutoscalingV1alpha1.SetCondition(&updateVA,
+				llmdVariantAutoscalingV1alpha1.TypeMetricsAvailable,
+				metav1.ConditionFalse,
+				llmdVariantAutoscalingV1alpha1.ReasonPrometheusError,
+				fmt.Sprintf("Failed to collect aggregate metrics: %v", err))
+			// Add to updateList without allocation - will be handled in applyOptimizedAllocations
+			updateList.Items = append(updateList.Items, updateVA)
 			continue
 		}
 
@@ -1084,24 +1088,15 @@ func (r *VariantAutoscalingReconciler) prepareVariantAutoscalings(
 		// Extract metrics to internal structure (all metrics passed separately from Prometheus)
 		metrics, err := interfaces.NewVariantMetrics(load, ttftAvg, itlAvg)
 		if err != nil {
-			logger.Log.Error(err, "failed to parse variant metrics, using fallback allocation for metric emission")
-			// Add to updateList with fallback allocation for metric emission
-			// Extract load value from LoadProfile
-			var loadValue *float64
-			if arrivalRate, parseErr := strconv.ParseFloat(load.ArrivalRate, 64); parseErr == nil {
-				loadValue = &arrivalRate
-			}
-			isCheapest := isCheapestVariantForModel(&updateVA, activeVAs, modelName)
-			addVariantWithFallbackAllocation(&updateVA, &deploy,
-				llmdVariantAutoscalingV1alpha1.ReasonMetricsUnavailable,
-				fmt.Sprintf("Failed to parse variant metrics: %v", err),
-				&updateList,
-				scaleToZeroConfigData,
-				modelName,
-				loadValue, // We have load but failed to parse full metrics
-				isCheapest,
-				activeVAs,
-				retentionPeriod)
+			logger.Log.Error(err, "failed to parse variant metrics, adding to updateList for fallback allocation")
+			// Set MetricsAvailable condition to False
+			llmdVariantAutoscalingV1alpha1.SetCondition(&updateVA,
+				llmdVariantAutoscalingV1alpha1.TypeMetricsAvailable,
+				metav1.ConditionFalse,
+				llmdVariantAutoscalingV1alpha1.ReasonPrometheusError,
+				fmt.Sprintf("Failed to parse variant metrics: %v", err))
+			// Add to updateList without allocation - will be handled in applyOptimizedAllocations
+			updateList.Items = append(updateList.Items, updateVA)
 			continue
 		}
 
@@ -1112,60 +1107,35 @@ func (r *VariantAutoscalingReconciler) prepareVariantAutoscalings(
 			updateVA.Spec.Accelerator,
 			updateVA.Spec.AcceleratorCount,
 			&updateVA.Spec.VariantProfile); err != nil {
-			logger.Log.Error(err, "failed to add variant profile to system data, using fallback allocation for metric emission", "variantAutoscaling", updateVA.Name)
-			// Extract load value from LoadProfile
-			var loadValue *float64
-			if arrivalRate, parseErr := strconv.ParseFloat(load.ArrivalRate, 64); parseErr == nil {
-				loadValue = &arrivalRate
-			}
-			isCheapest := isCheapestVariantForModel(&updateVA, activeVAs, modelName)
-			addVariantWithFallbackAllocation(&updateVA, &deploy,
+			logger.Log.Error(err, "failed to add variant profile to system data, adding to updateList for fallback allocation", "variantAutoscaling", updateVA.Name)
+			// Set OptimizationReady condition to False
+			llmdVariantAutoscalingV1alpha1.SetCondition(&updateVA,
+				llmdVariantAutoscalingV1alpha1.TypeOptimizationReady,
+				metav1.ConditionFalse,
 				llmdVariantAutoscalingV1alpha1.ReasonOptimizationFailed,
-				fmt.Sprintf("Failed to add variant profile to system data: %v", err),
-				&updateList,
-				scaleToZeroConfigData,
-				modelName,
-				loadValue,
-				isCheapest,
-				activeVAs,
-				retentionPeriod)
+				fmt.Sprintf("Failed to add variant profile to system data: %v", err))
+			// Add to updateList without allocation - will be handled in applyOptimizedAllocations
+			updateList.Items = append(updateList.Items, updateVA)
 			continue
 		}
 
 		// Add server info with both metrics and scale-to-zero configuration
 		if err := utils.AddServerInfoToSystemData(systemData, &updateVA, className, metrics, scaleToZeroConfigData); err != nil {
-			logger.Log.Warn("variantAutoscaling bad deployment server data, using fallback allocation for metric emission")
-			// Add to updateList with fallback allocation for metric emission
-			// Extract load value from LoadProfile
-			var loadValue *float64
-			if arrivalRate, parseErr := strconv.ParseFloat(load.ArrivalRate, 64); parseErr == nil {
-				loadValue = &arrivalRate
-			}
-			isCheapest := isCheapestVariantForModel(&updateVA, activeVAs, modelName)
-			addVariantWithFallbackAllocation(&updateVA, &deploy,
-				llmdVariantAutoscalingV1alpha1.ReasonMetricsUnavailable,
-				fmt.Sprintf("Failed to add server info: %v", err),
-				&updateList,
-				scaleToZeroConfigData,
-				modelName,
-				loadValue, // We have load and metrics but validation failed
-				isCheapest,
-				activeVAs,
-				retentionPeriod)
+			logger.Log.Warn("variantAutoscaling bad deployment server data, adding to updateList for fallback allocation")
+			// Set OptimizationReady condition to False
+			llmdVariantAutoscalingV1alpha1.SetCondition(&updateVA,
+				llmdVariantAutoscalingV1alpha1.TypeOptimizationReady,
+				metav1.ConditionFalse,
+				llmdVariantAutoscalingV1alpha1.ReasonOptimizationFailed,
+				fmt.Sprintf("Failed to add server info: %v", err))
+			// Add to updateList without allocation - will be handled in applyOptimizedAllocations
+			updateList.Items = append(updateList.Items, updateVA)
 			continue
 		}
 
 		vaFullName := utils.FullName(va.Name, va.Namespace)
 
-		// Ensure DesiredOptimizedAlloc has Reason and LastUpdate initialized
-		// This handles cases where optimizer might not run or old CRDs without these fields
-		if updateVA.Status.DesiredOptimizedAlloc.Reason == "" {
-			updateVA.Status.DesiredOptimizedAlloc.Reason = "Metrics collected, awaiting optimizer decision"
-		}
-		if updateVA.Status.DesiredOptimizedAlloc.LastUpdate.IsZero() && updateVA.Status.DesiredOptimizedAlloc.NumReplicas >= 0 {
-			updateVA.Status.DesiredOptimizedAlloc.LastUpdate = metav1.Now()
-		}
-
+		// Add to updateList - allocation will be set in applyOptimizedAllocations
 		updateList.Items = append(updateList.Items, updateVA)
 		vaMap[vaFullName] = &va
 	}
@@ -1244,24 +1214,15 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 			}
 		}
 
-		// Fetch the latest version from API server
+		// Fetch the latest version from API server for conflict-free status update
 		var updateVa llmdVariantAutoscalingV1alpha1.VariantAutoscaling
 		if err := utils.GetVariantAutoscalingWithBackoff(ctx, r.Client, va.Name, va.Namespace, &updateVa); err != nil {
 			logger.Log.Error(err, "failed to get latest VariantAutoscaling from API server: ", "variantAutoscaling-name: ", va.Name)
 			continue
 		}
 
-		// Preserve Reason and LastUpdate from preparation phase initialization
-		// The fresh copy from API server won't have these fields if they were just initialized
-		if updateVa.Status.DesiredOptimizedAlloc.Reason == "" && va.Status.DesiredOptimizedAlloc.Reason != "" {
-			updateVa.Status.DesiredOptimizedAlloc.Reason = va.Status.DesiredOptimizedAlloc.Reason
-		}
-		if updateVa.Status.DesiredOptimizedAlloc.LastUpdate.IsZero() && !va.Status.DesiredOptimizedAlloc.LastUpdate.IsZero() {
-			updateVa.Status.DesiredOptimizedAlloc.LastUpdate = va.Status.DesiredOptimizedAlloc.LastUpdate
-		}
-
-		// Note: ownerReference is now set earlier in prepareVariantAutoscalings
-		// This ensures it's set even if metrics aren't available yet
+		// Note: ownerReference is set in prepareVariantAutoscalings
+		// Note: All allocation decisions happen here - nothing carried over from preparation phase
 
 		// Initialize CurrentAlloc from actual deployment replicas
 		// This ensures Status.CurrentAlloc reflects reality, not stale data
