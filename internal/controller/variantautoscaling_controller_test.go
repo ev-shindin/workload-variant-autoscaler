@@ -2676,7 +2676,7 @@ retentionPeriod: "not-a-duration"`,
 				// Simulate scenario where Reason is empty (shouldn't happen, but safety net)
 				updateVa.Status.DesiredOptimizedAlloc = llmdVariantAutoscalingV1alpha1.OptimizedAlloc{
 					NumReplicas: 2,
-					Reason:      "",  // Empty reason
+					Reason:      "", // Empty reason
 					LastUpdate:  metav1.NewTime(time.Now()),
 				}
 

@@ -1279,7 +1279,7 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 				newAlloc.LastUpdate = previousAlloc.LastUpdate
 			}
 
-				updateVa.Status.DesiredOptimizedAlloc = newAlloc
+			updateVa.Status.DesiredOptimizedAlloc = newAlloc
 			logger.Log.Info("Using optimized allocation from optimizer",
 				"variantName", updateVa.Name,
 				"currentReplicas", updateVa.Status.CurrentAlloc.NumReplicas,
