@@ -98,6 +98,80 @@ jobs:
           echo "Running E2E tests..."
           make test-e2e
 
+      - name: Verify CRD Schema (Diagnostic)
+        if: ${{ !github.event.inputs.skip_e2e && always() }}
+        continue-on-error: true
+        run: |
+          echo "========== Checking deployed CRD schema =========="
+          echo ""
+          echo "Looking for 'reason' and 'lastUpdate' fields in desiredOptimizedAlloc..."
+          echo ""
+
+          # Check if CRD exists
+          if ! kubectl get crd variantautoscalings.llm-d.llm-manager.io >/dev/null 2>&1; then
+            echo "❌ ERROR: CRD variantautoscalings.llm-d.llm-manager.io not found!"
+            echo "## ❌ CRD Not Found" >> $GITHUB_STEP_SUMMARY
+            echo "The VariantAutoscaling CRD was not deployed to the cluster." >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+          # Extract desiredOptimizedAlloc section
+          DESIRED_ALLOC_SCHEMA=$(kubectl get crd variantautoscalings.llm-d.llm-manager.io -o yaml | \
+            grep -A 30 "desiredOptimizedAlloc:")
+
+          echo "$DESIRED_ALLOC_SCHEMA"
+          echo ""
+
+          # Check for required fields
+          HAS_REASON=$(echo "$DESIRED_ALLOC_SCHEMA" | grep -c "reason:" || true)
+          HAS_LASTUPDATE=$(echo "$DESIRED_ALLOC_SCHEMA" | grep -c "lastUpdate:" || true)
+          HAS_NUMREPLICAS=$(echo "$DESIRED_ALLOC_SCHEMA" | grep -c "numReplicas:" || true)
+          HAS_LASTRUNTIME=$(echo "$DESIRED_ALLOC_SCHEMA" | grep -c "lastRunTime:" || true)
+
+          echo "========== Field Check Results =========="
+          echo "numReplicas: $([ $HAS_NUMREPLICAS -gt 0 ] && echo '✅ FOUND' || echo '❌ MISSING')"
+          echo "lastRunTime: $([ $HAS_LASTRUNTIME -gt 0 ] && echo '✅ FOUND' || echo '❌ MISSING')"
+          echo "reason: $([ $HAS_REASON -gt 0 ] && echo '✅ FOUND' || echo '❌ MISSING')"
+          echo "lastUpdate: $([ $HAS_LASTUPDATE -gt 0 ] && echo '✅ FOUND' || echo '❌ MISSING')"
+          echo ""
+
+          # Report to GitHub Actions Summary
+          echo "## 🔍 CRD Schema Verification" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Checking if \`desiredOptimizedAlloc\` has required fields:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| \`numReplicas\` | $([ $HAS_NUMREPLICAS -gt 0 ] && echo '✅ FOUND' || echo '❌ MISSING') |" >> $GITHUB_STEP_SUMMARY
+          echo "| \`lastRunTime\` | $([ $HAS_LASTRUNTIME -gt 0 ] && echo '✅ FOUND' || echo '❌ MISSING') |" >> $GITHUB_STEP_SUMMARY
+          echo "| \`reason\` | $([ $HAS_REASON -gt 0 ] && echo '✅ FOUND' || echo '❌ MISSING') |" >> $GITHUB_STEP_SUMMARY
+          echo "| \`lastUpdate\` | $([ $HAS_LASTUPDATE -gt 0 ] && echo '✅ FOUND' || echo '❌ MISSING') |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Check if critical fields are missing
+          if [ $HAS_REASON -eq 0 ] || [ $HAS_LASTUPDATE -eq 0 ]; then
+            echo "## ⚠️ ISSUE FOUND: Missing CRD Fields" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**The CRD is missing \`reason\` and/or \`lastUpdate\` fields!**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "This explains why E2E tests show empty \`Reason=\"\"\` and \`LastUpdate=0001-01-01\`." >> $GITHUB_STEP_SUMMARY
+            echo "The Kubernetes API server silently drops fields not defined in the CRD schema." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Solution:" >> $GITHUB_STEP_SUMMARY
+            echo "1. Run \`make manifests\` to regenerate CRDs" >> $GITHUB_STEP_SUMMARY
+            echo "2. Ensure E2E tests deploy the latest CRD from \`config/crd/bases/\`" >> $GITHUB_STEP_SUMMARY
+            echo "3. Verify with: \`kubectl apply -f config/crd/bases/llm-d.llm-manager.io_variantautoscalings.yaml\`" >> $GITHUB_STEP_SUMMARY
+
+            echo ""
+            echo "❌ CRITICAL: CRD is missing required fields (reason and/or lastUpdate)"
+            echo "   This explains the E2E test failures with empty Reason and LastUpdate!"
+            exit 1
+          else
+            echo "✅ All required fields found in CRD schema"
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "✅ **All required fields are present in the CRD.**" >> $GITHUB_STEP_SUMMARY
+          fi
+
       - name: E2E tests skipped
         if: ${{ github.event.inputs.skip_e2e }}
         run: echo "E2E tests were skipped to save CI minutes"
