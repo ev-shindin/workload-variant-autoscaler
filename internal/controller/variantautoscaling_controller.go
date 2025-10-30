@@ -817,37 +817,6 @@ func updateConditionsForAllocation(
 	}
 }
 
-// addVariantWithFallback is a helper function that safely fetches the latest VA and adds it with fallback allocation.
-// If the fetch fails, it uses the provided VA object as fallback to ensure metrics are always emitted.
-func (r *VariantAutoscalingReconciler) addVariantWithFallback(
-	ctx context.Context,
-	va llmdVariantAutoscalingV1alpha1.VariantAutoscaling,
-	deploy *appsv1.Deployment,
-	reason string,
-	message string,
-	updateList *llmdVariantAutoscalingV1alpha1.VariantAutoscalingList,
-	allVariants []llmdVariantAutoscalingV1alpha1.VariantAutoscaling,
-	scaleToZeroConfigData utils.ScaleToZeroConfigData,
-	aggregateLoad *float64,
-) {
-	// Try to get fresh copy of VA, but use original if fetch fails
-	var updateVA llmdVariantAutoscalingV1alpha1.VariantAutoscaling
-	if err := utils.GetVariantAutoscalingWithBackoff(ctx, r.Client, va.Name, va.Namespace, &updateVA); err != nil {
-		logger.Log.Warn("Failed to fetch fresh VA for fallback, using original object",
-			"variant", va.Name,
-			"namespace", va.Namespace,
-			"error", err)
-		updateVA = va
-	}
-
-	// Get retention period for this model
-	retentionPeriod := utils.GetScaleToZeroRetentionPeriod(scaleToZeroConfigData, va.Spec.ModelID)
-
-	isCheapest := isCheapestVariantForModel(&updateVA, allVariants, va.Spec.ModelID)
-	addVariantWithFallbackAllocation(&updateVA, deploy, reason, message, updateList,
-		scaleToZeroConfigData, va.Spec.ModelID, aggregateLoad, isCheapest, allVariants, retentionPeriod)
-}
-
 // isCheapestVariantForModel determines if the given variant is the cheapest among all variants for the same model.
 // Cheapest is determined by accelerator count (fewer accelerators = cheaper).
 func isCheapestVariantForModel(
