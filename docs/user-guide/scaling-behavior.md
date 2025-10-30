@@ -179,24 +179,50 @@ On first reconciliation, `lastUpdate` is zero, so retention period checks are sk
 
 ## 4. Last Resort Allocation
 
-If no optimizer solution or fallback allocation is provided, the controller applies the same logic as Fallback Allocation.
+If no optimizer solution or fallback allocation is provided, the controller applies the same logic as Fallback Allocation with additional deployment discovery protection.
 
 ### Behavior
 
-The controller uses a **controller-centric approach** with retention period awareness:
+The controller uses a **controller-centric approach** with retention period awareness and smart first-run handling:
 
 #### When Retention Period NOT Exceeded
 
-Uses previous optimized allocation if available, otherwise uses current deployment state:
+The controller follows a multi-stage decision process:
 
+**Stage 1: Check if deployment was discovered late**
 ```
-IF previousOptimized exists:
+IF previousOptimized exists AND current > previous:
+    # Deployment discovered after first run
+    baseline = currentDeploymentReplicas    # Reset to actual deployment state
+```
+
+This handles the case where a VariantAutoscaling resource is created for an existing deployment with N replicas, but the deployment isn't discovered in the first reconciliation.
+
+**Stage 2: Use previous optimized allocation**
+```
+IF previousOptimized exists AND current <= previous:
     baseline = previousOptimized.NumReplicas  # Maintain controller intent
-ELSE:
-    baseline = currentDeploymentReplicas     # First run
+```
+
+**Stage 3: First run with deployment discovery protection**
+```
+IF previousOptimized does NOT exist:
+    IF current=0 AND minReplicas=0:
+        # Check for other running variants of same model
+        IF other variants running:
+            baseline = 0  # Safe to start at 0
+        ELSE:
+            baseline = 1  # Safe default to prevent premature scale-to-zero
+    ELSE:
+        baseline = currentDeploymentReplicas  # Use discovered replicas
 
 desiredReplicas = clamp(baseline, minReplicas, maxReplicas)
 ```
+
+This ensures:
+- If deployment isn't discovered yet (`current=0`), use safe default of 1 (unless other variants are handling load)
+- If deployment is discovered (`current>=1`), use actual replica count
+- Prevents premature scale-to-zero before deployment discovery
 
 #### When Retention Period EXCEEDED
 
@@ -230,14 +256,23 @@ retentionPeriod: 5m
 
 **Status indicators**:
 ```
-# Retention period not exceeded
+# Late deployment discovery (current > previous)
+Last resort: deployment discovered late, using current=5 (was 0)
+
+# Retention period not exceeded (has previous optimized)
 Last resort: maintaining controller intent: max(minReplicas=2, previousOptimized=10) = 10
 
-# First run
-Last resort: first run, using max(minReplicas=2, current=5) = 5
+# First run with other variants running
+Last resort: first run, other variants handling load, starting at 0
+
+# First run without other variants
+Last resort: first run with current=0, using safe default of 1 (waiting for deployment discovery)
 
 # Retention period exceeded with scale-to-zero
 Last resort: retention period exceeded (>5m), scale-to-zero enabled, scaling to 0
+
+# Retention period exceeded without scale-to-zero
+Last resort: retention period exceeded (>5m), cheapest variant getting 1 replica (scaleToZero disabled)
 ```
 
 ## Administrator Guidelines
@@ -383,6 +418,7 @@ The VariantAutoscaling controller provides intelligent, cost-optimized scaling w
 **Key Features:**
 - **Consistent retention period enforcement**: All decision paths (optimizer, fallback, last resort) use time-based retention checks to prevent premature scale-to-zero
 - **Controller-centric approach**: Maintains optimization intent during transient issues
+- **Deployment discovery protection**: Smart first-run logic prevents premature scale-to-zero before deployment discovery, checks for other running variants, and handles late discovery gracefully
 - **Retention period awareness**: Scales to zero only after retention period expires with no activity
 - **Bounds enforcement**: Always respects `minReplicas` and `maxReplicas` across all paths
 - **Scale-to-zero integration**: Conserves resources while maintaining essential capacity

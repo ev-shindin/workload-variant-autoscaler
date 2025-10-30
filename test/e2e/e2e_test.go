@@ -1529,67 +1529,13 @@ var _ = Describe("Test traffic-based scale-to-zero with retention period", Order
 				fmt.Sprintf("Service %s should have at least one ready endpoint", serviceName))
 		}, 2*time.Minute, 5*time.Second).Should(Succeed())
 
-		// Start traffic BEFORE creating KEDA (so KEDA sees desired > 0 when created)
-		By("setting up port-forward to the vllme service for traffic generation")
-		port := 8001 // Use different port to avoid conflict with other tests
-		portForwardCmd := utils.SetUpPortForward(k8sClient, ctx, serviceName, namespace, port, 80)
-		defer func() {
-			err := utils.StopCmd(portForwardCmd)
-			Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to stop port-forwarding for: %s", serviceName))
-		}()
-
-		By("waiting for port-forward to be ready")
-		err = utils.VerifyPortForwardReadiness(ctx, port, fmt.Sprintf("http://localhost:%d/v1", port))
-		Expect(err).NotTo(HaveOccurred(), "Port-forward should be ready within timeout")
-
-		By("starting traffic generation")
-		loadRate := 10 // 10 requests per second
-		loadGenCmd := utils.StartLoadGenerator(loadRate, 100, port, modelID)
-		defer func() {
-			err := utils.StopCmd(loadGenCmd)
-			if err != nil {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Warning: Failed to stop load generator: %v\n", err)
-			}
-		}()
-
-		_, _ = fmt.Fprintf(GinkgoWriter, "Starting traffic generation at %d req/s...\n", loadRate)
-
-		// Previous It() block gave Prometheus 5 minutes for ServiceMonitor discovery
-		// Now just wait for rate([1m]) data accumulation: 60s + scrape interval
-		By("waiting for vLLM metrics rate data to accumulate")
-		_, _ = fmt.Fprintf(GinkgoWriter, "Waiting 90 seconds for rate([1m]) data accumulation...\n")
-		time.Sleep(90 * time.Second)
-
-		By("waiting for controller to process traffic and emit metrics")
-		Eventually(func(g Gomega) {
-			va := &v1alpha1.VariantAutoscaling{}
-			err := crClient.Get(ctx, client.ObjectKey{Name: deployName, Namespace: namespace}, va)
-			g.Expect(err).NotTo(HaveOccurred(), "Should be able to get VariantAutoscaling")
-
-			_, _ = fmt.Fprintf(GinkgoWriter, "Waiting for controller: DesiredOptimized=%d, Current=%d, Reason=%q, LastUpdate=%v\n",
-				va.Status.DesiredOptimizedAlloc.NumReplicas, va.Status.CurrentAlloc.NumReplicas,
-				va.Status.DesiredOptimizedAlloc.Reason, va.Status.DesiredOptimizedAlloc.LastUpdate.Time)
-
-			// Verify controller has processed traffic and recommended replicas > 0
-			g.Expect(va.Status.DesiredOptimizedAlloc.NumReplicas).To(BeNumerically(">", 0),
-				"Controller should see traffic and recommend replicas > 0")
-
-			// Verify metrics were emitted to Prometheus (like idle scale-to-zero test)
-			currentReplicasProm, desiredReplicasProm, _, err = utils.GetInfernoReplicaMetrics(va.Name, namespace, va.Spec.Accelerator, va.Spec.VariantID)
-			g.Expect(err).NotTo(HaveOccurred(), "Should be able to query inferno_desired_replicas from Prometheus")
-			g.Expect(int32(desiredReplicasProm)).To(BeNumerically(">", 0),
-				"Prometheus inferno_desired_replicas should be > 0")
-
-			_, _ = fmt.Fprintf(GinkgoWriter, "✓ Metrics: current=%.0f, desired=%.0f\n", currentReplicasProm, desiredReplicasProm)
-		}, 5*time.Minute, 10*time.Second).Should(Succeed())
-
-		// NOW create InferenceModel and KEDA ScaledObject (after traffic generated and desired > 0 verified)
+		// Create InferenceModel and KEDA early (controller already has desired=1 from first run)
 		// Get VA to access VariantID for KEDA query
 		va := &v1alpha1.VariantAutoscaling{}
 		err = crClient.Get(ctx, client.ObjectKey{Name: deployName, Namespace: namespace}, va)
 		Expect(err).NotTo(HaveOccurred(), "Should be able to get VariantAutoscaling for KEDA creation")
 
-		By("creating InferenceModel (now that traffic is flowing)")
+		By("creating InferenceModel (deployment is ready with 1 replica)")
 		inferenceModel := utils.CreateInferenceModel(deployName, namespace, modelID)
 		err = crClient.Create(ctx, inferenceModel)
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to create InferenceModel: %s", modelID))
@@ -1617,9 +1563,12 @@ var _ = Describe("Test traffic-based scale-to-zero with retention period", Order
 				{
 					"type": "prometheus",
 					"metadata": map[string]interface{}{
-						"serverAddress": "https://kube-prometheus-stack-prometheus.monitoring-system.svc.cluster.local:9090",
-						"query":         fmt.Sprintf("inferno_desired_replicas{variant_name=\"%s\",exported_namespace=\"%s\",accelerator_type=\"%s\",variant_id=\"%s\"}", va.Name, namespace, va.Spec.Accelerator, va.Spec.VariantID),
+						"serverAddress": "https://kube-prometheus-stack-prometheus.workload-variant-autoscaler-monitoring.svc.cluster.local:9090",
+						"metricName":    "inferno_desired_replicas",
 						"threshold":     "1",
+						"query": fmt.Sprintf(
+							`inferno_desired_replicas{variant_id="%s",exported_namespace="%s"}`,
+							va.Spec.VariantID, namespace),
 					},
 				},
 			},
@@ -1627,7 +1576,111 @@ var _ = Describe("Test traffic-based scale-to-zero with retention period", Order
 
 		err = crClient.Create(ctx, scaledObject)
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to create ScaledObject: %s", scaledObjectName))
-		_, _ = fmt.Fprintf(GinkgoWriter, "✓ KEDA ScaledObject created (sees desired=%.0f > 0)\n", desiredReplicasProm)
+		_, _ = fmt.Fprintf(GinkgoWriter, "✓ KEDA ScaledObject created: %s\n", scaledObjectName)
+
+		By("waiting for KEDA ScaledObject to be ready")
+		Eventually(func(g Gomega) {
+			so := &unstructured.Unstructured{}
+			so.SetGroupVersionKind(schema.GroupVersionKind{
+				Group:   "keda.sh",
+				Version: "v1alpha1",
+				Kind:    "ScaledObject",
+			})
+			err := crClient.Get(ctx, client.ObjectKey{Name: scaledObjectName, Namespace: namespace}, so)
+			g.Expect(err).NotTo(HaveOccurred(), "Should be able to get ScaledObject")
+
+			// Check if ScaledObject has conditions and is ready
+			conditions, found, err := unstructured.NestedSlice(so.Object, "status", "conditions")
+			if err == nil && found {
+				for _, condition := range conditions {
+					condMap, ok := condition.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					condType, _, _ := unstructured.NestedString(condMap, "type")
+					condStatus, _, _ := unstructured.NestedString(condMap, "status")
+					if condType == "Ready" && condStatus == "True" {
+						_, _ = fmt.Fprintf(GinkgoWriter, "✓ KEDA ScaledObject is ready\n")
+						return
+					}
+				}
+			}
+			_, _ = fmt.Fprintf(GinkgoWriter, "Waiting for KEDA ScaledObject to be ready...\n")
+			g.Expect(found).To(BeTrue(), "ScaledObject should have conditions")
+		}, 3*time.Minute, 5*time.Second).Should(Succeed())
+
+		// Wait for Prometheus to discover and scrape vLLM pod metrics before generating traffic
+		By("verifying Prometheus is scraping vLLM pod metrics (ServiceMonitor discovery)")
+		Eventually(func(g Gomega) {
+			vllmQuery := fmt.Sprintf(`vllm_request_success_total{model_name="%s",namespace="%s"}`, modelID, namespace)
+			promClient, err := utils.NewPrometheusClient("https://localhost:9090", true)
+			g.Expect(err).NotTo(HaveOccurred(), "Should be able to create Prometheus client")
+
+			ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel2()
+
+			_, err = promClient.QueryWithRetry(ctx2, vllmQuery)
+			g.Expect(err).NotTo(HaveOccurred(), "Prometheus should have vLLM metrics from pod")
+
+			_, _ = fmt.Fprintf(GinkgoWriter, "✓ Prometheus is scraping vLLM pod metrics\n")
+		}, 5*time.Minute, 15*time.Second).Should(Succeed(), "Prometheus ServiceMonitor discovery should complete")
+
+		// Now start traffic (optimizer has access to vLLM metrics)
+		By("setting up port-forward to the vllme service for traffic generation")
+		port := 8001 // Use different port to avoid conflict with other tests
+		portForwardCmd := utils.SetUpPortForward(k8sClient, ctx, serviceName, namespace, port, 80)
+		defer func() {
+			err := utils.StopCmd(portForwardCmd)
+			Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to stop port-forwarding for: %s", serviceName))
+		}()
+
+		By("waiting for port-forward to be ready")
+		err = utils.VerifyPortForwardReadiness(ctx, port, fmt.Sprintf("http://localhost:%d/v1", port))
+		Expect(err).NotTo(HaveOccurred(), "Port-forward should be ready within timeout")
+
+		By("starting traffic generation")
+		loadRate := 10 // 10 requests per second
+		loadGenCmd := utils.StartLoadGenerator(loadRate, 100, port, modelID)
+		defer func() {
+			err := utils.StopCmd(loadGenCmd)
+			if err != nil {
+				_, _ = fmt.Fprintf(GinkgoWriter, "Warning: Failed to stop load generator: %v\n", err)
+			}
+		}()
+
+		_, _ = fmt.Fprintf(GinkgoWriter, "Starting traffic generation at %d req/s...\n", loadRate)
+
+		// Wait for vLLM rate([1m]) data to accumulate: 60s + scrape interval
+		By("waiting for vLLM metrics rate data to accumulate")
+		_, _ = fmt.Fprintf(GinkgoWriter, "Waiting 90 seconds for rate([1m]) data accumulation...\n")
+		time.Sleep(90 * time.Second)
+
+		By("waiting for controller to process traffic and emit metrics")
+		Eventually(func(g Gomega) {
+			va := &v1alpha1.VariantAutoscaling{}
+			err := crClient.Get(ctx, client.ObjectKey{Name: deployName, Namespace: namespace}, va)
+			g.Expect(err).NotTo(HaveOccurred(), "Should be able to get VariantAutoscaling")
+
+			_, _ = fmt.Fprintf(GinkgoWriter, "Waiting for controller: DesiredOptimized=%d, Current=%d, Reason=%q, LastUpdate=%v\n",
+				va.Status.DesiredOptimizedAlloc.NumReplicas, va.Status.CurrentAlloc.NumReplicas,
+				va.Status.DesiredOptimizedAlloc.Reason, va.Status.DesiredOptimizedAlloc.LastUpdate.Time)
+
+			// Verify controller has processed traffic and recommended replicas > 0
+			g.Expect(va.Status.DesiredOptimizedAlloc.NumReplicas).To(BeNumerically(">", 0),
+				"Controller should see traffic and recommend replicas > 0")
+
+			// Verify metrics were emitted to Prometheus (like idle scale-to-zero test)
+			currentReplicasProm, desiredReplicasProm, _, err = utils.GetInfernoReplicaMetrics(va.Name, namespace, va.Spec.Accelerator, va.Spec.VariantID)
+			g.Expect(err).NotTo(HaveOccurred(), "Should be able to query inferno_desired_replicas from Prometheus")
+			g.Expect(int32(desiredReplicasProm)).To(BeNumerically(">", 0),
+				"Prometheus inferno_desired_replicas should be > 0")
+
+			_, _ = fmt.Fprintf(GinkgoWriter, "✓ Metrics: current=%.0f, desired=%.0f\n", currentReplicasProm, desiredReplicasProm)
+		}, 5*time.Minute, 10*time.Second).Should(Succeed())
+
+		// KEDA was already created earlier (after deployment was ready with 1 replica)
+		// It has been seeing desired=1 from the controller this whole time
+		_, _ = fmt.Fprintf(GinkgoWriter, "✓ KEDA has been observing desired=%.0f during traffic\n", desiredReplicasProm)
 
 		By("stopping traffic generation")
 		err = utils.StopCmd(loadGenCmd)
