@@ -627,13 +627,12 @@ func applyReplicaBounds(
 // Returns error if allocation computation fails.
 func applyFallbackAllocation(
 	updateVa *llmdVariantAutoscalingV1alpha1.VariantAutoscaling,
-	va *llmdVariantAutoscalingV1alpha1.VariantAutoscaling,
 	allVariants []llmdVariantAutoscalingV1alpha1.VariantAutoscaling,
 	scaleToZeroConfigData utils.ScaleToZeroConfigData,
 	hasPrecomputedFallback bool,
 	pathLabel string, // "Fallback" or "Last resort"
 ) {
-	modelName := va.Spec.ModelID
+	modelName := updateVa.Spec.ModelID
 	retentionPeriod := utils.GetScaleToZeroRetentionPeriod(scaleToZeroConfigData, modelName)
 	previousAlloc := updateVa.Status.DesiredOptimizedAlloc
 
@@ -654,7 +653,7 @@ func applyFallbackAllocation(
 		)
 
 		// Apply maxReplicas bound (minReplicas already applied in scale-to-zero logic)
-		clampedReplicas, boundsApplied := applyReplicaBounds(desiredReplicas, nil, va.Spec.MaxReplicas, va.Name)
+		clampedReplicas, boundsApplied := applyReplicaBounds(desiredReplicas, nil, updateVa.Spec.MaxReplicas, updateVa.Name)
 		if boundsApplied {
 			reason = fmt.Sprintf("%s (clamped to maxReplicas=%d)", reason, clampedReplicas)
 			desiredReplicas = clampedReplicas
@@ -665,23 +664,24 @@ func applyFallbackAllocation(
 	} else {
 		// Retention period NOT exceeded
 		if hasPrecomputedFallback {
-			// PATH 2: Use cached allocation from preparation phase
-			updateVa.Status.DesiredOptimizedAlloc = va.Status.DesiredOptimizedAlloc
+			// PATH 2: Preserve existing allocation from previous reconciliation
+			// Note: previousAlloc already contains the current DesiredOptimizedAlloc from updateVa (line 637)
+			// We don't need to copy it again - just re-apply bounds and update timestamps if needed
 
 			// Re-apply bounds to respect any CRD changes since the allocation was computed
-			originalReplicas := updateVa.Status.DesiredOptimizedAlloc.NumReplicas
+			originalReplicas := previousAlloc.NumReplicas
 			clampedReplicas, boundsApplied := applyReplicaBounds(
 				originalReplicas,
-				va.Spec.MinReplicas,
-				va.Spec.MaxReplicas,
-				va.Name,
+				updateVa.Spec.MinReplicas,
+				updateVa.Spec.MaxReplicas,
+				updateVa.Name,
 			)
 
 			// Update allocation if bounds were applied
 			if boundsApplied {
 				updateVa.Status.DesiredOptimizedAlloc.NumReplicas = clampedReplicas
 				updateVa.Status.DesiredOptimizedAlloc.Reason = fmt.Sprintf("%s (clamped from %d to %d for bounds)",
-					updateVa.Status.DesiredOptimizedAlloc.Reason, originalReplicas, clampedReplicas)
+					previousAlloc.Reason, originalReplicas, clampedReplicas)
 				updateVa.Status.DesiredOptimizedAlloc.LastUpdate = metav1.Now()
 			}
 
@@ -699,8 +699,8 @@ func applyFallbackAllocation(
 			}
 
 			logger.Log.Info("Using fallback allocation (retention period not exceeded)",
-				"variantName", va.Name,
-				"currentReplicas", va.Status.CurrentAlloc.NumReplicas,
+				"variantName", updateVa.Name,
+				"currentReplicas", updateVa.Status.CurrentAlloc.NumReplicas,
 				"desiredReplicas", updateVa.Status.DesiredOptimizedAlloc.NumReplicas,
 				"boundChanged", boundsApplied,
 				"timeSinceUpdate", time.Since(previousAlloc.LastUpdate.Time),
@@ -708,8 +708,8 @@ func applyFallbackAllocation(
 		} else {
 			// PATH 3: Controller-centric approach
 			minReplicasValue := int32(0)
-			if va.Spec.MinReplicas != nil {
-				minReplicasValue = *va.Spec.MinReplicas
+			if updateVa.Spec.MinReplicas != nil {
+				minReplicasValue = *updateVa.Spec.MinReplicas
 			}
 
 			var baselineReplicas int32
@@ -720,7 +720,7 @@ func applyFallbackAllocation(
 				// Use previous optimized allocation - maintain controller intent
 				baselineReplicas = previousAlloc.NumReplicas
 				logger.Log.Info("Last resort - using previous optimized allocation as baseline",
-					"variantName", va.Name,
+					"variantName", updateVa.Name,
 					"previousOptimized", baselineReplicas,
 					"currentReplicas", updateVa.Status.CurrentAlloc.NumReplicas)
 				reason = fmt.Sprintf("Last resort: maintaining controller intent: max(minReplicas=%d, previousOptimized=%d)",
@@ -729,7 +729,7 @@ func applyFallbackAllocation(
 				// First run - use current deployment state as baseline
 				baselineReplicas = updateVa.Status.CurrentAlloc.NumReplicas
 				logger.Log.Info("Last resort - first run, using current deployment replicas as baseline",
-					"variantName", va.Name,
+					"variantName", updateVa.Name,
 					"currentReplicas", updateVa.Status.CurrentAlloc.NumReplicas)
 				reason = fmt.Sprintf("Last resort: first run, using max(minReplicas=%d, current=%d)",
 					minReplicasValue, baselineReplicas)
@@ -738,7 +738,7 @@ func applyFallbackAllocation(
 			desiredReplicas = max(minReplicasValue, baselineReplicas)
 
 			// Apply maxReplicas bound
-			clampedReplicas, boundsApplied := applyReplicaBounds(desiredReplicas, nil, va.Spec.MaxReplicas, va.Name)
+			clampedReplicas, boundsApplied := applyReplicaBounds(desiredReplicas, nil, updateVa.Spec.MaxReplicas, updateVa.Name)
 			if boundsApplied {
 				reason = fmt.Sprintf("%s (clamped to maxReplicas=%d)", reason, clampedReplicas)
 				desiredReplicas = clampedReplicas
@@ -1231,15 +1231,16 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 			// If optimizer returns 0 replicas, verify time-based retention period has expired
 			// This ensures consistency with Path 2 and Path 3 fallback logic
 			if optimizedAlloc.NumReplicas == 0 {
-				previousAlloc := va.Status.DesiredOptimizedAlloc
-				modelName := va.Spec.ModelID
+				// IMPORTANT: Use updateVa (fresh from API) for previous allocation state
+				previousAlloc := updateVa.Status.DesiredOptimizedAlloc
+				modelName := updateVa.Spec.ModelID
 				retentionPeriod := utils.GetScaleToZeroRetentionPeriod(scaleToZeroConfigData, modelName)
 
 				// Check if this is first run (LastUpdate is zero) or retention period not exceeded
 				if previousAlloc.LastUpdate.IsZero() {
 					// First run: preserve currentReplicas as grace period for Prometheus discovery
 					logger.Log.Info("Optimizer returned 0 replicas but this is first run, preserving current deployment replicas",
-						"variantName", va.Name,
+						"variantName", updateVa.Name,
 						"currentReplicas", currentReplicas)
 
 					newAlloc.NumReplicas = currentReplicas
@@ -1249,7 +1250,7 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 					if timeSinceLastUpdate <= retentionPeriod {
 						// Retention period NOT exceeded - preserve previous allocation
 						logger.Log.Info("Optimizer returned 0 replicas but retention period not exceeded, preserving previous allocation",
-							"variantName", va.Name,
+							"variantName", updateVa.Name,
 							"previousReplicas", previousAlloc.NumReplicas,
 							"timeSinceLastUpdate", timeSinceLastUpdate.Round(time.Second),
 							"retentionPeriod", retentionPeriod)
@@ -1260,7 +1261,7 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 							timeSinceLastUpdate.Round(time.Second), retentionPeriod)
 					} else {
 						logger.Log.Info("Optimizer returned 0 replicas and retention period exceeded, scaling to zero",
-							"variantName", va.Name,
+							"variantName", updateVa.Name,
 							"previousReplicas", previousAlloc.NumReplicas,
 							"timeSinceLastUpdate", timeSinceLastUpdate.Round(time.Second),
 							"retentionPeriod", retentionPeriod)
@@ -1269,7 +1270,8 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 			}
 
 			// Update LastUpdate only if NumReplicas or Reason changed
-			previousAlloc := va.Status.DesiredOptimizedAlloc
+			// IMPORTANT: Use updateVa (fresh from API) for previous allocation state
+			previousAlloc := updateVa.Status.DesiredOptimizedAlloc
 			if previousAlloc.NumReplicas != newAlloc.NumReplicas || previousAlloc.Reason != newAlloc.Reason {
 				newAlloc.LastUpdate = metav1.Now()
 			} else {
@@ -1277,9 +1279,9 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 				newAlloc.LastUpdate = previousAlloc.LastUpdate
 			}
 
-			updateVa.Status.DesiredOptimizedAlloc = newAlloc
+				updateVa.Status.DesiredOptimizedAlloc = newAlloc
 			logger.Log.Info("Using optimized allocation from optimizer",
-				"variantName", va.Name,
+				"variantName", updateVa.Name,
 				"currentReplicas", updateVa.Status.CurrentAlloc.NumReplicas,
 				"desiredReplicas", newAlloc.NumReplicas,
 				"reason", newAlloc.Reason)
@@ -1289,14 +1291,15 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 			// Note: We check LastUpdate (not NumReplicas >= 0) because NumReplicas defaults to 0,
 			// and would incorrectly treat first-run scenarios as having a precomputed fallback.
 			// LastUpdate is only set when a controller allocation decision was actually made.
-			hasPrecomputedFallback := !va.Status.DesiredOptimizedAlloc.LastUpdate.IsZero()
+			// IMPORTANT: Use updateVa (fresh from API) not va (from updateList which may be stale)
+			hasPrecomputedFallback := !updateVa.Status.DesiredOptimizedAlloc.LastUpdate.IsZero()
 
 			if hasPrecomputedFallback {
 				// PATH 2: Has precomputed fallback allocation
-				applyFallbackAllocation(&updateVa, va, allVariants, scaleToZeroConfigData, true, "Fallback")
+				applyFallbackAllocation(&updateVa, allVariants, scaleToZeroConfigData, true, "Fallback")
 			} else {
 				// PATH 3: No precomputed fallback - use last resort logic
-				applyFallbackAllocation(&updateVa, va, allVariants, scaleToZeroConfigData, false, "Last resort")
+				applyFallbackAllocation(&updateVa, allVariants, scaleToZeroConfigData, false, "Last resort")
 			}
 		}
 

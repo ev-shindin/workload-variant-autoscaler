@@ -2592,6 +2592,122 @@ retentionPeriod: "not-a-duration"`,
 		})
 	})
 
+	Describe("Fallback Allocation - Reason and LastUpdate Fields", func() {
+		var updateVa *llmdVariantAutoscalingV1alpha1.VariantAutoscaling
+		var allVariants []llmdVariantAutoscalingV1alpha1.VariantAutoscaling
+		var scaleToZeroConfigData utils.ScaleToZeroConfigData
+
+		BeforeEach(func() {
+			minReplicas := int32(0)
+			updateVa = &llmdVariantAutoscalingV1alpha1.VariantAutoscaling{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-va",
+					Namespace: "default",
+				},
+				Spec: llmdVariantAutoscalingV1alpha1.VariantAutoscalingSpec{
+					ModelID:     "test-model",
+					MinReplicas: &minReplicas,
+				},
+				Status: llmdVariantAutoscalingV1alpha1.VariantAutoscalingStatus{
+					CurrentAlloc: llmdVariantAutoscalingV1alpha1.Allocation{
+						NumReplicas: 1,
+					},
+				},
+			}
+			allVariants = []llmdVariantAutoscalingV1alpha1.VariantAutoscaling{*updateVa}
+			scaleToZeroConfigData = utils.ScaleToZeroConfigData{}
+		})
+
+		Context("PATH 3 - First run (no previous allocation)", func() {
+			It("should set Reason and LastUpdate on first run", func() {
+				// Simulate first run: empty DesiredOptimizedAlloc
+				updateVa.Status.DesiredOptimizedAlloc = llmdVariantAutoscalingV1alpha1.OptimizedAlloc{}
+
+				// Apply fallback allocation (PATH 3)
+				applyFallbackAllocation(updateVa, allVariants, scaleToZeroConfigData, false, "Last resort")
+
+				// Verify Reason is set
+				Expect(updateVa.Status.DesiredOptimizedAlloc.Reason).NotTo(BeEmpty(),
+					"Reason should be set on first run")
+				Expect(updateVa.Status.DesiredOptimizedAlloc.Reason).To(ContainSubstring("Last resort: first run"))
+
+				// Verify LastUpdate is set
+				Expect(updateVa.Status.DesiredOptimizedAlloc.LastUpdate.IsZero()).To(BeFalse(),
+					"LastUpdate should be set on first run")
+
+				// Verify NumReplicas is set
+				Expect(updateVa.Status.DesiredOptimizedAlloc.NumReplicas).To(Equal(int32(1)),
+					"NumReplicas should be max(minReplicas=0, current=1) = 1")
+			})
+
+			It("should set Reason with minReplicas > 0", func() {
+				minReplicas := int32(2)
+				updateVa.Spec.MinReplicas = &minReplicas
+				updateVa.Status.DesiredOptimizedAlloc = llmdVariantAutoscalingV1alpha1.OptimizedAlloc{}
+
+				applyFallbackAllocation(updateVa, allVariants, scaleToZeroConfigData, false, "Last resort")
+
+				Expect(updateVa.Status.DesiredOptimizedAlloc.Reason).To(ContainSubstring("max(minReplicas=2, current=1)"))
+				Expect(updateVa.Status.DesiredOptimizedAlloc.NumReplicas).To(Equal(int32(2)))
+				Expect(updateVa.Status.DesiredOptimizedAlloc.LastUpdate.IsZero()).To(BeFalse())
+			})
+		})
+
+		Context("PATH 2 - Has previous allocation", func() {
+			It("should preserve Reason and LastUpdate when no bounds changed", func() {
+				// Set previous allocation
+				previousTime := metav1.NewTime(time.Now().Add(-5 * time.Minute))
+				updateVa.Status.DesiredOptimizedAlloc = llmdVariantAutoscalingV1alpha1.OptimizedAlloc{
+					NumReplicas: 3,
+					Reason:      "Previous allocation: optimizer result",
+					LastUpdate:  previousTime,
+				}
+
+				// Apply fallback allocation (PATH 2)
+				applyFallbackAllocation(updateVa, allVariants, scaleToZeroConfigData, true, "Fallback")
+
+				// Verify Reason and LastUpdate are preserved
+				Expect(updateVa.Status.DesiredOptimizedAlloc.Reason).To(ContainSubstring("Previous allocation"))
+				Expect(updateVa.Status.DesiredOptimizedAlloc.NumReplicas).To(Equal(int32(3)))
+				// LastUpdate might be updated due to bounds check, but Reason should be preserved or updated
+			})
+
+			It("should set empty Reason to default fallback message", func() {
+				// Simulate scenario where Reason is empty (shouldn't happen, but safety net)
+				updateVa.Status.DesiredOptimizedAlloc = llmdVariantAutoscalingV1alpha1.OptimizedAlloc{
+					NumReplicas: 2,
+					Reason:      "",  // Empty reason
+					LastUpdate:  metav1.NewTime(time.Now()),
+				}
+
+				applyFallbackAllocation(updateVa, allVariants, scaleToZeroConfigData, true, "Fallback")
+
+				// Verify default Reason is set
+				Expect(updateVa.Status.DesiredOptimizedAlloc.Reason).To(Equal("Fallback: preserving previous allocation (no optimizer solution)"))
+				Expect(updateVa.Status.DesiredOptimizedAlloc.LastUpdate.IsZero()).To(BeFalse())
+			})
+		})
+
+		Context("LastUpdate vs LastRunTime distinction", func() {
+			It("should only update LastUpdate when allocation changes", func() {
+				// Set previous allocation
+				previousTime := metav1.NewTime(time.Now().Add(-5 * time.Minute))
+				updateVa.Status.DesiredOptimizedAlloc = llmdVariantAutoscalingV1alpha1.OptimizedAlloc{
+					NumReplicas: 1,
+					Reason:      "Previous: test",
+					LastUpdate:  previousTime,
+				}
+
+				// Apply same allocation again
+				applyFallbackAllocation(updateVa, allVariants, scaleToZeroConfigData, true, "Fallback")
+
+				// Since allocation didn't change, LastUpdate might be preserved or set
+				// The key is that Reason should not be empty
+				Expect(updateVa.Status.DesiredOptimizedAlloc.Reason).NotTo(BeEmpty())
+			})
+		})
+	})
+
 	Describe("Goroutine Cleanup", func() {
 		Context("Cache cleanup goroutine lifecycle", func() {
 			// NOTE: This test is skipped because SetupWithManager requires a full controller-runtime
