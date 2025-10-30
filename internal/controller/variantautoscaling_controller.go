@@ -404,7 +404,7 @@ func addVariantWithFallbackAllocation(
 
 			// Determine baseline replicas: use previous optimized if available, else current
 			var baselineReplicas int32
-			if !updateVA.Status.DesiredOptimizedAlloc.LastRunTime.IsZero() {
+			if !updateVA.Status.DesiredOptimizedAlloc.LastUpdate.IsZero() {
 				// Use previous optimized allocation - maintain controller intent
 				baselineReplicas = updateVA.Status.DesiredOptimizedAlloc.NumReplicas
 				logger.Log.Info("Using previous optimized allocation as baseline during metrics unavailability",
@@ -427,7 +427,7 @@ func addVariantWithFallbackAllocation(
 				desiredReplicas = 1
 				message = fmt.Sprintf("%s. Metrics unavailable, scale-to-zero disabled, ensuring cheapest variant has 1 replica", message)
 			} else {
-				if !updateVA.Status.DesiredOptimizedAlloc.LastRunTime.IsZero() {
+				if !updateVA.Status.DesiredOptimizedAlloc.LastUpdate.IsZero() {
 					message = fmt.Sprintf("%s. Metrics unavailable, maintaining controller intent: max(minReplicas=%d, previousOptimized=%d) = %d",
 						message, minReplicasValue, baselineReplicas, desiredReplicas)
 				} else {
@@ -713,10 +713,10 @@ func applyFallbackAllocation(
 			}
 
 			var baselineReplicas int32
-			// Note: We check LastRunTime (not NumReplicas >= 0) because NumReplicas defaults to 0,
+			// Note: We check LastUpdate (not NumReplicas >= 0) because NumReplicas defaults to 0,
 			// and would incorrectly treat first-run scenarios as having a previous allocation.
-			// LastRunTime is only set when a controller decision was actually made.
-			if !previousAlloc.LastRunTime.IsZero() {
+			// LastUpdate is only set when a controller decision was actually made.
+			if !previousAlloc.LastUpdate.IsZero() {
 				// Use previous optimized allocation - maintain controller intent
 				baselineReplicas = previousAlloc.NumReplicas
 				logger.Log.Info("Last resort - using previous optimized allocation as baseline",
@@ -1285,11 +1285,11 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 				"reason", newAlloc.Reason)
 		} else {
 			// No optimizer solution - apply fallback allocation logic
-			// Check if fallback allocation was set in updateList (from addVariantWithFallbackAllocation or previous reconciliation)
-			// Note: We check LastRunTime (not NumReplicas >= 0) because NumReplicas defaults to 0,
+			// PATH 2 vs PATH 3 decision: Check if a previous allocation decision was made
+			// Note: We check LastUpdate (not NumReplicas >= 0) because NumReplicas defaults to 0,
 			// and would incorrectly treat first-run scenarios as having a precomputed fallback.
-			// LastRunTime is only set when addVariantWithFallbackAllocation actually runs or optimizer runs.
-			hasPrecomputedFallback := !va.Status.DesiredOptimizedAlloc.LastRunTime.IsZero()
+			// LastUpdate is only set when a controller allocation decision was actually made.
+			hasPrecomputedFallback := !va.Status.DesiredOptimizedAlloc.LastUpdate.IsZero()
 
 			if hasPrecomputedFallback {
 				// PATH 2: Has precomputed fallback allocation
@@ -1301,6 +1301,11 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 		}
 
 		updateVa.Status.Actuation.Applied = false // No longer directly applying changes
+
+		// Set LastRunTime on every reconciliation for observability
+		// LastRunTime tracks when the controller last processed this variant (updated every reconciliation)
+		// LastUpdate tracks when the allocation decision actually changed (updated only when NumReplicas or Reason changes)
+		updateVa.Status.DesiredOptimizedAlloc.LastRunTime = metav1.Now()
 
 		// CRITICAL FIX: Ensure Reason and LastUpdate are set before persisting status
 		// This is a safety net to catch any cases where these fields might be lost
