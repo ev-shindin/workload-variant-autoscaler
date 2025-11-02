@@ -116,6 +116,12 @@ var _ = Describe("Actuator", func() {
 					Name:      resourceName,
 					Namespace: namespace,
 				},
+				Spec: llmdVariantAutoscalingV1alpha1.VariantAutoscalingSpec{
+					ScaleTargetRef: llmdVariantAutoscalingV1alpha1.CrossVersionObjectReference{
+						Kind: "Deployment",
+						Name: resourceName,
+					},
+				},
 			}
 
 			Expect(k8sClient.Create(ctx, deployment)).To(Succeed())
@@ -140,6 +146,12 @@ var _ = Describe("Actuator", func() {
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "non-existent",
 					Namespace: namespace,
+				},
+				Spec: llmdVariantAutoscalingV1alpha1.VariantAutoscalingSpec{
+					ScaleTargetRef: llmdVariantAutoscalingV1alpha1.CrossVersionObjectReference{
+						Kind: "Deployment",
+						Name: "non-existent",
+					},
 				},
 			}
 
@@ -196,6 +208,10 @@ var _ = Describe("Actuator", func() {
 					},
 				},
 				Spec: llmdVariantAutoscalingV1alpha1.VariantAutoscalingSpec{
+					ScaleTargetRef: llmdVariantAutoscalingV1alpha1.CrossVersionObjectReference{
+						Kind: "Deployment",
+						Name: contextResourceName,
+					},
 					ModelID:          "test-model/variant-1",
 					VariantID:        "test-model/variant-1-A100-1",
 					Accelerator:      "A100",
@@ -435,6 +451,10 @@ var _ = Describe("Actuator", func() {
 					Namespace: namespace,
 				},
 				Spec: llmdVariantAutoscalingV1alpha1.VariantAutoscalingSpec{
+					ScaleTargetRef: llmdVariantAutoscalingV1alpha1.CrossVersionObjectReference{
+						Kind: "Deployment",
+						Name: contextResourceName,
+					},
 					ModelID:          "test-model/metrics-test",
 					VariantID:        "test-model/metrics-test-A100-1",
 					Accelerator:      "A100",
@@ -521,6 +541,10 @@ var _ = Describe("Actuator", func() {
 					Namespace: namespace,
 				},
 				Spec: llmdVariantAutoscalingV1alpha1.VariantAutoscalingSpec{
+					ScaleTargetRef: llmdVariantAutoscalingV1alpha1.CrossVersionObjectReference{
+						Kind: "Deployment",
+						Name: "incomplete-va",
+					},
 					ModelID:          "test-model/incomplete",
 					VariantID:        "test-model/incomplete-A100-1",
 					Accelerator:      "A100",
@@ -606,6 +630,10 @@ var _ = Describe("Actuator", func() {
 					Namespace: namespace,
 				},
 				Spec: llmdVariantAutoscalingV1alpha1.VariantAutoscalingSpec{
+					ScaleTargetRef: llmdVariantAutoscalingV1alpha1.CrossVersionObjectReference{
+						Kind: "Deployment",
+						Name: contextResourceName,
+					},
 					ModelID:          "test-model/validation-test",
 					VariantID:        "test-model/validation-test-A100-1",
 					Accelerator:      "A100",
