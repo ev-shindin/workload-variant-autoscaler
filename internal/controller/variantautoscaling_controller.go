@@ -1262,13 +1262,60 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 
 				// Check if this is first run (LastUpdate.UpdateTime is zero) or retention period not exceeded
 				if previousAlloc.LastUpdate.UpdateTime.IsZero() {
-					// First run: preserve currentReplicas as grace period for Prometheus discovery
-					logger.Log.Info("Optimizer returned 0 replicas but this is first run, preserving current deployment replicas",
-						"variantName", updateVa.Name,
-						"currentReplicas", currentReplicas)
+					// First run: check if we need to bootstrap with 1 replica
+					// This handles the case where currentReplicas=0 (HPA already scaled down)
+					// but we need a warm replica for Prometheus discovery and retention period logic
 
-					newAlloc.NumReplicas = currentReplicas
-					newReason = "First run: preserving current replicas for Prometheus discovery grace period"
+					// Check conditions for bootstrapping with 1 replica:
+					// 1. Scale-to-zero enabled
+					// 2. VA minReplicas = 0
+					// 3. currentReplicas = 0
+					// 4. Either: single variant OR cheapest variant among multiple variants
+
+					scaleToZeroEnabled := utils.IsScaleToZeroEnabled(scaleToZeroConfigData, updateVa.Namespace, modelName)
+					vaMinReplicasZero := updateVa.Spec.MinReplicas == nil || *updateVa.Spec.MinReplicas == 0
+
+					// Count variants for this model
+					variantCountForModel := 0
+					for _, v := range updateList.Items {
+						if v.Spec.ModelID == modelName {
+							variantCountForModel++
+						}
+					}
+					isSingleVariant := variantCountForModel == 1
+
+					// Check if this is the cheapest variant (lowest accelerator count)
+					isCheapest := isCheapestVariantForModel(&updateVa, updateList.Items, modelName)
+
+					if currentReplicas == 0 && scaleToZeroEnabled && vaMinReplicasZero {
+						// Bootstrap logic: ensure at least one warm replica for the model
+						if isSingleVariant || isCheapest {
+							// Bootstrap with 1 replica (single variant OR cheapest among multiple)
+							logger.Log.Info("Optimizer returned 0 replicas but this is first run with scale-to-zero enabled, bootstrapping with 1 replica",
+								"variantName", updateVa.Name,
+								"currentReplicas", currentReplicas,
+								"scaleToZeroEnabled", scaleToZeroEnabled,
+								"isSingleVariant", isSingleVariant,
+								"isCheapest", isCheapest)
+							newAlloc.NumReplicas = 1
+							newReason = "First run: bootstrapping with 1 replica for Prometheus discovery (scale-to-zero enabled)"
+						} else {
+							// Multiple variants, not cheapest - stay at 0
+							logger.Log.Info("Optimizer returned 0 replicas, first run with multiple variants (not cheapest), staying at 0",
+								"variantName", updateVa.Name,
+								"currentReplicas", currentReplicas,
+								"isCheapest", isCheapest)
+							newAlloc.NumReplicas = 0
+							newReason = "First run: multiple variants, not cheapest, waiting for traffic"
+						}
+					} else {
+						// Follow existing rules: preserve currentReplicas
+						logger.Log.Info("Optimizer returned 0 replicas but this is first run, preserving current deployment replicas",
+							"variantName", updateVa.Name,
+							"currentReplicas", currentReplicas)
+						newAlloc.NumReplicas = currentReplicas
+						newReason = "First run: preserving current replicas for Prometheus discovery grace period"
+					}
 				} else {
 					timeSinceLastUpdate := time.Since(previousAlloc.LastUpdate.UpdateTime.Time)
 					if timeSinceLastUpdate <= retentionPeriod {
