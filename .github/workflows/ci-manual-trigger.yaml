@@ -1,0 +1,288 @@
+name: CI - Manual Trigger (All Tests)
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to test (leave empty for current branch)'
+        required: false
+        type: string
+      pr_number:
+        description: 'PR number to test (optional, takes precedence over branch)'
+        required: false
+        type: string
+      skip_e2e:
+        description: 'Skip E2E tests (to save minutes)'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+
+    steps:
+      - name: Determine checkout ref
+        id: checkout-ref
+        run: |
+          if [ -n "${{ github.event.inputs.pr_number }}" ]; then
+            echo "ref=refs/pull/${{ github.event.inputs.pr_number }}/merge" >> $GITHUB_OUTPUT
+            echo "Testing PR #${{ github.event.inputs.pr_number }}"
+          elif [ -n "${{ github.event.inputs.branch }}" ]; then
+            echo "ref=${{ github.event.inputs.branch }}" >> $GITHUB_OUTPUT
+            echo "Testing branch ${{ github.event.inputs.branch }}"
+          else
+            echo "ref=${{ github.ref }}" >> $GITHUB_OUTPUT
+            echo "Testing default branch ${{ github.ref }}"
+          fi
+
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.checkout-ref.outputs.ref }}
+
+      - name: Sanity check repo contents
+        run: ls -la
+
+      - name: Extract Go version from go.mod
+        run: sed -En 's/^go (.*)$/GO_VERSION=\1/p' go.mod >> $GITHUB_ENV
+
+      - name: Set up Go with cache
+        uses: actions/setup-go@v5
+        with:
+          go-version: "${{ env.GO_VERSION }}"
+          cache-dependency-path: ./go.sum
+
+      - name: Install dependencies
+        run: go mod download
+
+      - name: Install golangci-lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.1.6
+          args: ""
+
+      - name: Run make lint
+        run: make lint
+
+      - name: Run make test (unit tests)
+        run: make test
+
+      - name: Run make build
+        run: make build
+
+      # E2E tests (optional, can be skipped to save minutes)
+      - name: Install Kind
+        if: ${{ github.event.inputs.skip_e2e != 'true' }}
+        run: |
+          echo "Installing Kind..."
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+          kind version
+
+      - name: Install kubectl
+        if: ${{ github.event.inputs.skip_e2e != 'true' }}
+        run: |
+          echo "Installing kubectl..."
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/kubectl
+          kubectl version --client
+
+      - name: Verify CRD YAML Schema (Pre-E2E)
+        if: ${{ github.event.inputs.skip_e2e != 'true' }}
+        run: |
+          echo "========== Verifying CRD YAML file before E2E tests =========="
+          echo ""
+          echo "Checking config/crd/bases/llmd.ai_variantautoscalings.yaml for required fields..."
+          echo ""
+
+          CRD_FILE="config/crd/bases/llmd.ai_variantautoscalings.yaml"
+
+          if [ ! -f "$CRD_FILE" ]; then
+            echo "❌ ERROR: CRD file not found at $CRD_FILE"
+            exit 1
+          fi
+
+          # Extract desiredOptimizedAlloc section and lastUpdate subsection
+          DESIRED_ALLOC_SCHEMA=$(grep -A 50 "desiredOptimizedAlloc:" "$CRD_FILE")
+          LASTUPDATE_SCHEMA=$(grep -A 30 "lastUpdate:" "$CRD_FILE" | head -40)
+
+          # Check for required fields in OptimizedAlloc
+          HAS_NUMREPLICAS=$(echo "$DESIRED_ALLOC_SCHEMA" | grep -c "numReplicas:" || true)
+          HAS_LASTRUNTIME=$(echo "$DESIRED_ALLOC_SCHEMA" | grep -c "lastRunTime:" || true)
+          HAS_LASTUPDATE=$(echo "$DESIRED_ALLOC_SCHEMA" | grep -c "lastUpdate:" || true)
+
+          # Check for required fields inside LastUpdateInfo struct
+          HAS_UPDATETIME=$(echo "$LASTUPDATE_SCHEMA" | grep -c "updateTime:" || true)
+          HAS_NUMREPLICASCHANGED=$(echo "$LASTUPDATE_SCHEMA" | grep -c "numReplicasChanged:" || true)
+          HAS_REASON=$(echo "$LASTUPDATE_SCHEMA" | grep -c "reason:" || true)
+
+          echo "Field verification results:"
+          echo "OptimizedAlloc fields:"
+          echo "  numReplicas: $([ $HAS_NUMREPLICAS -gt 0 ] && echo '✅ FOUND' || echo '❌ MISSING')"
+          echo "  lastRunTime: $([ $HAS_LASTRUNTIME -gt 0 ] && echo '✅ FOUND' || echo '❌ MISSING')"
+          echo "  lastUpdate: $([ $HAS_LASTUPDATE -gt 0 ] && echo '✅ FOUND' || echo '❌ MISSING')"
+          echo "LastUpdateInfo fields (inside lastUpdate):"
+          echo "  updateTime: $([ $HAS_UPDATETIME -gt 0 ] && echo '✅ FOUND' || echo '❌ MISSING')"
+          echo "  numReplicasChanged: $([ $HAS_NUMREPLICASCHANGED -gt 0 ] && echo '✅ FOUND' || echo '❌ MISSING')"
+          echo "  reason: $([ $HAS_REASON -gt 0 ] && echo '✅ FOUND' || echo '❌ MISSING')"
+          echo ""
+
+          # Report to GitHub Actions Summary
+          echo "## 🔍 CRD YAML Pre-Verification" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Verified CRD file **before** E2E tests:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### OptimizedAlloc Fields" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| \`numReplicas\` | $([ $HAS_NUMREPLICAS -gt 0 ] && echo '✅ FOUND' || echo '❌ MISSING') |" >> $GITHUB_STEP_SUMMARY
+          echo "| \`lastRunTime\` | $([ $HAS_LASTRUNTIME -gt 0 ] && echo '✅ FOUND' || echo '❌ MISSING') |" >> $GITHUB_STEP_SUMMARY
+          echo "| \`lastUpdate\` | $([ $HAS_LASTUPDATE -gt 0 ] && echo '✅ FOUND' || echo '❌ MISSING') |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### LastUpdateInfo Fields (nested in lastUpdate)" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| \`updateTime\` | $([ $HAS_UPDATETIME -gt 0 ] && echo '✅ FOUND' || echo '❌ MISSING') |" >> $GITHUB_STEP_SUMMARY
+          echo "| \`numReplicasChanged\` | $([ $HAS_NUMREPLICASCHANGED -gt 0 ] && echo '✅ FOUND' || echo '❌ MISSING') |" >> $GITHUB_STEP_SUMMARY
+          echo "| \`reason\` | $([ $HAS_REASON -gt 0 ] && echo '✅ FOUND' || echo '❌ MISSING') |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Fail fast if critical fields are missing
+          if [ $HAS_LASTUPDATE -eq 0 ] || [ $HAS_UPDATETIME -eq 0 ] || [ $HAS_NUMREPLICASCHANGED -eq 0 ] || [ $HAS_REASON -eq 0 ]; then
+            echo "❌ CRITICAL: CRD YAML is missing required fields!"
+            echo "   E2E tests will fail because these fields will be dropped by the API server."
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "❌ **CRD YAML missing required fields!** Run \`make manifests\` to regenerate." >> $GITHUB_STEP_SUMMARY
+            exit 1
+          else
+            echo "✅ All required fields present in CRD YAML"
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "✅ **All required fields present in CRD YAML**" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Run make test-e2e
+        if: ${{ github.event.inputs.skip_e2e != 'true' }}
+        timeout-minutes: 40
+        env:
+          E2E_IMG: ghcr.io/ev-shindin/workload-variant-autoscaler:latest
+          SKIP_DOCKER_BUILD: "true"
+        run: |
+          echo "Running E2E tests..."
+          make test-e2e
+
+      - name: Verify CRD Schema (Diagnostic)
+        if: ${{ github.event.inputs.skip_e2e != 'true' && always() }}
+        continue-on-error: true
+        run: |
+          echo "========== Checking deployed CRD schema =========="
+          echo ""
+          echo "Looking for 'reason' and 'lastUpdate' fields in desiredOptimizedAlloc..."
+          echo ""
+
+          # Check if CRD exists
+          if ! kubectl get crd variantautoscalings.llmd.ai >/dev/null 2>&1; then
+            echo "⚠️  WARNING: CRD variantautoscalings.llmd.ai not found (cluster may have been torn down)"
+            echo "## ⚠️ CRD Not Found (Diagnostic)" >> $GITHUB_STEP_SUMMARY
+            echo "The VariantAutoscaling CRD was not found. This is expected if the cluster was already torn down." >> $GITHUB_STEP_SUMMARY
+            echo "This is a diagnostic step and does not indicate test failure." >> $GITHUB_STEP_SUMMARY
+            echo "Skipping CRD schema verification."
+            exit 0
+          fi
+
+          # Extract desiredOptimizedAlloc section and lastUpdate subsection
+          DESIRED_ALLOC_SCHEMA=$(kubectl get crd variantautoscalings.llmd.ai -o yaml | \
+            grep -A 50 "desiredOptimizedAlloc:")
+          LASTUPDATE_SCHEMA=$(kubectl get crd variantautoscalings.llmd.ai -o yaml | \
+            grep -A 30 "lastUpdate:" | head -40)
+
+          echo "$DESIRED_ALLOC_SCHEMA"
+          echo ""
+
+          # Check for required fields in OptimizedAlloc
+          HAS_NUMREPLICAS=$(echo "$DESIRED_ALLOC_SCHEMA" | grep -c "numReplicas:" || true)
+          HAS_LASTRUNTIME=$(echo "$DESIRED_ALLOC_SCHEMA" | grep -c "lastRunTime:" || true)
+          HAS_LASTUPDATE=$(echo "$DESIRED_ALLOC_SCHEMA" | grep -c "lastUpdate:" || true)
+
+          # Check for required fields inside LastUpdateInfo struct
+          HAS_UPDATETIME=$(echo "$LASTUPDATE_SCHEMA" | grep -c "updateTime:" || true)
+          HAS_NUMREPLICASCHANGED=$(echo "$LASTUPDATE_SCHEMA" | grep -c "numReplicasChanged:" || true)
+          HAS_REASON=$(echo "$LASTUPDATE_SCHEMA" | grep -c "reason:" || true)
+
+          echo "========== Field Check Results =========="
+          echo "OptimizedAlloc fields:"
+          echo "  numReplicas: $([ $HAS_NUMREPLICAS -gt 0 ] && echo '✅ FOUND' || echo '❌ MISSING')"
+          echo "  lastRunTime: $([ $HAS_LASTRUNTIME -gt 0 ] && echo '✅ FOUND' || echo '❌ MISSING')"
+          echo "  lastUpdate: $([ $HAS_LASTUPDATE -gt 0 ] && echo '✅ FOUND' || echo '❌ MISSING')"
+          echo "LastUpdateInfo fields (inside lastUpdate):"
+          echo "  updateTime: $([ $HAS_UPDATETIME -gt 0 ] && echo '✅ FOUND' || echo '❌ MISSING')"
+          echo "  numReplicasChanged: $([ $HAS_NUMREPLICASCHANGED -gt 0 ] && echo '✅ FOUND' || echo '❌ MISSING')"
+          echo "  reason: $([ $HAS_REASON -gt 0 ] && echo '✅ FOUND' || echo '❌ MISSING')"
+          echo ""
+
+          # Report to GitHub Actions Summary
+          echo "## 🔍 CRD Schema Verification" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Checking if \`desiredOptimizedAlloc\` has required fields:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### OptimizedAlloc Fields" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| \`numReplicas\` | $([ $HAS_NUMREPLICAS -gt 0 ] && echo '✅ FOUND' || echo '❌ MISSING') |" >> $GITHUB_STEP_SUMMARY
+          echo "| \`lastRunTime\` | $([ $HAS_LASTRUNTIME -gt 0 ] && echo '✅ FOUND' || echo '❌ MISSING') |" >> $GITHUB_STEP_SUMMARY
+          echo "| \`lastUpdate\` | $([ $HAS_LASTUPDATE -gt 0 ] && echo '✅ FOUND' || echo '❌ MISSING') |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### LastUpdateInfo Fields (nested in lastUpdate)" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| \`updateTime\` | $([ $HAS_UPDATETIME -gt 0 ] && echo '✅ FOUND' || echo '❌ MISSING') |" >> $GITHUB_STEP_SUMMARY
+          echo "| \`numReplicasChanged\` | $([ $HAS_NUMREPLICASCHANGED -gt 0 ] && echo '✅ FOUND' || echo '❌ MISSING') |" >> $GITHUB_STEP_SUMMARY
+          echo "| \`reason\` | $([ $HAS_REASON -gt 0 ] && echo '✅ FOUND' || echo '❌ MISSING') |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Check if critical fields are missing
+          if [ $HAS_LASTUPDATE -eq 0 ] || [ $HAS_UPDATETIME -eq 0 ] || [ $HAS_NUMREPLICASCHANGED -eq 0 ] || [ $HAS_REASON -eq 0 ]; then
+            echo "## ⚠️ ISSUE FOUND: Missing CRD Fields" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**The CRD is missing \`reason\` and/or \`lastUpdate\` fields!**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "This explains why E2E tests show empty \`Reason=\"\"\` and \`LastUpdate=0001-01-01\`." >> $GITHUB_STEP_SUMMARY
+            echo "The Kubernetes API server silently drops fields not defined in the CRD schema." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Solution:" >> $GITHUB_STEP_SUMMARY
+            echo "1. Run \`make manifests\` to regenerate CRDs" >> $GITHUB_STEP_SUMMARY
+            echo "2. Ensure E2E tests deploy the latest CRD from \`config/crd/bases/\`" >> $GITHUB_STEP_SUMMARY
+            echo "3. Verify with: \`kubectl apply -f config/crd/bases/llm-d.llm-manager.io_variantautoscalings.yaml\`" >> $GITHUB_STEP_SUMMARY
+
+            echo ""
+            echo "❌ CRITICAL: CRD is missing required fields (reason and/or lastUpdate)"
+            echo "   This explains the E2E test failures with empty Reason and LastUpdate!"
+            exit 1
+          else
+            echo "✅ All required fields found in CRD schema"
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "✅ **All required fields are present in the CRD.**" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: E2E tests skipped
+        if: ${{ github.event.inputs.skip_e2e == 'true' }}
+        run: echo "E2E tests were skipped to save CI minutes"
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "### Test Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Branch/PR**: ${{ steps.checkout-ref.outputs.ref }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Go Version**: ${{ env.GO_VERSION }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Lint**: ✅" >> $GITHUB_STEP_SUMMARY
+          echo "- **Unit Tests**: ✅" >> $GITHUB_STEP_SUMMARY
+          echo "- **Build**: ✅" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ github.event.inputs.skip_e2e }}" = "true" ]; then
+            echo "- **E2E Tests**: ⏭️ Skipped" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- **E2E Tests**: ✅" >> $GITHUB_STEP_SUMMARY
+          fi
