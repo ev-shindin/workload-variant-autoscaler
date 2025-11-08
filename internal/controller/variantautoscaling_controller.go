@@ -1287,14 +1287,13 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 					// Check if this is the cheapest variant (lowest accelerator count)
 					isCheapest := isCheapestVariantForModel(&updateVa, updateList.Items, modelName)
 
-					if currentReplicas == 0 && scaleToZeroEnabled && vaMinReplicasZero {
+					if currentReplicas == 0 && vaMinReplicasZero {
 						// Bootstrap logic: ensure at least one warm replica for the model
 						if isSingleVariant || isCheapest {
 							// Bootstrap with 1 replica (single variant OR cheapest among multiple)
 							logger.Log.Info("Optimizer returned 0 replicas but this is first run with scale-to-zero enabled, bootstrapping with 1 replica",
 								"variantName", updateVa.Name,
 								"currentReplicas", currentReplicas,
-								"scaleToZeroEnabled", scaleToZeroEnabled,
 								"isSingleVariant", isSingleVariant,
 								"isCheapest", isCheapest)
 							newAlloc.NumReplicas = 1
