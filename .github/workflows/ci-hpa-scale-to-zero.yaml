@@ -1,0 +1,391 @@
+name: CI - HPA Scale-to-Zero Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to test (leave empty for current branch)'
+        required: false
+        type: string
+      pr_number:
+        description: 'PR number to test (optional, takes precedence over branch)'
+        required: false
+        type: string
+
+jobs:
+  hpa-scale-to-zero-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+
+    steps:
+      - name: Determine checkout ref
+        id: checkout-ref
+        run: |
+          if [ -n "${{ github.event.inputs.pr_number }}" ]; then
+            echo "ref=refs/pull/${{ github.event.inputs.pr_number }}/merge" >> $GITHUB_OUTPUT
+            echo "Testing PR #${{ github.event.inputs.pr_number }}"
+          elif [ -n "${{ github.event.inputs.branch }}" ]; then
+            echo "ref=${{ github.event.inputs.branch }}" >> $GITHUB_OUTPUT
+            echo "Testing branch ${{ github.event.inputs.branch }}"
+          else
+            echo "ref=${{ github.ref }}" >> $GITHUB_OUTPUT
+            echo "Testing default branch ${{ github.ref }}"
+          fi
+
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.checkout-ref.outputs.ref }}
+
+      - name: Sanity check repo contents
+        run: ls -la
+
+      - name: Extract Go version from go.mod
+        run: sed -En 's/^go (.*)$/GO_VERSION=\1/p' go.mod >> $GITHUB_ENV
+
+      - name: Set up Go with cache
+        uses: actions/setup-go@v5
+        with:
+          go-version: "${{ env.GO_VERSION }}"
+          cache-dependency-path: ./go.sum
+
+      - name: Install dependencies
+        run: go mod download
+
+      - name: Install Kind
+        run: |
+          echo "Installing Kind..."
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+          kind version
+
+      - name: Install kubectl
+        run: |
+          echo "Installing kubectl..."
+          KUBECTL_VERSION=$(curl -L -s https://dl.k8s.io/release/stable.txt)
+          curl -LO "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/kubectl
+          kubectl version --client
+
+      - name: Install Helm
+        run: |
+          echo "Installing Helm..."
+          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          helm version
+
+      - name: Install jq
+        run: |
+          echo "Installing jq..."
+          sudo apt-get update && sudo apt-get install -y jq
+          jq --version
+
+      - name: Create KIND cluster with HPAScaleToZero feature gate and GPU emulation
+        run: |
+          echo "Creating KIND cluster with HPAScaleToZero feature gate and emulated GPUs..."
+          bash deploy/kind-emulator/setup.sh -c kind-hpa-cluster -n 3 -g 4 -t mix
+          kubectl cluster-info
+          kubectl get nodes
+
+      - name: Install Prometheus Adapter (pre-configured for HTTPS Prometheus)
+        run: |
+          echo "Installing Prometheus Adapter..."
+          echo "Note: Prometheus will be installed later by deployment script with TLS"
+
+          # Create monitoring namespace
+          kubectl create namespace workload-variant-autoscaler-monitoring || true
+
+          # Add Helm repo
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo update
+
+          # Install Prometheus Adapter configured for HTTPS connection
+          # The CA cert will be provided by the deployment script when it installs Prometheus
+          helm install prometheus-adapter prometheus-community/prometheus-adapter \
+            --namespace workload-variant-autoscaler-monitoring \
+            --set prometheus.url=https://kube-prometheus-stack-prometheus.workload-variant-autoscaler-monitoring.svc.cluster.local \
+            --set prometheus.port=9090 \
+            --set rules.external[0].seriesQuery='wva_desired_replicas{target_name!="",exported_namespace!=""}' \
+            --set rules.external[0].resources.overrides.exported_namespace.resource=namespace \
+            --set rules.external[0].resources.overrides.target_name.resource=deployment \
+            --set rules.external[0].name.matches='^wva_desired_replicas' \
+            --set rules.external[0].name.as='wva_desired_replicas' \
+            --set rules.external[0].metricsQuery='wva_desired_replicas{<<.LabelMatchers>>}' \
+            --set replicas=2 \
+            --set logLevel=4 \
+            --set tls.enable=false \
+            --wait --timeout=5m
+
+          echo "✓ Prometheus Adapter installed (will connect to HTTPS Prometheus once it's deployed)"
+          kubectl get pods -n workload-variant-autoscaler-monitoring
+
+      - name: Build and deploy controller to cluster
+        env:
+          IMG: ghcr.io/ev-shindin/workload-variant-autoscaler:latest
+        run: |
+          echo "Pulling pre-built controller image..."
+          docker pull $IMG
+
+          echo "Loading controller image into KIND cluster..."
+          kind load docker-image $IMG --name kind-hpa-cluster
+
+          echo "Pre-loading vLLM emulator image into KIND cluster..."
+          docker pull quay.io/infernoautoscaler/vllme:0.2.3-multi-arch
+          kind load docker-image quay.io/infernoautoscaler/vllme:0.2.3-multi-arch --name kind-hpa-cluster
+
+          echo "Setting up test environment..."
+          export CLUSTER_NAME=kind-hpa-cluster
+          export CREATE_CLUSTER=false
+          export DEPLOY_PROMETHEUS_ADAPTER=false
+          export WVA_IMAGE_PULL_POLICY=IfNotPresent
+          export NUM_NODES=3
+          export MAX_GPUS=4
+          export GPU_TYPES=mix
+
+          echo "Deploying Prometheus with TLS, WVA controller and llm-d infrastructure..."
+          # Use the deployment script but skip cluster creation and Prometheus Adapter
+          # Script will install Prometheus with TLS, configure adapter CA cert, deploy WVA and llm-d
+          KIND=kind KUBECTL=kubectl bash deploy/kind-emulator/deploy-llm-d.sh -i $IMG
+
+          echo "✓ Controller deployment initiated"
+          kubectl get pods -n workload-variant-autoscaler-system
+
+      - name: Restart Prometheus Adapter to connect to Prometheus
+        run: |
+          echo "Restarting Prometheus Adapter pods to establish connection to Prometheus..."
+          echo "Note: Prometheus Adapter was installed before Prometheus existed."
+          echo "      Now that Prometheus is deployed with TLS, we need to restart Prometheus Adapter"
+          echo "      so it can connect to Prometheus and discover metrics."
+          echo ""
+
+          # Delete existing Prometheus Adapter pods to force restart
+          echo "Deleting existing Prometheus Adapter pods..."
+          kubectl delete pods -n workload-variant-autoscaler-monitoring \
+            -l app.kubernetes.io/name=prometheus-adapter || {
+              echo "Warning: Failed to delete pods with app.kubernetes.io/name label, trying alternative..."
+              kubectl delete pods -n workload-variant-autoscaler-monitoring \
+                -l app=prometheus-adapter || true
+            }
+
+          # Wait for new pods to be created and ready
+          echo "Waiting for new Prometheus Adapter pods to be ready..."
+          RETRY_COUNT=0
+          MAX_RETRIES=24  # 2 minutes with 5 second intervals
+
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            echo "Checking Prometheus Adapter pods (attempt $((RETRY_COUNT + 1))/$MAX_RETRIES)..."
+
+            # Try primary label selector
+            RUNNING_PODS=$(kubectl get pods -n workload-variant-autoscaler-monitoring \
+              -l app.kubernetes.io/name=prometheus-adapter \
+              --field-selector=status.phase=Running \
+              --no-headers 2>/dev/null | wc -l)
+
+            if [ "$RUNNING_PODS" -eq "0" ]; then
+              # Try alternative label selector
+              RUNNING_PODS=$(kubectl get pods -n workload-variant-autoscaler-monitoring \
+                -l app=prometheus-adapter \
+                --field-selector=status.phase=Running \
+                --no-headers 2>/dev/null | wc -l)
+            fi
+
+            if [ "$RUNNING_PODS" -gt "0" ]; then
+              echo "Found $RUNNING_PODS running Prometheus Adapter pod(s)"
+
+              # Verify all pods are actually ready (containers ready)
+              ALL_READY=true
+              PODS=$(kubectl get pods -n workload-variant-autoscaler-monitoring \
+                -l app.kubernetes.io/name=prometheus-adapter \
+                -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
+
+              if [ -z "$PODS" ]; then
+                PODS=$(kubectl get pods -n workload-variant-autoscaler-monitoring \
+                  -l app=prometheus-adapter \
+                  -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
+              fi
+
+              for pod in $PODS; do
+                READY=$(kubectl get pod $pod -n workload-variant-autoscaler-monitoring \
+                  -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null)
+                if [ "$READY" != "true" ]; then
+                  ALL_READY=false
+                  echo "Pod $pod is not ready yet (ready=$READY)"
+                  break
+                fi
+              done
+
+              if [ "$ALL_READY" = true ]; then
+                echo "✓ All Prometheus Adapter pods are ready"
+                kubectl get pods -n workload-variant-autoscaler-monitoring -l app.kubernetes.io/name=prometheus-adapter
+                break
+              fi
+            fi
+
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+              sleep 5
+            fi
+          done
+
+          if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
+            echo "ERROR: Prometheus Adapter pods did not become ready in time"
+            echo ""
+            echo "===== Prometheus Adapter Pods Status ====="
+            kubectl get pods -n workload-variant-autoscaler-monitoring -l app.kubernetes.io/name=prometheus-adapter -o wide || true
+            kubectl get pods -n workload-variant-autoscaler-monitoring -l app=prometheus-adapter -o wide || true
+            echo ""
+            echo "===== Prometheus Adapter Pod Describe ====="
+            kubectl describe pods -n workload-variant-autoscaler-monitoring -l app.kubernetes.io/name=prometheus-adapter || true
+            echo ""
+            echo "===== Prometheus Adapter Logs ====="
+            kubectl logs -n workload-variant-autoscaler-monitoring -l app.kubernetes.io/name=prometheus-adapter --tail=50 || true
+            exit 1
+          fi
+
+          echo "✓ Prometheus Adapter restarted and connected to Prometheus"
+
+      - name: Wait for controller pod to be ready
+        run: |
+          echo "Waiting for controller pod to be running..."
+          kubectl wait --for=condition=Ready pod \
+            -l app.kubernetes.io/name=workload-variant-autoscaler \
+            -n workload-variant-autoscaler-system \
+            --timeout=5m || {
+              echo "ERROR: Controller pod failed to become ready"
+              echo ""
+              echo "===== Pod Status ====="
+              kubectl get pods -n workload-variant-autoscaler-system -o wide
+              echo ""
+              echo "===== Pod Describe ====="
+              kubectl describe pods -n workload-variant-autoscaler-system
+              echo ""
+              echo "===== Pod Events ====="
+              kubectl get events -n workload-variant-autoscaler-system --sort-by='.lastTimestamp'
+              echo ""
+              echo "===== Pod Logs (if available) ====="
+              kubectl logs -l app.kubernetes.io/name=workload-variant-autoscaler -n workload-variant-autoscaler-system --tail=100 || true
+              exit 1
+            }
+
+          echo "✓ Controller pod is ready"
+          kubectl get pods -n workload-variant-autoscaler-system
+
+      - name: Verify prerequisites
+        run: |
+          echo "Verifying cluster prerequisites for HPA scale-to-zero tests..."
+
+          echo "✓ KIND cluster is running"
+          kubectl get nodes
+
+          echo "===== Checking all pods in monitoring namespace ====="
+          kubectl get pods -n workload-variant-autoscaler-monitoring -o wide
+
+          echo "===== Checking Prometheus Adapter deployment ====="
+          kubectl get deployment -n workload-variant-autoscaler-monitoring prometheus-adapter
+
+          echo "===== Checking Prometheus Adapter pods with label ====="
+          kubectl get pods -n workload-variant-autoscaler-monitoring -l app.kubernetes.io/name=prometheus-adapter -o wide
+
+          echo "===== Describing Prometheus Adapter pods ====="
+          kubectl describe pods -n workload-variant-autoscaler-monitoring -l app.kubernetes.io/name=prometheus-adapter || true
+
+          echo "===== Checking if pods are actually ready ====="
+          READY_PODS=$(kubectl get pods -n workload-variant-autoscaler-monitoring -l app.kubernetes.io/name=prometheus-adapter -o jsonpath='{.items[?(@.status.phase=="Running")].metadata.name}')
+          if [ -z "$READY_PODS" ]; then
+            echo "ERROR: No Prometheus Adapter pods are running!"
+            kubectl get pods -n workload-variant-autoscaler-monitoring -l app.kubernetes.io/name=prometheus-adapter
+            exit 1
+          else
+            echo "✓ Prometheus Adapter pods are running: $READY_PODS"
+          fi
+
+          echo "✓ Checking HPAScaleToZero feature gate on API server..."
+          kubectl get pod -n kube-system -l component=kube-apiserver -o yaml | grep -i "HPAScaleToZero" || echo "Warning: Could not verify feature gate"
+
+          echo "All prerequisites verified!"
+
+      - name: Final check before running tests
+        run: |
+          echo "===== Final verification before running E2E tests ====="
+
+          echo "===== Checking actual labels on Prometheus Adapter pods ====="
+          ADAPTER_PODS=$(kubectl get pods -n workload-variant-autoscaler-monitoring | grep prometheus-adapter | awk '{print $1}')
+          if [ -n "$ADAPTER_PODS" ]; then
+            for pod in $ADAPTER_PODS; do
+              echo "Labels on pod $pod:"
+              kubectl get pod $pod -n workload-variant-autoscaler-monitoring --show-labels
+              echo ""
+            done
+          fi
+
+          echo "===== Testing different label selectors ====="
+          echo "1. Using app.kubernetes.io/name=prometheus-adapter:"
+          kubectl get pods -n workload-variant-autoscaler-monitoring -l app.kubernetes.io/name=prometheus-adapter
+
+          echo "2. Using app=prometheus-adapter:"
+          kubectl get pods -n workload-variant-autoscaler-monitoring -l app=prometheus-adapter
+
+          echo "3. All prometheus-adapter pods (by name pattern):"
+          kubectl get pods -n workload-variant-autoscaler-monitoring | grep prometheus-adapter
+
+          POD_COUNT=$(kubectl get pods -n workload-variant-autoscaler-monitoring -l app.kubernetes.io/name=prometheus-adapter --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l)
+          echo ""
+          echo "Running Prometheus Adapter pods count (with app.kubernetes.io/name label): $POD_COUNT"
+
+          if [ "$POD_COUNT" -eq "0" ]; then
+            echo "WARNING: No pods found with app.kubernetes.io/name=prometheus-adapter label!"
+            echo "Trying alternative label selector (app=prometheus-adapter)..."
+            ALT_POD_COUNT=$(kubectl get pods -n workload-variant-autoscaler-monitoring -l app=prometheus-adapter --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l)
+            echo "Alternative label selector count: $ALT_POD_COUNT"
+
+            if [ "$ALT_POD_COUNT" -eq "0" ]; then
+              echo "ERROR: No Prometheus Adapter pods found with any label selector!"
+              echo "All pods in monitoring namespace:"
+              kubectl get pods -n workload-variant-autoscaler-monitoring
+              exit 1
+            fi
+          fi
+
+          echo "✓ Prometheus Adapter is ready for tests"
+
+      - name: Run HPA scale-to-zero E2E tests
+        timeout-minutes: 60
+        env:
+          E2E_IMG: ghcr.io/ev-shindin/workload-variant-autoscaler:latest
+          SKIP_DOCKER_BUILD: "true"
+          SKIP_KIND_DEPLOY: "true"
+          KEDA_INSTALL_SKIP: "true"
+          LLMD_NAMESPACE: llm-d-sim
+          MONITORING_NAMESPACE: workload-variant-autoscaler-monitoring
+          CONTROLLER_NAMESPACE: workload-variant-autoscaler-system
+          ACCELERATOR_TYPE: A100
+          GATEWAY_NAME: infra-sim-inference-gateway
+          DEFAULT_MODEL_ID: default/default
+        run: |
+          echo "Running HPA scale-to-zero E2E tests..."
+          echo "Environment variables:"
+          echo "  E2E_IMG=$E2E_IMG"
+          echo "  LLMD_NAMESPACE=$LLMD_NAMESPACE"
+          echo "  MONITORING_NAMESPACE=$MONITORING_NAMESPACE"
+          echo "  CONTROLLER_NAMESPACE=$CONTROLLER_NAMESPACE"
+          echo ""
+
+          make test-e2e FOCUS="HPA"
+
+      - name: Cleanup KIND cluster
+        if: always()
+        run: |
+          echo "Cleaning up KIND cluster..."
+          kind delete cluster --name kind-hpa-cluster || true
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "### HPA Scale-to-Zero Test Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Branch/PR**: ${{ steps.checkout-ref.outputs.ref }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Go Version**: ${{ env.GO_VERSION }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **KIND Cluster**: ✅ Created with HPAScaleToZero feature gate" >> $GITHUB_STEP_SUMMARY
+          echo "- **Prometheus Adapter**: ✅ Installed via kube-prometheus-stack" >> $GITHUB_STEP_SUMMARY
+          echo "- **HPA Scale-to-Zero Tests**: ✅" >> $GITHUB_STEP_SUMMARY
