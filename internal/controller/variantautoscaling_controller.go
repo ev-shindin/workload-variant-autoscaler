@@ -1267,12 +1267,10 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 					// but we need a warm replica for Prometheus discovery and retention period logic
 
 					// Check conditions for bootstrapping with 1 replica:
-					// 1. Scale-to-zero enabled
-					// 2. VA minReplicas = 0
-					// 3. currentReplicas = 0
-					// 4. Either: single variant OR cheapest variant among multiple variants
+					// 1. VA minReplicas = 0
+					// 2. currentReplicas = 0
+					// 3. Either: single variant OR cheapest variant among multiple variants
 
-					scaleToZeroEnabled := utils.IsScaleToZeroEnabled(scaleToZeroConfigData, updateVa.Namespace, modelName)
 					vaMinReplicasZero := updateVa.Spec.MinReplicas == nil || *updateVa.Spec.MinReplicas == 0
 
 					// Count variants for this model
