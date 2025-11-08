@@ -1291,13 +1291,13 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 						// Bootstrap logic: ensure at least one warm replica for the model
 						if isSingleVariant || isCheapest {
 							// Bootstrap with 1 replica (single variant OR cheapest among multiple)
-							logger.Log.Info("Optimizer returned 0 replicas but this is first run with scale-to-zero enabled, bootstrapping with 1 replica",
+							logger.Log.Info("Optimizer returned 0 replicas but this is first run, bootstrapping with 1 replica",
 								"variantName", updateVa.Name,
 								"currentReplicas", currentReplicas,
 								"isSingleVariant", isSingleVariant,
 								"isCheapest", isCheapest)
 							newAlloc.NumReplicas = 1
-							newReason = "First run: bootstrapping with 1 replica for Prometheus discovery (scale-to-zero enabled)"
+							newReason = "First run: bootstrapping with 1 replica for Prometheus discovery"
 						} else {
 							// Multiple variants, not cheapest - stay at 0
 							logger.Log.Info("Optimizer returned 0 replicas, first run with multiple variants (not cheapest), staying at 0",
