@@ -13,8 +13,9 @@ import (
 )
 
 // The following utility functions are used to create Prometheus queries for testing
+// These must match the exact queries used in collector.go
 func CreateArrivalQuery(modelID, namespace string) string {
-	return fmt.Sprintf(`sum(rate(%s{%s="%s",%s="%s"}[1m]))`,
+	return fmt.Sprintf(`sum(rate(%s{%s="%s",%s="%s"}[1m])) * 60`,
 		constants.VLLMRequestSuccessTotal,
 		constants.LabelModelName, modelID,
 		constants.LabelNamespace, namespace)
@@ -41,11 +42,12 @@ func CreateDecToksQuery(modelID, namespace string) string {
 }
 
 func CreateTTFTQuery(modelID, namespace string) string {
+	// Note: collector.go uses queue time metrics for TTFT calculation
 	return fmt.Sprintf(`sum(rate(%s{%s="%s",%s="%s"}[1m]))/sum(rate(%s{%s="%s",%s="%s"}[1m]))`,
-		constants.VLLMTimeToFirstTokenSecondsSum,
+		constants.VLLMRequestQueueTimeSecondsSum,
 		constants.LabelModelName, modelID,
 		constants.LabelNamespace, namespace,
-		constants.VLLMTimeToFirstTokenSecondsCount,
+		constants.VLLMRequestQueueTimeSecondsCount,
 		constants.LabelModelName, modelID,
 		constants.LabelNamespace, namespace)
 }

@@ -1549,7 +1549,7 @@ retentionPeriod: "not-a-duration"`,
 			Expect(len(configData)).To(Equal(2))
 
 			// GetScaleToZeroRetentionPeriod will fall back to defaults when model's retention is invalid
-			duration := utils.GetScaleToZeroRetentionPeriod(configData, "test/invalid")
+			duration := utils.GetScaleToZeroRetentionPeriod(configData, "", "test/invalid")
 			Expect(duration).To(Equal(20 * time.Minute)) // Should use defaults, not system default
 
 			By("Cleaning up ConfigMap")
@@ -2371,7 +2371,7 @@ retentionPeriod: "not-a-duration"`,
 				newAlloc.LastUpdate.Reason = "Optimizer solution: cost and latency optimized allocation"
 
 				modelName := "test-model"
-				retentionPeriod := utils.GetScaleToZeroRetentionPeriod(scaleToZeroConfigData, modelName)
+				retentionPeriod := utils.GetScaleToZeroRetentionPeriod(scaleToZeroConfigData, "", modelName)
 
 				if optimizedAlloc.NumReplicas == 0 {
 					if !previousAlloc.LastUpdate.UpdateTime.IsZero() {
@@ -2408,7 +2408,7 @@ retentionPeriod: "not-a-duration"`,
 				newAlloc.LastUpdate.Reason = "Optimizer solution: cost and latency optimized allocation"
 
 				modelName := "test-model"
-				retentionPeriod := utils.GetScaleToZeroRetentionPeriod(scaleToZeroConfigData, modelName)
+				retentionPeriod := utils.GetScaleToZeroRetentionPeriod(scaleToZeroConfigData, "", modelName)
 
 				if optimizedAlloc.NumReplicas == 0 {
 					if !previousAlloc.LastUpdate.UpdateTime.IsZero() {
@@ -2448,7 +2448,7 @@ retentionPeriod: "not-a-duration"`,
 				newAlloc.LastUpdate.Reason = "Optimizer solution: cost and latency optimized allocation"
 
 				modelName := "test-model"
-				retentionPeriod := utils.GetScaleToZeroRetentionPeriod(scaleToZeroConfigData, modelName)
+				retentionPeriod := utils.GetScaleToZeroRetentionPeriod(scaleToZeroConfigData, "", modelName)
 
 				if optimizedAlloc.NumReplicas == 0 {
 					if previousAlloc.LastUpdate.UpdateTime.IsZero() {
@@ -2489,7 +2489,7 @@ retentionPeriod: "not-a-duration"`,
 				newAlloc.LastUpdate.Reason = "Optimizer solution: cost and latency optimized allocation"
 
 				modelName := "test-model"
-				retentionPeriod := utils.GetScaleToZeroRetentionPeriod(scaleToZeroConfigData, modelName)
+				retentionPeriod := utils.GetScaleToZeroRetentionPeriod(scaleToZeroConfigData, "", modelName)
 
 				if optimizedAlloc.NumReplicas == 0 {
 					if !previousAlloc.LastUpdate.UpdateTime.IsZero() {

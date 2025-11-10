@@ -61,7 +61,7 @@ var _ = Describe("Optimizer", Ordered, func() {
 
 		acceleratorCm  map[string]map[string]string
 		serviceClassCm map[string]string
-		minNumReplicas = 1
+		minNumReplicas int32 = 1
 	)
 
 	Context("Testing optimization", func() {
@@ -272,7 +272,7 @@ var _ = Describe("Optimizer", Ordered, func() {
 				modelName := va.Spec.ModelID
 				Expect(modelName).NotTo(BeEmpty(), "variantAutoscaling missing modelName label, skipping optimization - ", "variantAutoscaling-name: ", va.Name)
 
-				_, className, err := utils.FindModelSLO(serviceClassCm, modelName)
+				_, className, err := utils.FindModelSLO(serviceClassCm, va.Namespace, modelName)
 				Expect(err).NotTo(HaveOccurred(), "failed to find model SLO for model - ", modelName, ", variantAutoscaling - ", va.Name)
 
 				// Single-variant architecture: add the variant profile to system data
@@ -374,7 +374,7 @@ var _ = Describe("Optimizer", Ordered, func() {
 				modelName := va.Spec.ModelID
 				Expect(modelName).NotTo(BeEmpty(), "variantAutoscaling missing modelName label, skipping optimization - ", "variantAutoscaling-name: ", va.Name)
 
-				_, className, err := utils.FindModelSLO(serviceClassCm, modelName)
+				_, className, err := utils.FindModelSLO(serviceClassCm, va.Namespace, modelName)
 				Expect(err).NotTo(HaveOccurred(), "failed to find model SLO for model - ", modelName, ", variantAutoscaling - ", va.Name)
 
 				// Single-variant architecture: add the variant profile to system data
@@ -393,8 +393,8 @@ var _ = Describe("Optimizer", Ordered, func() {
 				// Setup high load metrics for simulation
 				testNamespace := va.Namespace
 				arrivalQuery := testutils.CreateArrivalQuery(modelName, testNamespace)
-				avgDecToksQuery := testutils.CreateTokenQuery(modelName, testNamespace)
-				ttftQuery := testutils.CreateWaitQuery(modelName, testNamespace)
+				avgDecToksQuery := testutils.CreateDecToksQuery(modelName, testNamespace)
+				ttftQuery := testutils.CreateTTFTQuery(modelName, testNamespace)
 				itlQuery := testutils.CreateITLQuery(modelName, testNamespace)
 
 				// High load metrics that should trigger scaling up
