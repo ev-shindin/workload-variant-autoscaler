@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"strconv"
 	"time"
 
 	llmdVariantAutoscalingV1alpha1 "github.com/llm-d-incubation/workload-variant-autoscaler/api/v1alpha1"
@@ -216,63 +215,54 @@ func AddMetricsToOptStatus(ctx context.Context,
 	}
 	arrivalVal *= 60 // convert from req/sec to req/min
 
-	avgInputTokens, err := queryAndExtractMetric(ctx, promAPI, avgPromptToksQuery, "AvgInputTokens")
+	// In single-variant architecture, these metrics are collected but not stored in status
+	// They will be used directly by the controller/optimizer in PR2
+	_, err = queryAndExtractMetric(ctx, promAPI, avgPromptToksQuery, "AvgInputTokens")
 	if err != nil {
 		return llmdVariantAutoscalingV1alpha1.Allocation{}, err
 	}
 
-	avgOutputTokens, err := queryAndExtractMetric(ctx, promAPI, avgDecToksQuery, "AvgOutputTokens")
+	_, err = queryAndExtractMetric(ctx, promAPI, avgDecToksQuery, "AvgOutputTokens")
 	if err != nil {
 		return llmdVariantAutoscalingV1alpha1.Allocation{}, err
 	}
 
-	ttftAverageTime, err := queryAndExtractMetric(ctx, promAPI, ttftQuery, "TTFTAverageTime")
+	_, err = queryAndExtractMetric(ctx, promAPI, ttftQuery, "TTFTAverageTime")
 	if err != nil {
 		return llmdVariantAutoscalingV1alpha1.Allocation{}, err
 	}
-	ttftAverageTime *= 1000 // convert to msec
 
-	itlAverage, err := queryAndExtractMetric(ctx, promAPI, itlQuery, "ITLAverage")
+	_, err = queryAndExtractMetric(ctx, promAPI, itlQuery, "ITLAverage")
 	if err != nil {
 		return llmdVariantAutoscalingV1alpha1.Allocation{}, err
 	}
-	itlAverage *= 1000 // convert to msec
 
 	// --- 3. Collect K8s and Static Info ---
 
 	// number of replicas
 	numReplicas := int(*deployment.Spec.Replicas)
 
-	// accelerator type
-	acc := ""
+	// These are collected but not stored in status in single-variant architecture
+	// Accelerator, maxBatch, and cost are now in spec
+	// Metrics validation still needed to ensure Prometheus is working
+	_ = ""
 	if val, ok := opt.Labels["inference.optimization/acceleratorName"]; ok {
-		acc = val
+		_ = val
 	} else {
 		logger.Log.Warn("acceleratorName label not found on VariantAutoscaling object", "object-name", opt.Name)
 	}
 
-	// cost
-	discoveredCost := float64(*deployment.Spec.Replicas) * acceleratorCostVal
-
-	// max batch size
-	// TODO: collect value from server
-	maxBatch := 256
+	_ = float64(*deployment.Spec.Replicas) * acceleratorCostVal
+	_ = 256
 
 	// --- 4. Populate Allocation Status ---
 
 	// populate current alloc
+	// In single-variant architecture, only numReplicas is stored in status.
+	// Variant characteristics (accelerator, maxBatch, cost) are in spec.
+	// Load metrics, TTFT, ITL are collected but not stored in status.
 	currentAlloc := llmdVariantAutoscalingV1alpha1.Allocation{
-		Accelerator: acc,
-		NumReplicas: numReplicas,
-		MaxBatch:    maxBatch,
-		VariantCost: strconv.FormatFloat(float64(discoveredCost), 'f', 2, 32),
-		TTFTAverage: strconv.FormatFloat(float64(ttftAverageTime), 'f', 2, 32),
-		ITLAverage:  strconv.FormatFloat(float64(itlAverage), 'f', 2, 32),
-		Load: llmdVariantAutoscalingV1alpha1.LoadProfile{
-			ArrivalRate:     strconv.FormatFloat(float64(arrivalVal), 'f', 2, 32),
-			AvgInputTokens:  strconv.FormatFloat(float64(avgInputTokens), 'f', 2, 32),
-			AvgOutputTokens: strconv.FormatFloat(float64(avgOutputTokens), 'f', 2, 32),
-		},
+		NumReplicas: int32(numReplicas),
 	}
 	return currentAlloc, nil
 }

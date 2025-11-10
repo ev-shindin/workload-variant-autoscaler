@@ -240,11 +240,10 @@ func (r *VariantAutoscalingReconciler) prepareVariantAutoscalings(
 		}
 		logger.Log.Info("Found SLO for model - ", "model: ", modelName, ", class: ", className, ", slo-tpot: ", entry.SLOTPOT, ", slo-ttft: ", entry.SLOTTFT)
 
-		for _, modelAcceleratorProfile := range va.Spec.ModelProfile.Accelerators {
-			if utils.AddModelAcceleratorProfileToSystemData(systemData, modelName, &modelAcceleratorProfile) != nil {
-				logger.Log.Error("variantAutoscaling bad model accelerator profile data, skipping optimization - ", "variantAutoscaling-name: ", va.Name)
-				continue
-			}
+		// In single-variant architecture, each VA has only one accelerator
+		if utils.AddModelAcceleratorProfileToSystemData(systemData, modelName, va.Spec.Accelerator, va.Spec.AcceleratorCount, &va.Spec.VariantProfile) != nil {
+			logger.Log.Error("variantAutoscaling bad variant profile data, skipping optimization - ", "variantAutoscaling-name: ", va.Name)
+			continue
 		}
 
 		accName := va.Labels["inference.optimization/acceleratorName"]
@@ -370,13 +369,14 @@ func (r *VariantAutoscalingReconciler) applyOptimizedAllocations(
 		updateVa.Status.Conditions = va.Status.Conditions
 
 		// Set OptimizationReady condition to True on successful optimization
+		// In single-variant architecture, accelerator is in spec
 		llmdVariantAutoscalingV1alpha1.SetCondition(&updateVa,
 			llmdVariantAutoscalingV1alpha1.TypeOptimizationReady,
 			metav1.ConditionTrue,
 			llmdVariantAutoscalingV1alpha1.ReasonOptimizationSucceeded,
 			fmt.Sprintf("Optimization completed: %d replicas on %s",
 				updateVa.Status.DesiredOptimizedAlloc.NumReplicas,
-				updateVa.Status.DesiredOptimizedAlloc.Accelerator))
+				updateVa.Spec.Accelerator))
 
 		act := actuator.NewActuator(r.Client)
 

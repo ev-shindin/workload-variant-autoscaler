@@ -717,15 +717,13 @@ func LogVariantAutoscalingStatus(ctx context.Context, vaName, namespace string, 
 	if err != nil {
 		return err
 	}
-	fmt.Printf("Load Profile for VA: %s - Arrival Rate: %s, Avg Input Tokens: %s, Avg Output Tokens: %s\n",
+	// In single-variant architecture, load metrics are not stored in status
+	// Accelerator is defined in spec, not in status
+	fmt.Printf("VA: %s - Current Replicas: %d, Desired Replicas: %d, Accelerator: %s\n",
 		variantAutoscaling.Name,
-		variantAutoscaling.Status.CurrentAlloc.Load.ArrivalRate,
-		variantAutoscaling.Status.CurrentAlloc.Load.AvgInputTokens, variantAutoscaling.Status.CurrentAlloc.Load.AvgOutputTokens)
-
-	fmt.Printf("Desired Optimized Allocation for VA: %s - Replicas: %d, Accelerator: %s\n",
-		variantAutoscaling.Name,
+		variantAutoscaling.Status.CurrentAlloc.NumReplicas,
 		variantAutoscaling.Status.DesiredOptimizedAlloc.NumReplicas,
-		variantAutoscaling.Status.DesiredOptimizedAlloc.Accelerator)
+		variantAutoscaling.Spec.Accelerator)
 	return nil
 }
 
@@ -828,7 +826,47 @@ func CreateVllmeService(namespace, serviceName, appLabel string, nodePort int) *
 }
 
 // creates a VariantAutoscaling resource with owner reference to deployment
+// In single-variant architecture, creates a VA for the specified accelerator only
 func CreateVariantAutoscalingResource(namespace, resourceName, modelId, acc string) *v1alpha1.VariantAutoscaling {
+	// Select performance parameters based on accelerator
+	var perfParms v1alpha1.PerfParms
+	var maxBatchSize int
+	var variantCost string
+
+	switch acc {
+	case "A100":
+		perfParms = v1alpha1.PerfParms{
+			DecodeParms:  map[string]string{"alpha": "20.58", "beta": "0.41"},
+			PrefillParms: map[string]string{"gamma": "20.58", "delta": "0.041"},
+		}
+		maxBatchSize = 4
+		variantCost = "40.00"
+	case "MI300X":
+		perfParms = v1alpha1.PerfParms{
+			DecodeParms:  map[string]string{"alpha": "0.77", "beta": "0.15"},
+			PrefillParms: map[string]string{"gamma": "0.77", "delta": "0.15"},
+		}
+		maxBatchSize = 4
+		variantCost = "65.00"
+	case "G2":
+		perfParms = v1alpha1.PerfParms{
+			DecodeParms:  map[string]string{"alpha": "17.15", "beta": "0.34"},
+			PrefillParms: map[string]string{"gamma": "17.15", "delta": "0.34"},
+		}
+		maxBatchSize = 4
+		variantCost = "23.00"
+	default:
+		// Default performance parameters
+		perfParms = v1alpha1.PerfParms{
+			DecodeParms:  map[string]string{"alpha": "20.58", "beta": "0.41"},
+			PrefillParms: map[string]string{"gamma": "20.58", "delta": "0.041"},
+		}
+		maxBatchSize = 4
+		variantCost = "10.00"
+	}
+
+	variantID := modelId + "-" + acc + "-1"
+
 	return &v1alpha1.VariantAutoscaling{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      resourceName,
@@ -838,41 +876,23 @@ func CreateVariantAutoscalingResource(namespace, resourceName, modelId, acc stri
 			},
 		},
 		Spec: v1alpha1.VariantAutoscalingSpec{
-			ModelID: modelId,
+			ScaleTargetRef: v1alpha1.CrossVersionObjectReference{
+				APIVersion: "apps/v1",
+				Kind:       "Deployment",
+				Name:       resourceName,
+			},
+			ModelID:          modelId,
+			VariantID:        variantID,
+			Accelerator:      acc,
+			AcceleratorCount: 1,
+			VariantCost:      variantCost,
 			SLOClassRef: v1alpha1.ConfigMapKeyRef{
 				Name: "premium",
 				Key:  "slo",
 			},
-			ModelProfile: v1alpha1.ModelProfile{
-				Accelerators: []v1alpha1.AcceleratorProfile{
-					{
-						Acc:      "A100",
-						AccCount: 1,
-						PerfParms: v1alpha1.PerfParms{
-							DecodeParms:  map[string]string{"alpha": "20.58", "beta": "0.41"},
-							PrefillParms: map[string]string{"gamma": "20.58", "delta": "0.041"},
-						},
-						MaxBatchSize: 4,
-					},
-					{
-						Acc:      "MI300X",
-						AccCount: 1,
-						PerfParms: v1alpha1.PerfParms{
-							DecodeParms:  map[string]string{"alpha": "0.77", "beta": "0.15"},
-							PrefillParms: map[string]string{"gamma": "0.77", "delta": "0.15"},
-						},
-						MaxBatchSize: 4,
-					},
-					{
-						Acc:      "G2",
-						AccCount: 1,
-						PerfParms: v1alpha1.PerfParms{
-							DecodeParms:  map[string]string{"alpha": "17.15", "beta": "0.34"},
-							PrefillParms: map[string]string{"gamma": "17.15", "delta": "0.34"},
-						},
-						MaxBatchSize: 4,
-					},
-				},
+			VariantProfile: v1alpha1.VariantProfile{
+				PerfParms:    perfParms,
+				MaxBatchSize: maxBatchSize,
 			},
 		},
 	}
