@@ -475,7 +475,7 @@ func AddServerInfoToSystemData(
 
 	AllocationData := &infernoConfig.AllocationData{
 		Accelerator: va.Spec.Accelerator, // Use spec field (single-variant architecture)
-		NumReplicas: currentAlloc.NumReplicas,
+		NumReplicas: int(currentAlloc.NumReplicas),
 		MaxBatch:    va.Spec.VariantProfile.MaxBatchSize, // Use spec field (single-variant architecture)
 		Cost:        float32(cost),
 		ITLAverage:  metrics.ITLAverage,
@@ -535,10 +535,10 @@ func CreateOptimizedAlloc(name string,
 	// Note: VariantID and Accelerator are not included as they're in the parent VA spec
 	optimizedAlloc := &llmdVariantAutoscalingV1alpha1.OptimizedAlloc{
 		LastRunTime: metav1.NewTime(time.Now()),
-		NumReplicas: allocationData.NumReplicas,
+		NumReplicas: int32(allocationData.NumReplicas),
 		LastUpdate: llmdVariantAutoscalingV1alpha1.LastUpdateInfo{
 			UpdateTime:         metav1.NewTime(time.Now()),
-			NumReplicasChanged: allocationData.NumReplicas, // First allocation, delta = total
+			NumReplicasChanged: int32(allocationData.NumReplicas), // First allocation, delta = total
 			Reason:             "Optimizer solution: cost and latency optimized allocation",
 		},
 	}
