@@ -194,24 +194,26 @@ var _ = BeforeSuite(func() {
 	}
 
 	// Setup KEDA before the suite if not skipped and if not already installed
-	if !skipKEDAInstall {
-		By("checking if KEDA is installed already")
-		isKEDAAlreadyInstalled = utils.IsKEDAInstalled()
-		if !isKEDAAlreadyInstalled {
-			_, _ = fmt.Fprintf(GinkgoWriter, "Installing KEDA...\n")
-			Expect(utils.InstallKEDA()).To(Succeed(), "Failed to install KEDA")
-		} else {
-			_, _ = fmt.Fprintf(GinkgoWriter, "WARNING: KEDA is already installed. Skipping installation...\n")
-		}
-	}
+	// TODO: KEDA installation functions need to be implemented in test/utils
+	// if !skipKEDAInstall {
+	// 	By("checking if KEDA is installed already")
+	// 	isKEDAAlreadyInstalled = utils.IsKEDAInstalled()
+	// 	if !isKEDAAlreadyInstalled {
+	// 		_, _ = fmt.Fprintf(GinkgoWriter, "Installing KEDA...\n")
+	// 		Expect(utils.InstallKEDA()).To(Succeed(), "Failed to install KEDA")
+	// 	} else {
+	// 		_, _ = fmt.Fprintf(GinkgoWriter, "WARNING: KEDA is already installed. Skipping installation...\n")
+	// 	}
+	// }
 })
 
 var _ = AfterSuite(func() {
 	// Teardown KEDA after the suite if not skipped and if it was not already installed
-	if !skipKEDAInstall && !isKEDAAlreadyInstalled {
-		_, _ = fmt.Fprintf(GinkgoWriter, "Uninstalling KEDA...\n")
-		utils.UninstallKEDA()
-	}
+	// TODO: KEDA uninstall function needs to be implemented in test/utils
+	// if !skipKEDAInstall && !isKEDAAlreadyInstalled {
+	// 	_, _ = fmt.Fprintf(GinkgoWriter, "Uninstalling KEDA...\n")
+	// 	utils.UninstallKEDA()
+	// }
 
 	// Teardown CertManager after the suite if not skipped and if it was not already installed
 	if !skipCertManagerInstall && !isCertManagerAlreadyInstalled {
