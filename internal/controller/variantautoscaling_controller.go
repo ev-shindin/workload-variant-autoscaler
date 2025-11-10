@@ -321,7 +321,8 @@ func (r *VariantAutoscalingReconciler) prepareVariantAutoscalings(
 		}
 		updateVA.Status.CurrentAlloc = currentAllocation
 
-		if err := utils.AddServerInfoToSystemData(systemData, &updateVA, className); err != nil {
+		// Pass placeholder metrics (0) for now - will be collected from Prometheus in PR2
+		if err := utils.AddServerInfoToSystemData(systemData, &updateVA, className, 0, 0, 0, 0, 0); err != nil {
 			logger.Log.Info("variantAutoscaling bad deployment server data, skipping optimization - ", "variantAutoscaling-name: ", updateVA.Name)
 			continue
 		}

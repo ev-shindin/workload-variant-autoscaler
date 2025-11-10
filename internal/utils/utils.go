@@ -237,19 +237,17 @@ func AddModelAcceleratorProfileToSystemData(
 }
 
 // Add server specs to inferno system data
+// In single-variant architecture, load and performance metrics are passed as parameters
+// instead of being read from status (they will be collected from Prometheus in PR2)
 func AddServerInfoToSystemData(
 	sd *infernoConfig.SystemData,
 	va *llmdVariantAutoscalingV1alpha1.VariantAutoscaling,
-	className string) (err error) {
-
-	// In single-variant architecture:
-	// - Load metrics (arrivalRate, avgInputTokens, avgOutputTokens) are no longer stored in status
-	//   They should be collected from Prometheus (will be implemented in controller refactor PR)
-	// - For now, set to 0 as placeholders
-	var arrivalRate, avgOutputTokens, avgInputTokens float64
-	arrivalRate = 0
-	avgOutputTokens = 0
-	avgInputTokens = 0
+	className string,
+	arrivalRate float64,
+	avgInputTokens float64,
+	avgOutputTokens float64,
+	itlAverage float64,
+	ttftAverage float64) (err error) {
 
 	serverLoadSpec := &infernoConfig.ServerLoadSpec{
 		ArrivalRate:  float32(arrivalRate),
@@ -263,12 +261,6 @@ func AddServerInfoToSystemData(
 	if cost, err = strconv.ParseFloat(va.Spec.VariantCost, 32); err != nil || !CheckValue(cost) {
 		cost = 10.0 // default cost
 	}
-
-	// ITL and TTFT averages are no longer stored in status
-	// They should be collected from Prometheus (will be implemented in controller refactor PR)
-	var itlAverage, ttftAverage float64
-	itlAverage = 0
-	ttftAverage = 0
 
 	AllocationData := &infernoConfig.AllocationData{
 		Accelerator: va.Spec.Accelerator,
