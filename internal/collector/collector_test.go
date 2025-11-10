@@ -305,15 +305,9 @@ var _ = Describe("Collector", func() {
 			allocation, err := AddMetricsToOptStatus(ctx, &va, deployment, accCost, mockProm)
 
 			Expect(err).NotTo(HaveOccurred())
-			Expect(allocation.Accelerator).To(Equal("A100"))
-			Expect(allocation.NumReplicas).To(Equal(2))
-			Expect(allocation.MaxBatch).To(Equal(256))
-			Expect(allocation.VariantCost).To(Equal("80.00"))           // 2 replicas * 40.0 acc cost
-			Expect(allocation.TTFTAverage).To(Equal("500.00"))          // 0.5 * 1000 ms
-			Expect(allocation.ITLAverage).To(Equal("50.00"))            // 0.05 * 1000 ms
-			Expect(allocation.Load.ArrivalRate).To(Equal("10.50"))      // req per min
-			Expect(allocation.Load.AvgInputTokens).To(Equal("100.00"))  // input tokens per req
-			Expect(allocation.Load.AvgOutputTokens).To(Equal("150.00")) // output tokens per req
+			// In the new API, Allocation only has NumReplicas
+			Expect(allocation.NumReplicas).To(Equal(int32(2)))
+			// All other fields (accelerator, maxBatch, cost, TTFT, ITL, load) are now in Spec or removed
 		})
 
 		It("should handle missing accelerator label", func() {
@@ -322,19 +316,32 @@ var _ = Describe("Collector", func() {
 
 			// Setup minimal mock responses
 			arrivalQuery := utils.CreateArrivalQuery(modelID, testNamespace)
-			tokenQuery := utils.CreateDecToksQuery(modelID, testNamespace)
+			avgPromptToksQuery := utils.CreatePromptToksQuery(modelID, testNamespace)
+			avgDecToksQuery := utils.CreateDecToksQuery(modelID, testNamespace)
+			ttftQuery := utils.CreateTTFTQuery(modelID, testNamespace)
+			itlQuery := utils.CreateITLQuery(modelID, testNamespace)
 
 			mockProm.QueryResults[arrivalQuery] = model.Vector{
 				&model.Sample{Value: model.SampleValue(5.0)},
 			}
-			mockProm.QueryResults[tokenQuery] = model.Vector{
+			mockProm.QueryResults[avgPromptToksQuery] = model.Vector{
 				&model.Sample{Value: model.SampleValue(100.0)},
+			}
+			mockProm.QueryResults[avgDecToksQuery] = model.Vector{
+				&model.Sample{Value: model.SampleValue(100.0)},
+			}
+			mockProm.QueryResults[ttftQuery] = model.Vector{
+				&model.Sample{Value: model.SampleValue(0.5)},
+			}
+			mockProm.QueryResults[itlQuery] = model.Vector{
+				&model.Sample{Value: model.SampleValue(0.05)},
 			}
 
 			allocation, err := AddMetricsToOptStatus(ctx, &va, deployment, accCost, mockProm)
 
 			Expect(err).NotTo(HaveOccurred())
-			Expect(allocation.Accelerator).To(Equal("")) // Empty due to deleted accName label
+			// In the new API, Allocation only has NumReplicas - accelerator is in Spec
+			Expect(allocation.NumReplicas).To(Equal(int32(2)))
 		})
 
 		It("should handle Prometheus Query errors", func() {
@@ -352,20 +359,24 @@ var _ = Describe("Collector", func() {
 		It("should handle empty metric results gracefully", func() {
 			// Setup empty responses (no data points)
 			arrivalQuery := utils.CreateArrivalQuery(modelID, testNamespace)
-			tokenQuery := utils.CreateDecToksQuery(modelID, testNamespace)
+			avgPromptToksQuery := utils.CreatePromptToksQuery(modelID, testNamespace)
+			avgDecToksQuery := utils.CreateDecToksQuery(modelID, testNamespace)
+			ttftQuery := utils.CreateTTFTQuery(modelID, testNamespace)
+			itlQuery := utils.CreateITLQuery(modelID, testNamespace)
 
 			// Empty vectors (no data)
 			mockProm.QueryResults[arrivalQuery] = model.Vector{}
-			mockProm.QueryResults[tokenQuery] = model.Vector{}
+			mockProm.QueryResults[avgPromptToksQuery] = model.Vector{}
+			mockProm.QueryResults[avgDecToksQuery] = model.Vector{}
+			mockProm.QueryResults[ttftQuery] = model.Vector{}
+			mockProm.QueryResults[itlQuery] = model.Vector{}
 
 			allocation, err := AddMetricsToOptStatus(ctx, &va, deployment, accCost, mockProm)
 
 			Expect(err).NotTo(HaveOccurred())
-			Expect(allocation.ITLAverage).To(Equal("0.00"))
-			Expect(allocation.TTFTAverage).To(Equal("0.00"))
-			Expect(allocation.Load.ArrivalRate).To(Equal("0.00"))
-			Expect(allocation.Load.AvgInputTokens).To(Equal("0.00"))
-			Expect(allocation.Load.AvgOutputTokens).To(Equal("0.00"))
+			// In the new API, Allocation only has NumReplicas
+			// Metrics being empty should still return a valid allocation
+			Expect(allocation.NumReplicas).To(Equal(int32(2)))
 		})
 	})
 

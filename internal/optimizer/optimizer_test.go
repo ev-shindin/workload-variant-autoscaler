@@ -188,19 +188,21 @@ var _ = Describe("Optimizer", Ordered, func() {
 						},
 					},
 					Spec: llmdVariantAutoscalingV1alpha1.VariantAutoscalingSpec{
-						ModelID: "meta/llama0-70b",
-						ModelProfile: llmdVariantAutoscalingV1alpha1.ModelProfile{
-							Accelerators: []llmdVariantAutoscalingV1alpha1.AcceleratorProfile{
-								{
-									Acc:      "A100",
-									AccCount: 1,
-									PerfParms: llmdVariantAutoscalingV1alpha1.PerfParms{
-										DecodeParms:  map[string]string{"alpha": "20.28", "beta": "0.72"},
-										PrefillParms: map[string]string{"gamma": "0", "delta": "0"},
-									},
-									MaxBatchSize: 4,
-								},
+						ScaleTargetRef: llmdVariantAutoscalingV1alpha1.CrossVersionObjectReference{
+							APIVersion: "apps/v1",
+							Kind:       "Deployment",
+							Name:       fmt.Sprintf("test-variantautoscaling-%d", i),
+						},
+						ModelID:   "meta/llama0-70b",
+						VariantID: fmt.Sprintf("variant-%d", i),
+						Accelerator: "A100",
+						AcceleratorCount: 1,
+						VariantProfile: llmdVariantAutoscalingV1alpha1.VariantProfile{
+							PerfParms: llmdVariantAutoscalingV1alpha1.PerfParms{
+								DecodeParms:  map[string]string{"alpha": "20.28", "beta": "0.72"},
+								PrefillParms: map[string]string{"gamma": "0", "delta": "0"},
 							},
+							MaxBatchSize: 4,
 						},
 						SLOClassRef: llmdVariantAutoscalingV1alpha1.ConfigMapKeyRef{
 							Name: "premium",
@@ -273,10 +275,9 @@ var _ = Describe("Optimizer", Ordered, func() {
 				_, className, err := utils.FindModelSLO(serviceClassCm, modelName)
 				Expect(err).NotTo(HaveOccurred(), "failed to find model SLO for model - ", modelName, ", variantAutoscaling - ", va.Name)
 
-				for _, modelAcceleratorProfile := range va.Spec.ModelProfile.Accelerators {
-					err = utils.AddModelAcceleratorProfileToSystemData(systemData, modelName, &modelAcceleratorProfile)
-					Expect(err).NotTo(HaveOccurred(), "failed to add model accelerator profile to system data for model - ", modelName, ", variantAutoscaling - ", va.Name)
-				}
+				// Add single accelerator profile to system data
+				err = utils.AddModelAcceleratorProfileToSystemData(systemData, modelName, va.Spec.Accelerator, va.Spec.AcceleratorCount, &va.Spec.VariantProfile)
+				Expect(err).NotTo(HaveOccurred(), "failed to add model accelerator profile to system data for model - ", modelName, ", variantAutoscaling - ", va.Name)
 
 				accName := va.Labels["inference.optimization/acceleratorName"]
 				Expect(accName).NotTo(BeEmpty(), "variantAutoscaling missing acceleratorName label, skipping optimization - ", "variantAutoscaling-name: ", va.Name)
@@ -371,10 +372,9 @@ var _ = Describe("Optimizer", Ordered, func() {
 				_, className, err := utils.FindModelSLO(serviceClassCm, modelName)
 				Expect(err).NotTo(HaveOccurred(), "failed to find model SLO for model - ", modelName, ", variantAutoscaling - ", va.Name)
 
-				for _, modelAcceleratorProfile := range va.Spec.ModelProfile.Accelerators {
-					err = utils.AddModelAcceleratorProfileToSystemData(systemData, modelName, &modelAcceleratorProfile)
-					Expect(err).NotTo(HaveOccurred(), "failed to add model accelerator profile to system data for model - ", modelName, ", variantAutoscaling - ", va.Name)
-				}
+				// Add single accelerator profile to system data
+				err = utils.AddModelAcceleratorProfileToSystemData(systemData, modelName, va.Spec.Accelerator, va.Spec.AcceleratorCount, &va.Spec.VariantProfile)
+				Expect(err).NotTo(HaveOccurred(), "failed to add model accelerator profile to system data for model - ", modelName, ", variantAutoscaling - ", va.Name)
 
 				accName := va.Labels["inference.optimization/acceleratorName"]
 				Expect(accName).NotTo(BeEmpty(), "variantAutoscaling missing acceleratorName label, skipping optimization - ", "variantAutoscaling-name: ", va.Name)
