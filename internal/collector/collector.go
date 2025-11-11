@@ -209,14 +209,13 @@ func AddMetricsToOptStatus(ctx context.Context,
 
 	// --- 2. Execute Queries ---
 
-	arrivalVal, err := queryAndExtractMetric(ctx, promAPI, arrivalQuery, "ArrivalRate")
+	// In single-variant architecture, these metrics are collected but not stored in status
+	// They will be used directly by the controller/optimizer in PR2
+	_, err := queryAndExtractMetric(ctx, promAPI, arrivalQuery, "ArrivalRate")
 	if err != nil {
 		return llmdVariantAutoscalingV1alpha1.Allocation{}, err
 	}
-	arrivalVal *= 60 // convert from req/sec to req/min
 
-	// In single-variant architecture, these metrics are collected but not stored in status
-	// They will be used directly by the controller/optimizer in PR2
 	_, err = queryAndExtractMetric(ctx, promAPI, avgPromptToksQuery, "AvgInputTokens")
 	if err != nil {
 		return llmdVariantAutoscalingV1alpha1.Allocation{}, err

@@ -44,7 +44,6 @@ func getProjectImage() string {
 var (
 	// Optional Environment Variables:
 	// - CERT_MANAGER_INSTALL_SKIP=true: Skips CertManager installation during test setup.
-	// - KEDA_INSTALL_SKIP=true: Skips KEDA installation during test setup.
 	// - SKIP_KIND_DEPLOY=true: Skips KIND cluster creation and deployment. Useful when running
 	//   in CI/CD where the cluster is already created and controller is already deployed.
 	// - SKIP_DOCKER_BUILD=true: Skips building the controller Docker image. Useful when using
@@ -54,13 +53,13 @@ var (
 	// These variables are useful if CertManager/KEDA is already installed, avoiding
 	// re-installation and conflicts.
 	skipCertManagerInstall = os.Getenv("CERT_MANAGER_INSTALL_SKIP") == "true"
-	skipKEDAInstall        = os.Getenv("KEDA_INSTALL_SKIP") == "true"
 	skipKindDeploy         = os.Getenv("SKIP_KIND_DEPLOY") == "true"
 	skipDockerBuild        = os.Getenv("SKIP_DOCKER_BUILD") == "true"
 	// isCertManagerAlreadyInstalled will be set true when CertManager CRDs be found on the cluster
 	isCertManagerAlreadyInstalled = false
-	// isKEDAAlreadyInstalled will be set true when KEDA CRDs be found on the cluster
-	isKEDAAlreadyInstalled = false
+	// KEDA variables removed - KEDA installation functions not yet implemented in test/utils
+	// skipKEDAInstall        = os.Getenv("KEDA_INSTALL_SKIP") == "true"
+	// isKEDAAlreadyInstalled = false
 
 	// projectImage is the name of the image which will be build and loaded
 	// with the code source changes to be tested.
