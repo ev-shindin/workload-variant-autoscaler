@@ -387,14 +387,14 @@ retentionPeriod: "4m"`, modelID)
 
 		By("verifying deployment maintains >= 1 replica during retention period after bootstrap")
 		// After VA recreation, controller enters bootstrap mode and retention period should apply
-		_, _ = fmt.Fprintf(GinkgoWriter, "Monitoring for %d seconds (retention period after bootstrap)...\n", retentionSeconds)
+		_, _ = fmt.Fprintf(GinkgoWriter, "Monitoring for %d seconds (remaining retention period after 90s controller init)...\n", retentionSeconds-90)
 		Consistently(func(g Gomega) {
 			deploy, err := k8sClient.AppsV1().Deployments(llmDNamespace).Get(ctx, deployment, metav1.GetOptions{})
 			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(deploy.Status.Replicas).To(BeNumerically(">=", 1),
 				"Deployment should maintain >= 1 replica during retention period after VA recreation/bootstrap")
 			_, _ = fmt.Fprintf(GinkgoWriter, "Retention period active (bootstrap): %d replicas\n", deploy.Status.Replicas)
-		}, time.Duration(retentionSeconds)*time.Second, 15*time.Second).Should(Succeed())
+		}, time.Duration(retentionSeconds-90)*time.Second, 15*time.Second).Should(Succeed())
 
 		By("verifying deployment scales to 0 after retention period expires")
 		_, _ = fmt.Fprintf(GinkgoWriter, "Waiting for scale-to-zero after retention period...\n")
