@@ -258,17 +258,23 @@ func (r *VariantAutoscalingReconciler) prepareVariantAutoscalings(
 			continue
 		}
 
+		// Get the Deployment using ScaleTargetRef
+		if va.Spec.ScaleTargetRef.Name == "" {
+			logger.Log.Error("variantAutoscaling missing ScaleTargetRef.Name, skipping optimization - ", "variantAutoscaling-name: ", va.Name)
+			continue
+		}
+
 		var deploy appsv1.Deployment
-		err = utils.GetDeploymentWithBackoff(ctx, r.Client, va.Name, va.Namespace, &deploy)
+		err = utils.GetDeploymentWithBackoff(ctx, r.Client, va.Spec.ScaleTargetRef.Name, va.Namespace, &deploy)
 		if err != nil {
-			logger.Log.Error(err, "failed to get Deployment after retries - ", "variantAutoscaling-name: ", va.Name)
+			logger.Log.Error(err, "failed to get Deployment after retries - ", "variantAutoscaling-name: ", va.Name, ", scaleTargetRef: ", va.Spec.ScaleTargetRef.Name)
 			continue
 		}
 
 		var updateVA llmdVariantAutoscalingV1alpha1.VariantAutoscaling
-		err = utils.GetVariantAutoscalingWithBackoff(ctx, r.Client, deploy.Name, deploy.Namespace, &updateVA)
+		err = utils.GetVariantAutoscalingWithBackoff(ctx, r.Client, va.Name, va.Namespace, &updateVA)
 		if err != nil {
-			logger.Log.Error(err, "unable to get variantAutoscaling for deployment - ", "deployment-name: ", deploy.Name, ", namespace: ", deploy.Namespace)
+			logger.Log.Error(err, "unable to get variantAutoscaling - ", "variantAutoscaling-name: ", va.Name, ", namespace: ", va.Namespace)
 			continue
 		}
 
