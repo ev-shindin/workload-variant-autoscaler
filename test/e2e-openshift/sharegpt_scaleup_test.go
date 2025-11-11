@@ -134,7 +134,8 @@ var _ = Describe("ShareGPT Scale-Up Test", Ordered, func() {
 			g.Expect(err).NotTo(HaveOccurred(), "Should be able to get VariantAutoscaling")
 
 			scaledOptimized = int32(va.Status.DesiredOptimizedAlloc.NumReplicas)
-			// In single-variant architecture, load metrics are collected from Prometheus, not stored in status
+			// TODO(PR2): Re-enable load arrival rate logging once load metrics are collected from Prometheus
+			// currentRateStr := va.Status.CurrentAlloc.Load.ArrivalRate
 			_, _ = fmt.Fprintf(GinkgoWriter, "Current optimized replicas: %d (initial: %d)\n",
 				scaledOptimized, initialOptimized)
 
