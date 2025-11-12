@@ -182,7 +182,7 @@ var _ = Describe("Test workload-variant-autoscaler with vllme deployment - singl
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to create Deployment: %s", deployName))
 
 		By("creating vllme service")
-		service := utils.CreateVllmeService(namespace, serviceName, appLabel, 30000)
+		service := utils.CreateVllmeService(namespace, serviceName, appLabel, 30002)
 		_, err = k8sClient.CoreV1().Services(namespace).Create(ctx, service, metav1.CreateOptions{})
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to create Service: %s", serviceName))
 
