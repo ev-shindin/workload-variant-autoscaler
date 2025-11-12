@@ -145,7 +145,6 @@ var _ = Describe("Test workload-variant-autoscaler with vllme deployment - singl
 		deployName     string
 		serviceName    string
 		serviceMonName string
-		inferenceModel *unstructured.Unstructured
 		appLabel       string
 		loadGenCmd     *exec.Cmd
 		portForwardCmd *exec.Cmd
@@ -195,11 +194,6 @@ var _ = Describe("Test workload-variant-autoscaler with vllme deployment - singl
 		variantAutoscaling := utils.CreateVariantAutoscalingResource(namespace, deployName, modelName, a100Acc)
 		err = crClient.Create(ctx, variantAutoscaling)
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to create VariantAutoscaling for: %s", deployName))
-
-		By("adding an InferenceModel for the deployment")
-		inferenceModel = utils.CreateInferenceModel(deployName, namespace, modelName)
-		err = crClient.Create(ctx, inferenceModel)
-		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to create InferenceModel: %s", modelName))
 
 		logf.SetLogger(zap.New(zap.WriteTo(GinkgoWriter), zap.UseDevMode(true)))
 	})
@@ -687,13 +681,6 @@ var _ = Describe("Test workload-variant-autoscaler with vllme deployment - singl
 		err = client.IgnoreNotFound(err)
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to delete Deployment: %s", deployName))
 
-		By("deleting InferenceModel")
-		if inferenceModel != nil {
-			err = crClient.Delete(ctx, inferenceModel)
-			err = client.IgnoreNotFound(err)
-			Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to delete InferenceModel: %s", modelName))
-		}
-
 		By("waiting for all pods to be deleted")
 		Eventually(func(g Gomega) {
 			podList, err := k8sClient.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{LabelSelector: "app=" + appLabel})
@@ -718,8 +705,6 @@ var _ = Describe("Test workload-variant-autoscaler with vllme deployment - multi
 		secondServiceMonitorName string
 		firstModelName           string
 		secondModelName          string
-		firstInferenceModel      *unstructured.Unstructured
-		secondInferenceModel     *unstructured.Unstructured
 
 		ctx context.Context
 	)
@@ -767,11 +752,6 @@ var _ = Describe("Test workload-variant-autoscaler with vllme deployment - multi
 		err = crClient.Create(ctx, variantAutoscaling)
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to create first VariantAutoscaling for: %s", firstDeployName))
 
-		By("adding an InferenceModel for the first deployment")
-		firstInferenceModel = utils.CreateInferenceModel(firstDeployName, namespace, firstModelName)
-		err = crClient.Create(ctx, firstInferenceModel)
-		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to create first InferenceModel: %s", firstModelName))
-
 		By("creating resources for the second deployment")
 		secondDeployment := utils.CreateVllmeDeployment(namespace, secondDeployName, secondModelName, secondAppLabel)
 		_, err = k8sClient.AppsV1().Deployments(namespace).Create(ctx, secondDeployment, metav1.CreateOptions{})
@@ -788,11 +768,6 @@ var _ = Describe("Test workload-variant-autoscaler with vllme deployment - multi
 		secondServiceMonitor := utils.CreateVllmeServiceMonitor(secondServiceMonitorName, controllerMonitoringNamespace, secondAppLabel)
 		err = crClient.Create(ctx, secondServiceMonitor)
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to create second ServiceMonitor: %s", secondServiceMonitorName))
-
-		By("adding an InferenceModel for the second deployment")
-		secondInferenceModel = utils.CreateInferenceModel(secondDeployName, namespace, secondModelName)
-		err = crClient.Create(ctx, secondInferenceModel)
-		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to create second InferenceModel: %s", secondModelName))
 
 		logf.SetLogger(zap.New(zap.WriteTo(GinkgoWriter), zap.UseDevMode(true)))
 	})
@@ -1173,12 +1148,6 @@ var _ = Describe("Test workload-variant-autoscaler with vllme deployment - multi
 		err = client.IgnoreNotFound(err)
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to delete Deployment: %s", firstDeployName))
 
-		if firstInferenceModel != nil {
-			err = crClient.Delete(ctx, firstInferenceModel)
-			err = client.IgnoreNotFound(err)
-			Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to delete InferenceModel: %s", firstModelName))
-		}
-
 		Eventually(func(g Gomega) {
 			podList, err := k8sClient.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{LabelSelector: "app=" + firstAppLabel})
 			if err != nil {
@@ -1217,12 +1186,6 @@ var _ = Describe("Test workload-variant-autoscaler with vllme deployment - multi
 		err = k8sClient.AppsV1().Deployments(namespace).Delete(ctx, secondDeployName, metav1.DeleteOptions{})
 		err = client.IgnoreNotFound(err)
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to delete Deployment: %s", secondDeployName))
-
-		if secondInferenceModel != nil {
-			err = crClient.Delete(ctx, secondInferenceModel)
-			err = client.IgnoreNotFound(err)
-			Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to delete InferenceModel: %s", secondModelName))
-		}
 
 		Eventually(func(g Gomega) {
 			podList, err := k8sClient.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{LabelSelector: "app=" + secondAppLabel})
