@@ -74,6 +74,25 @@ func queryAndExtractMetric(ctx context.Context, promAPI promv1.API, query string
 	return resultVal, nil
 }
 
+// queryWithFallback tries a query with namespace label first, then falls back to without namespace
+// This supports both real vLLM deployments (with namespace) and vllm-emulator (without namespace)
+func queryWithFallback(ctx context.Context, promAPI promv1.API, queryWithNS, queryWithoutNS, metricName string) (float64, error) {
+	// Try with namespace first
+	result, err := queryAndExtractMetric(ctx, promAPI, queryWithNS, metricName)
+	if err != nil {
+		return 0.0, err
+	}
+
+	// If result is non-zero, return it
+	if result != 0.0 {
+		return result, nil
+	}
+
+	// Otherwise try fallback query without namespace (for vllm-emulator compatibility)
+	logger.Log.Debug("Primary query returned zero, trying fallback without namespace", "metric", metricName)
+	return queryAndExtractMetric(ctx, promAPI, queryWithoutNS, metricName)
+}
+
 // MetricsValidationResult contains the result of metrics availability check
 type MetricsValidationResult struct {
 	Available bool
@@ -163,13 +182,16 @@ func AddMetricsToOptStatus(ctx context.Context,
 	deployNamespace := deployment.Namespace
 	modelName := opt.Spec.ModelID
 
-	// --- 1. Define Queries ---
+	// --- 1. Define Queries (with and without namespace for fallback) ---
 
 	// Metric 1: Arrival rate (requests per minute)
 	arrivalQuery := fmt.Sprintf(`sum(rate(%s{%s="%s",%s="%s"}[1m]))`,
 		constants.VLLMRequestSuccessTotal,
 		constants.LabelModelName, modelName,
 		constants.LabelNamespace, deployNamespace)
+	arrivalQueryFallback := fmt.Sprintf(`sum(rate(%s{%s="%s"}[1m]))`,
+		constants.VLLMRequestSuccessTotal,
+		constants.LabelModelName, modelName)
 
 	// Metric 2: Average prompt length (Input Tokens)
 	avgPromptToksQuery := fmt.Sprintf(`sum(rate(%s{%s="%s",%s="%s"}[1m]))/sum(rate(%s{%s="%s",%s="%s"}[1m]))`,
@@ -179,6 +201,11 @@ func AddMetricsToOptStatus(ctx context.Context,
 		constants.VLLMRequestPromptTokensCount,
 		constants.LabelModelName, modelName,
 		constants.LabelNamespace, deployNamespace)
+	avgPromptToksQueryFallback := fmt.Sprintf(`sum(rate(%s{%s="%s"}[1m]))/sum(rate(%s{%s="%s"}[1m]))`,
+		constants.VLLMRequestPromptTokensSum,
+		constants.LabelModelName, modelName,
+		constants.VLLMRequestPromptTokensCount,
+		constants.LabelModelName, modelName)
 
 	// Metric 3: Average decode length (Output Tokens)
 	avgDecToksQuery := fmt.Sprintf(`sum(rate(%s{%s="%s",%s="%s"}[1m]))/sum(rate(%s{%s="%s",%s="%s"}[1m]))`,
@@ -188,6 +215,11 @@ func AddMetricsToOptStatus(ctx context.Context,
 		constants.VLLMRequestGenerationTokensCount,
 		constants.LabelModelName, modelName,
 		constants.LabelNamespace, deployNamespace)
+	avgDecToksQueryFallback := fmt.Sprintf(`sum(rate(%s{%s="%s"}[1m]))/sum(rate(%s{%s="%s"}[1m]))`,
+		constants.VLLMRequestGenerationTokensSum,
+		constants.LabelModelName, modelName,
+		constants.VLLMRequestGenerationTokensCount,
+		constants.LabelModelName, modelName)
 
 	// Metric 4: Average TTFT (Time to First Token) ms
 	ttftQuery := fmt.Sprintf(`sum(rate(%s{%s="%s",%s="%s"}[1m]))/sum(rate(%s{%s="%s",%s="%s"}[1m]))`,
@@ -197,6 +229,11 @@ func AddMetricsToOptStatus(ctx context.Context,
 		constants.VLLMTimeToFirstTokenSecondsCount,
 		constants.LabelModelName, modelName,
 		constants.LabelNamespace, deployNamespace)
+	ttftQueryFallback := fmt.Sprintf(`sum(rate(%s{%s="%s"}[1m]))/sum(rate(%s{%s="%s"}[1m]))`,
+		constants.VLLMTimeToFirstTokenSecondsSum,
+		constants.LabelModelName, modelName,
+		constants.VLLMTimeToFirstTokenSecondsCount,
+		constants.LabelModelName, modelName)
 
 	// Metric 5: Average ITL (Inter-Token Latency) ms
 	itlQuery := fmt.Sprintf(`sum(rate(%s{%s="%s",%s="%s"}[1m]))/sum(rate(%s{%s="%s",%s="%s"}[1m]))`,
@@ -206,32 +243,37 @@ func AddMetricsToOptStatus(ctx context.Context,
 		constants.VLLMTimePerOutputTokenSecondsCount,
 		constants.LabelModelName, modelName,
 		constants.LabelNamespace, deployNamespace)
+	itlQueryFallback := fmt.Sprintf(`sum(rate(%s{%s="%s"}[1m]))/sum(rate(%s{%s="%s"}[1m]))`,
+		constants.VLLMTimePerOutputTokenSecondsSum,
+		constants.LabelModelName, modelName,
+		constants.VLLMTimePerOutputTokenSecondsCount,
+		constants.LabelModelName, modelName)
 
-	// --- 2. Execute Queries ---
+	// --- 2. Execute Queries with fallback ---
 
 	// In single-variant architecture, these metrics are collected but not stored in status
 	// They will be used directly by the controller/optimizer in PR2
-	_, err := queryAndExtractMetric(ctx, promAPI, arrivalQuery, "ArrivalRate")
+	_, err := queryWithFallback(ctx, promAPI, arrivalQuery, arrivalQueryFallback, "ArrivalRate")
 	if err != nil {
 		return llmdVariantAutoscalingV1alpha1.Allocation{}, err
 	}
 
-	_, err = queryAndExtractMetric(ctx, promAPI, avgPromptToksQuery, "AvgInputTokens")
+	_, err = queryWithFallback(ctx, promAPI, avgPromptToksQuery, avgPromptToksQueryFallback, "AvgInputTokens")
 	if err != nil {
 		return llmdVariantAutoscalingV1alpha1.Allocation{}, err
 	}
 
-	_, err = queryAndExtractMetric(ctx, promAPI, avgDecToksQuery, "AvgOutputTokens")
+	_, err = queryWithFallback(ctx, promAPI, avgDecToksQuery, avgDecToksQueryFallback, "AvgOutputTokens")
 	if err != nil {
 		return llmdVariantAutoscalingV1alpha1.Allocation{}, err
 	}
 
-	_, err = queryAndExtractMetric(ctx, promAPI, ttftQuery, "TTFTAverageTime")
+	_, err = queryWithFallback(ctx, promAPI, ttftQuery, ttftQueryFallback, "TTFTAverageTime")
 	if err != nil {
 		return llmdVariantAutoscalingV1alpha1.Allocation{}, err
 	}
 
-	_, err = queryAndExtractMetric(ctx, promAPI, itlQuery, "ITLAverage")
+	_, err = queryWithFallback(ctx, promAPI, itlQuery, itlQueryFallback, "ITLAverage")
 	if err != nil {
 		return llmdVariantAutoscalingV1alpha1.Allocation{}, err
 	}
