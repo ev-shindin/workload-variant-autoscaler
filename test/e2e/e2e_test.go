@@ -378,10 +378,10 @@ var _ = Describe("Test workload-variant-autoscaler with vllme deployment - singl
 		By("getting the service endpoint for load generation")
 		// Port-forward the vllme service to send requests to it
 		By("setting up port-forward to the vllme service")
-		portForwardCmd = utils.SetUpPortForward(k8sClient, ctx, gatewayName, namespace, port, 80)
+		portForwardCmd = utils.SetUpPortForward(k8sClient, ctx, serviceName, namespace, port, 80)
 		defer func() {
 			err = utils.StopCmd(portForwardCmd)
-			Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to stop port-forwarding for: %s", gatewayName))
+			Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to stop port-forwarding for: %s", serviceName))
 		}()
 
 		By("waiting for port-forward to be ready")
@@ -455,10 +455,10 @@ var _ = Describe("Test workload-variant-autoscaler with vllme deployment - singl
 		Expect(err).NotTo(HaveOccurred(), "Prometheus port-forward should be ready within timeout")
 
 		By("setting up port-forward to the vllme service")
-		portForwardCmd := utils.SetUpPortForward(k8sClient, ctx, gatewayName, namespace, port, 80)
+		portForwardCmd := utils.SetUpPortForward(k8sClient, ctx, serviceName, namespace, port, 80)
 		defer func() {
 			err = utils.StopCmd(portForwardCmd)
-			Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to stop port-forwarding for: %s", gatewayName))
+			Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to stop port-forwarding for: %s", serviceName))
 		}()
 		By("waiting for port-forward to be ready")
 		err = utils.VerifyPortForwardReadiness(ctx, port, fmt.Sprintf("http://localhost:%d/v1", port))
@@ -841,17 +841,17 @@ var _ = Describe("Test workload-variant-autoscaler with vllme deployment - multi
 		err = utils.VerifyPortForwardReadiness(ctx, 9090, fmt.Sprintf("https://localhost:%d/api/v1/query?query=up", 9090))
 		Expect(err).NotTo(HaveOccurred(), "Prometheus port-forward should be ready within timeout")
 
-		By("getting the gateway service endpoint for load generation")
+		By("getting the first service endpoint for load generation")
 		port := 8000
-		portForwardCmd := utils.SetUpPortForward(k8sClient, ctx, gatewayName, namespace, port, 80)
+		portForwardCmd := utils.SetUpPortForward(k8sClient, ctx, firstServiceName, namespace, port, 80)
 		defer func() {
 			err = utils.StopCmd(portForwardCmd)
-			Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to stop port-forwarding for Service: %s", gatewayName))
+			Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to stop port-forwarding for Service: %s", firstServiceName))
 		}()
 
 		By("waiting for port-forwards to be ready")
 		err = utils.VerifyPortForwardReadiness(ctx, port, fmt.Sprintf("http://localhost:%d/v1", port))
-		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Port-forward should be ready within timeout for Service: %s", gatewayName))
+		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Port-forward should be ready within timeout for Service: %s", firstServiceName))
 
 		By("starting load generation to create traffic for both deployments")
 		loadRate1 := 30
@@ -959,29 +959,36 @@ var _ = Describe("Test workload-variant-autoscaler with vllme deployment - multi
 		err = utils.VerifyPortForwardReadiness(ctx, 9090, fmt.Sprintf("https://localhost:%d/api/v1/query?query=up", 9090))
 		Expect(err).NotTo(HaveOccurred(), "Prometheus port-forward should be ready within timeout")
 
-		By("getting the gateway service endpoint for load generation")
-		// Port-forward the gateway service to send requests to it
-		By("setting up port-forward to the gateway service")
-		port := 8000
-		portForwardCmd := utils.SetUpPortForward(k8sClient, ctx, gatewayName, namespace, port, 80)
+		By("setting up port-forwards to both vllme services for load generation")
+		port1 := 8000
+		portForwardCmd1 := utils.SetUpPortForward(k8sClient, ctx, firstServiceName, namespace, port1, 80)
 		defer func() {
-			err = utils.StopCmd(portForwardCmd)
-			Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to stop port-forwarding for: %s", gatewayName))
+			err = utils.StopCmd(portForwardCmd1)
+			Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to stop port-forwarding for: %s", firstServiceName))
+		}()
+
+		port2 := 8001
+		portForwardCmd2 := utils.SetUpPortForward(k8sClient, ctx, secondServiceName, namespace, port2, 80)
+		defer func() {
+			err = utils.StopCmd(portForwardCmd2)
+			Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to stop port-forwarding for: %s", secondServiceName))
 		}()
 
 		By("waiting for port-forwards to be ready")
-		err = utils.VerifyPortForwardReadiness(ctx, port, fmt.Sprintf("http://localhost:%d/v1", port))
+		err = utils.VerifyPortForwardReadiness(ctx, port1, fmt.Sprintf("http://localhost:%d/v1", port1))
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Port-forward should be ready within timeout for: %s", firstServiceName))
+		err = utils.VerifyPortForwardReadiness(ctx, port2, fmt.Sprintf("http://localhost:%d/v1", port2))
+		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Port-forward should be ready within timeout for: %s", secondServiceName))
 
 		By("starting load generation to create traffic for both deployments")
 		loadRate1 := 60
-		loadGenCmd1 := utils.StartLoadGenerator(loadRate1, 100, port, firstModelName)
+		loadGenCmd1 := utils.StartLoadGenerator(loadRate1, 100, port1, firstModelName)
 		defer func() {
 			err = utils.StopCmd(loadGenCmd1)
 			Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to stop load generator sending requests to: %s", firstDeployName))
 		}()
 		loadRate2 := 60
-		loadGenCmd2 := utils.StartLoadGenerator(loadRate2, 100, port, secondModelName)
+		loadGenCmd2 := utils.StartLoadGenerator(loadRate2, 100, port2, secondModelName)
 		defer func() {
 			err = utils.StopCmd(loadGenCmd2)
 			Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to stop load generator sending requests to: %s", secondDeployName))

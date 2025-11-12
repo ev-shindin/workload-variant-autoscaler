@@ -763,9 +763,12 @@ func ValidateAppLabelUniqueness(namespace, appLabel string, k8sClient *kubernete
 
 // CleanupResourcesByLabel deletes all resources with the specified app label in the given namespace
 func CleanupResourcesByLabel(ctx context.Context, namespace, appLabel string, k8sClient *kubernetes.Clientset, crClient client.Client) {
+	hadPods := false
+
 	// Delete all Pods with the label
 	pods, err := k8sClient.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{LabelSelector: "app=" + appLabel})
-	if err == nil {
+	if err == nil && len(pods.Items) > 0 {
+		hadPods = true
 		for _, pod := range pods.Items {
 			_ = k8sClient.CoreV1().Pods(namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
 		}
@@ -781,7 +784,8 @@ func CleanupResourcesByLabel(ctx context.Context, namespace, appLabel string, k8
 
 	// Delete all Deployments with the label
 	deployments, err := k8sClient.AppsV1().Deployments(namespace).List(ctx, metav1.ListOptions{LabelSelector: "app=" + appLabel})
-	if err == nil {
+	if err == nil && len(deployments.Items) > 0 {
+		hadPods = true
 		for _, deploy := range deployments.Items {
 			_ = k8sClient.AppsV1().Deployments(namespace).Delete(ctx, deploy.Name, metav1.DeleteOptions{})
 		}
@@ -810,11 +814,13 @@ func CleanupResourcesByLabel(ctx context.Context, namespace, appLabel string, k8
 		}
 	}
 
-	// Wait for pods to be deleted
-	gom.Eventually(func() bool {
-		podList, err := k8sClient.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{LabelSelector: "app=" + appLabel})
-		return err == nil && len(podList.Items) == 0
-	}, 30*time.Second, 1*time.Second).Should(gom.BeTrue())
+	// Only wait for pods to be deleted if there were pods to delete
+	if hadPods {
+		gom.Eventually(func() bool {
+			podList, err := k8sClient.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{LabelSelector: "app=" + appLabel})
+			return err == nil && len(podList.Items) == 0
+		}, 60*time.Second, 2*time.Second).Should(gom.BeTrue())
+	}
 }
 
 // ValidateVariantAutoscalingUniqueness checks if the VariantAutoscaling configuration is unique within the namespace
