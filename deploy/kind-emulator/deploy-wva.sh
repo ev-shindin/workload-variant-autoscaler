@@ -65,10 +65,18 @@ _kubectl apply -f deploy/configmap-serviceclass.yaml
 # Install the configmap for the accelerator unit cost
 _kubectl apply -f deploy/configmap-accelerator-unitcost.yaml
 
-# deploy emulated vllme server (includes Prometheus with TLS)
-# Export cluster name so the deploy script uses the same cluster
-export KIND_NAME=${KIND_NAME}
-deploy/examples/vllm-emulator/deploy.sh
+# Deploy emulated vllme server (includes Prometheus with TLS) unless explicitly disabled
+# This is disabled during e2e tests which deploy their own llm-d-sim instances
+DEPLOY_LLM_D_INFERENCE_SIM=${DEPLOY_LLM_D_INFERENCE_SIM:-true}
+if [ "$DEPLOY_LLM_D_INFERENCE_SIM" != "false" ]; then
+  echo "Deploying vllm-emulator (DEPLOY_LLM_D_INFERENCE_SIM=${DEPLOY_LLM_D_INFERENCE_SIM})"
+  # Export cluster name so the deploy script uses the same cluster
+  export KIND_NAME=${KIND_NAME}
+  deploy/examples/vllm-emulator/deploy.sh
+else
+  echo "Skipping vllm-emulator deployment (DEPLOY_LLM_D_INFERENCE_SIM=false)"
+  echo "Note: E2E tests deploy their own llm-d-sim instances"
+fi
 
 echo "Deploying Inferno controller-manager"
 make deploy-emulated
