@@ -441,14 +441,14 @@ var _ = Describe("Test workload-variant-autoscaler in emulated environment - sin
 		}()
 
 		By("getting the current number of replicas")
-		var initialDesiredReplicas int
+		var initialDesiredReplicas int32
 		va := &v1alpha1.VariantAutoscaling{}
 		err = crClient.Get(ctx, client.ObjectKey{
 			Namespace: namespace,
 			Name:      deployName,
 		}, va)
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to fetch VariantAutoscaling for: %s", deployName))
-		initialDesiredReplicas = int(va.Status.DesiredOptimizedAlloc.NumReplicas)
+		initialDesiredReplicas = va.Status.DesiredOptimizedAlloc.NumReplicas
 
 		// Since the previous Job has just finished and a new Job has started, there is an interval in which
 		// higher load is being generated. During this time, the controller may decide to scale up further.
