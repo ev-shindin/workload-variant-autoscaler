@@ -1,7 +1,6 @@
 wva:
   enabled: true
-  baseName: inference-scheduling
-  replicaCount: 1
+
   image:
     repository: ghcr.io/llm-d/workload-variant-autoscaler
     tag: latest
@@ -11,6 +10,8 @@ wva:
     enabled: true
     port: 8443
     secure: true
+
+  reconcileInterval: 60s
 
   prometheus:
     monitoringNamespace: openshift-user-workload-monitoring
