@@ -905,6 +905,216 @@ func CreateLlmdSimService(namespace, serviceName, appLabel string, nodePort, por
 	}
 }
 
+// creates a vllme deployment with the specified configuration
+func CreateVllmeDeployment(namespace, deployName, modelName, appLabel string) *appsv1.Deployment {
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      deployName,
+			Namespace: namespace,
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: ptr.To(int32(1)),
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"app":                       appLabel,
+					"llm-d.ai/inferenceServing": "true",
+					"llm-d.ai/model":            "ms-sim-llm-d-modelservice",
+				},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						"app":                       appLabel,
+						"llm-d.ai/inferenceServing": "true",
+						"llm-d.ai/model":            "ms-sim-llm-d-modelservice",
+					},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name:            appLabel,
+							Image:           "quay.io/infernoautoscaler/vllme:0.2.3-multi-arch",
+							ImagePullPolicy: corev1.PullIfNotPresent,
+							Env: []corev1.EnvVar{
+								{Name: "MODEL_NAME", Value: modelName},
+								{Name: "DECODE_TIME", Value: "20"},
+								{Name: "PREFILL_TIME", Value: "20"},
+								{Name: "MODEL_SIZE", Value: "25000"},
+								{Name: "KVC_PER_TOKEN", Value: "2"},
+								{Name: "MAX_SEQ_LEN", Value: "2048"},
+								{Name: "MEM_SIZE", Value: "80000"},
+								{Name: "AVG_TOKENS", Value: "128"},
+								{Name: "TOKENS_DISTRIBUTION", Value: "deterministic"},
+								{Name: "MAX_BATCH_SIZE", Value: "8"},
+								{Name: "REALTIME", Value: "True"},
+								{Name: "MUTE_PRINT", Value: "False"},
+							},
+							Ports: []corev1.ContainerPort{
+								{ContainerPort: 80, Name: appLabel, Protocol: corev1.ProtocolTCP},
+							},
+						},
+					},
+					RestartPolicy: corev1.RestartPolicyAlways,
+				},
+			},
+		},
+	}
+}
+
+// creates a service for the vllme deployment
+func CreateVllmeService(namespace, serviceName, appLabel string, nodePort int) *corev1.Service {
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      serviceName,
+			Namespace: namespace,
+			Labels: map[string]string{
+				"app": appLabel,
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			Selector: map[string]string{
+				"app": appLabel,
+			},
+			Ports: []corev1.ServicePort{
+				{
+					Name:       appLabel,
+					Port:       80,
+					Protocol:   corev1.ProtocolTCP,
+					TargetPort: intstr.FromInt32(80),
+					NodePort:   int32(nodePort),
+				},
+			},
+			Type: corev1.ServiceTypeNodePort,
+		},
+	}
+}
+
+// creates a ServiceMonitor for vllme metrics collection
+func CreateVllmeServiceMonitor(name, namespace, appLabel string) *unstructured.Unstructured {
+	serviceMonitor := &unstructured.Unstructured{}
+	serviceMonitor.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "monitoring.coreos.com",
+		Version: "v1",
+		Kind:    "ServiceMonitor",
+	})
+	serviceMonitor.SetName(name)
+	serviceMonitor.SetNamespace(namespace)
+	serviceMonitor.SetLabels(map[string]string{
+		"app":     appLabel,
+		"release": "kube-prometheus-stack",
+	})
+
+	spec := map[string]any{
+		"selector": map[string]any{
+			"matchLabels": map[string]any{
+				"app": appLabel,
+			},
+		},
+		"endpoints": []any{
+			map[string]any{
+				"port":     appLabel,
+				"path":     "/metrics",
+				"interval": "15s",
+			},
+		},
+		"namespaceSelector": map[string]any{
+			"any": true,
+		},
+	}
+	serviceMonitor.Object["spec"] = spec
+
+	return serviceMonitor
+}
+
+// StartLoadGenerator starts a load generator process sending traffic to localhost:port
+func StartLoadGenerator(rate, contentLength int, port int, modelName string) *exec.Cmd {
+	// Install the load generator requirements
+	requirementsCmd := exec.Command("pip", "install", "-r", "tools/vllm-emulator/requirements.txt")
+	_, err := Run(requirementsCmd)
+	gom.Expect(err).NotTo(gom.HaveOccurred(), "Failed to install loadgen requirements")
+	loadGenCmd := exec.Command("python",
+		"tools/vllm-emulator/loadgen.py",
+		"--url", fmt.Sprintf("http://localhost:%d/v1", port),
+		"--rate", fmt.Sprintf("%d", rate),
+		"--content", fmt.Sprintf("%d", contentLength),
+		"--model", modelName)
+	err = loadGenCmd.Start()
+	gom.Expect(err).NotTo(gom.HaveOccurred(), fmt.Sprintf("Failed to start load generator sending requests to model: %s, at \"http://localhost:%d/v1\"", modelName, port))
+
+	// Check if the loadgen process is still running
+	gom.Eventually(func() error {
+		if loadGenCmd.ProcessState != nil && loadGenCmd.ProcessState.Exited() {
+			return fmt.Errorf("load generator exited unexpectedly with code: %d", loadGenCmd.ProcessState.ExitCode())
+		}
+		return nil
+	}, 10*time.Second, 1*time.Second).Should(gom.Succeed(), fmt.Sprintf("Load generator sending requests to model: %s at \"http://localhost:%d/v1\" should keep running", modelName, port))
+
+	return loadGenCmd
+}
+
+// creates an InferenceModel resource for the specified model
+func CreateInferenceModel(name, namespace, modelName string) *unstructured.Unstructured {
+	inferenceModel := &unstructured.Unstructured{}
+	inferenceModel.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "inference.networking.x-k8s.io",
+		Version: "v1alpha2",
+		Kind:    "InferenceModel",
+	})
+	inferenceModel.SetName(name)
+	inferenceModel.SetNamespace(namespace)
+
+	spec := map[string]any{
+		"modelName":   modelName,
+		"criticality": "Critical",
+		"poolRef": map[string]any{
+			"name": "gaie-sim",
+		},
+		"targetModels": []any{
+			map[string]any{
+				"name":   modelName,
+				"weight": 100,
+			},
+		},
+	}
+	inferenceModel.Object["spec"] = spec
+
+	return inferenceModel
+}
+
+// GetWVAReplicaMetrics queries Prometheus for metrics emitted by the WVA controller
+func GetWVAReplicaMetrics(targetName, targetKind, namespace, acceleratorType string) (currentReplicas, desiredReplicas, desiredRatio float64, err error) {
+	client, err := NewPrometheusClient("https://localhost:9090", true)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("failed to create prometheus client: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	labels := fmt.Sprintf(`target_name="%s",target_kind="%s",exported_namespace="%s",accelerator_type="%s"`, targetName, targetKind, namespace, acceleratorType)
+
+	// Query metrics with retries
+	currentQuery := fmt.Sprintf(`wva_current_replicas{%s}`, labels)
+	currentReplicas, err = client.QueryWithRetry(ctx, currentQuery)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("failed to query current replicas: %w", err)
+	}
+
+	desiredQuery := fmt.Sprintf(`wva_desired_replicas{%s}`, labels)
+	desiredReplicas, err = client.QueryWithRetry(ctx, desiredQuery)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("failed to query desired replicas: %w", err)
+	}
+
+	desiredRatioQuery := fmt.Sprintf(`wva_desired_ratio{%s}`, labels)
+	desiredRatio, err = client.QueryWithRetry(ctx, desiredRatioQuery)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("failed to query desired ratio: %w", err)
+	}
+
+	return currentReplicas, desiredReplicas, desiredRatio, nil
+}
+
 // creates a VariantAutoscaling resource with owner reference to deployment
 // Note: Updated to use new single-variant API structure (API refactor)
 func CreateVariantAutoscalingResource(namespace, resourceName, modelId, acc string) *v1alpha1.VariantAutoscaling {
