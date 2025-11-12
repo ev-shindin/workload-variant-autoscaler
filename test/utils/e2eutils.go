@@ -761,6 +761,62 @@ func ValidateAppLabelUniqueness(namespace, appLabel string, k8sClient *kubernete
 	}
 }
 
+// CleanupResourcesByLabel deletes all resources with the specified app label in the given namespace
+func CleanupResourcesByLabel(ctx context.Context, namespace, appLabel string, k8sClient *kubernetes.Clientset, crClient client.Client) {
+	// Delete all Pods with the label
+	pods, err := k8sClient.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{LabelSelector: "app=" + appLabel})
+	if err == nil {
+		for _, pod := range pods.Items {
+			_ = k8sClient.CoreV1().Pods(namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
+		}
+	}
+
+	// Delete all Services with the label
+	services, err := k8sClient.CoreV1().Services(namespace).List(ctx, metav1.ListOptions{LabelSelector: "app=" + appLabel})
+	if err == nil {
+		for _, svc := range services.Items {
+			_ = k8sClient.CoreV1().Services(namespace).Delete(ctx, svc.Name, metav1.DeleteOptions{})
+		}
+	}
+
+	// Delete all Deployments with the label
+	deployments, err := k8sClient.AppsV1().Deployments(namespace).List(ctx, metav1.ListOptions{LabelSelector: "app=" + appLabel})
+	if err == nil {
+		for _, deploy := range deployments.Items {
+			_ = k8sClient.AppsV1().Deployments(namespace).Delete(ctx, deploy.Name, metav1.DeleteOptions{})
+		}
+	}
+
+	// Delete all VariantAutoscalings with the label
+	vaList := &v1alpha1.VariantAutoscalingList{}
+	err = crClient.List(ctx, vaList, client.InNamespace(namespace), client.MatchingLabels{"app": appLabel})
+	if err == nil {
+		for _, va := range vaList.Items {
+			_ = crClient.Delete(ctx, &va)
+		}
+	}
+
+	// Delete all ServiceMonitors with the label in the monitoring namespace
+	serviceMonitorList := &unstructured.UnstructuredList{}
+	serviceMonitorList.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "monitoring.coreos.com",
+		Version: "v1",
+		Kind:    "ServiceMonitor",
+	})
+	err = crClient.List(ctx, serviceMonitorList, client.MatchingLabels{"app": appLabel})
+	if err == nil {
+		for _, sm := range serviceMonitorList.Items {
+			_ = crClient.Delete(ctx, &sm)
+		}
+	}
+
+	// Wait for pods to be deleted
+	gom.Eventually(func() bool {
+		podList, err := k8sClient.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{LabelSelector: "app=" + appLabel})
+		return err == nil && len(podList.Items) == 0
+	}, 30*time.Second, 1*time.Second).Should(gom.BeTrue())
+}
+
 // ValidateVariantAutoscalingUniqueness checks if the VariantAutoscaling configuration is unique within the namespace
 func ValidateVariantAutoscalingUniqueness(namespace, modelId, acc string, crClient client.Client) {
 	// Create a context with timeout to prevent hanging tests

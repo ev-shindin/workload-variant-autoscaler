@@ -171,6 +171,9 @@ var _ = Describe("Test workload-variant-autoscaler with vllme deployment - singl
 		loadRate = 30
 		modelName = defaultModelId
 
+		By("cleaning up any leftover resources from previous test runs")
+		utils.CleanupResourcesByLabel(ctx, namespace, appLabel, k8sClient, crClient)
+
 		By("ensuring unique app label for deployment and service")
 		utils.ValidateAppLabelUniqueness(namespace, appLabel, k8sClient, crClient)
 		utils.ValidateVariantAutoscalingUniqueness(namespace, defaultModelId, a100Acc, crClient)
@@ -728,6 +731,10 @@ var _ = Describe("Test workload-variant-autoscaler with vllme deployment - multi
 		secondAppLabel = "vllme-2"
 		firstModelName = defaultModelId
 		secondModelName = llamaModelId
+
+		By("cleaning up any leftover resources from previous test runs")
+		utils.CleanupResourcesByLabel(ctx, namespace, firstAppLabel, k8sClient, crClient)
+		utils.CleanupResourcesByLabel(ctx, namespace, secondAppLabel, k8sClient, crClient)
 
 		By("ensuring unique app labels for deployment and service")
 		utils.ValidateAppLabelUniqueness(namespace, firstAppLabel, k8sClient, crClient)
