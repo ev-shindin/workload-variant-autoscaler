@@ -688,9 +688,11 @@ var _ = Describe("Test workload-variant-autoscaler with vllme deployment - singl
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to delete Deployment: %s", deployName))
 
 		By("deleting InferenceModel")
-		err = crClient.Delete(ctx, inferenceModel)
-		err = client.IgnoreNotFound(err)
-		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to delete InferenceModel: %s", modelName))
+		if inferenceModel != nil {
+			err = crClient.Delete(ctx, inferenceModel)
+			err = client.IgnoreNotFound(err)
+			Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to delete InferenceModel: %s", modelName))
+		}
 
 		By("waiting for all pods to be deleted")
 		Eventually(func(g Gomega) {
@@ -1171,9 +1173,11 @@ var _ = Describe("Test workload-variant-autoscaler with vllme deployment - multi
 		err = client.IgnoreNotFound(err)
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to delete Deployment: %s", firstDeployName))
 
-		err = crClient.Delete(ctx, firstInferenceModel)
-		err = client.IgnoreNotFound(err)
-		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to delete InferenceModel: %s", firstModelName))
+		if firstInferenceModel != nil {
+			err = crClient.Delete(ctx, firstInferenceModel)
+			err = client.IgnoreNotFound(err)
+			Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to delete InferenceModel: %s", firstModelName))
+		}
 
 		Eventually(func(g Gomega) {
 			podList, err := k8sClient.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{LabelSelector: "app=" + firstAppLabel})
@@ -1214,9 +1218,11 @@ var _ = Describe("Test workload-variant-autoscaler with vllme deployment - multi
 		err = client.IgnoreNotFound(err)
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to delete Deployment: %s", secondDeployName))
 
-		err = crClient.Delete(ctx, secondInferenceModel)
-		err = client.IgnoreNotFound(err)
-		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to delete InferenceModel: %s", secondModelName))
+		if secondInferenceModel != nil {
+			err = crClient.Delete(ctx, secondInferenceModel)
+			err = client.IgnoreNotFound(err)
+			Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to delete InferenceModel: %s", secondModelName))
+		}
 
 		Eventually(func(g Gomega) {
 			podList, err := k8sClient.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{LabelSelector: "app=" + secondAppLabel})
