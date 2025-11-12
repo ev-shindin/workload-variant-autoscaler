@@ -761,79 +761,6 @@ func ValidateAppLabelUniqueness(namespace, appLabel string, k8sClient *kubernete
 	}
 }
 
-// CleanupResourcesByLabel deletes all resources with the specified app label in the given namespace
-func CleanupResourcesByLabel(ctx context.Context, namespace, appLabel string, k8sClient *kubernetes.Clientset, crClient client.Client) {
-	gracePeriod := int64(0)
-	propagationPolicy := metav1.DeletePropagationForeground
-	deleteOptions := metav1.DeleteOptions{
-		GracePeriodSeconds: &gracePeriod,
-		PropagationPolicy:  &propagationPolicy,
-	}
-
-	// Delete all VariantAutoscalings first (they may have finalizers blocking pod deletion)
-	vaList := &v1alpha1.VariantAutoscalingList{}
-	err := crClient.List(ctx, vaList, client.InNamespace(namespace), client.MatchingLabels{"app": appLabel})
-	if err == nil {
-		for _, va := range vaList.Items {
-			_ = crClient.Delete(ctx, &va)
-		}
-	}
-
-	// Delete all Deployments (this should cascade delete pods)
-	deployments, err := k8sClient.AppsV1().Deployments(namespace).List(ctx, metav1.ListOptions{LabelSelector: "app=" + appLabel})
-	hadDeployments := err == nil && len(deployments.Items) > 0
-	if hadDeployments {
-		for _, deploy := range deployments.Items {
-			_ = k8sClient.AppsV1().Deployments(namespace).Delete(ctx, deploy.Name, deleteOptions)
-		}
-	}
-
-	// Delete all Services
-	services, err := k8sClient.CoreV1().Services(namespace).List(ctx, metav1.ListOptions{LabelSelector: "app=" + appLabel})
-	if err == nil {
-		for _, svc := range services.Items {
-			_ = k8sClient.CoreV1().Services(namespace).Delete(ctx, svc.Name, deleteOptions)
-		}
-	}
-
-	// Delete all ServiceMonitors
-	serviceMonitorList := &unstructured.UnstructuredList{}
-	serviceMonitorList.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "monitoring.coreos.com",
-		Version: "v1",
-		Kind:    "ServiceMonitor",
-	})
-	err = crClient.List(ctx, serviceMonitorList, client.MatchingLabels{"app": appLabel})
-	if err == nil {
-		for _, sm := range serviceMonitorList.Items {
-			_ = crClient.Delete(ctx, &sm)
-		}
-	}
-
-	// Wait for deployments and pods to be fully deleted
-	if hadDeployments {
-		// Wait for deployments to be gone
-		gom.Eventually(func() bool {
-			deployList, err := k8sClient.AppsV1().Deployments(namespace).List(ctx, metav1.ListOptions{LabelSelector: "app=" + appLabel})
-			return err == nil && len(deployList.Items) == 0
-		}, 30*time.Second, 2*time.Second).Should(gom.BeTrue())
-
-		// Force delete any remaining pods
-		pods, err := k8sClient.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{LabelSelector: "app=" + appLabel})
-		if err == nil {
-			for _, pod := range pods.Items {
-				_ = k8sClient.CoreV1().Pods(namespace).Delete(ctx, pod.Name, deleteOptions)
-			}
-		}
-
-		// Wait for all pods to be gone
-		gom.Eventually(func() bool {
-			podList, err := k8sClient.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{LabelSelector: "app=" + appLabel})
-			return err == nil && len(podList.Items) == 0
-		}, 30*time.Second, 2*time.Second).Should(gom.BeTrue())
-	}
-}
-
 // ValidateVariantAutoscalingUniqueness checks if the VariantAutoscaling configuration is unique within the namespace
 func ValidateVariantAutoscalingUniqueness(namespace, modelId, acc string, crClient client.Client) {
 	// Create a context with timeout to prevent hanging tests
@@ -870,19 +797,18 @@ func LogVariantAutoscalingStatus(ctx context.Context, vaName, namespace string, 
 	if err != nil {
 		return err
 	}
-
-	// Note: Load, ITLAverage, and TTFTAverage fields removed from Allocation struct in API refactor
-	// These metrics will be retrieved from Prometheus in Phase 2
-	// For now, only log the basic allocation information that still exists
-	fmt.Printf("Current Allocation for VA: %s - Replicas: %d\n",
+	fmt.Printf("Load Profile for VA: %s - Arrival Rate: %s, Avg Input Tokens: %s, Avg Output Tokens: %s, Avg ITL: %s, Avg TTFT: %s\n",
 		variantAutoscaling.Name,
-		variantAutoscaling.Status.CurrentAlloc.NumReplicas)
+		variantAutoscaling.Status.CurrentAlloc.Load.ArrivalRate,
+		variantAutoscaling.Status.CurrentAlloc.Load.AvgInputTokens,
+		variantAutoscaling.Status.CurrentAlloc.Load.AvgOutputTokens,
+		variantAutoscaling.Status.CurrentAlloc.ITLAverage,
+		variantAutoscaling.Status.CurrentAlloc.TTFTAverage)
 
-	// Note: Accelerator field moved from Status.DesiredOptimizedAlloc to Spec in API refactor
 	fmt.Printf("Desired Optimized Allocation for VA: %s - Replicas: %d, Accelerator: %s\n",
 		variantAutoscaling.Name,
 		variantAutoscaling.Status.DesiredOptimizedAlloc.NumReplicas,
-		variantAutoscaling.Spec.Accelerator)
+		variantAutoscaling.Status.DesiredOptimizedAlloc.Accelerator)
 	return nil
 }
 
@@ -978,243 +904,8 @@ func CreateLlmdSimService(namespace, serviceName, appLabel string, nodePort, por
 	}
 }
 
-// creates a vllme deployment with the specified configuration
-func CreateVllmeDeployment(namespace, deployName, modelName, appLabel string) *appsv1.Deployment {
-	return &appsv1.Deployment{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      deployName,
-			Namespace: namespace,
-		},
-		Spec: appsv1.DeploymentSpec{
-			Replicas: ptr.To(int32(1)),
-			Selector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{
-					"app":                       appLabel,
-					"llm-d.ai/inferenceServing": "true",
-					"llm-d.ai/model":            "ms-sim-llm-d-modelservice",
-				},
-			},
-			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels: map[string]string{
-						"app":                       appLabel,
-						"llm-d.ai/inferenceServing": "true",
-						"llm-d.ai/model":            "ms-sim-llm-d-modelservice",
-					},
-				},
-				Spec: corev1.PodSpec{
-					Containers: []corev1.Container{
-						{
-							Name:            appLabel,
-							Image:           "quay.io/infernoautoscaler/vllme:0.2.3-multi-arch",
-							ImagePullPolicy: corev1.PullIfNotPresent,
-							Env: []corev1.EnvVar{
-								{Name: "MODEL_NAME", Value: modelName},
-								{Name: "DECODE_TIME", Value: "20"},
-								{Name: "PREFILL_TIME", Value: "20"},
-								{Name: "MODEL_SIZE", Value: "25000"},
-								{Name: "KVC_PER_TOKEN", Value: "2"},
-								{Name: "MAX_SEQ_LEN", Value: "2048"},
-								{Name: "MEM_SIZE", Value: "80000"},
-								{Name: "AVG_TOKENS", Value: "128"},
-								{Name: "TOKENS_DISTRIBUTION", Value: "deterministic"},
-								{Name: "MAX_BATCH_SIZE", Value: "8"},
-								{Name: "REALTIME", Value: "True"},
-								{Name: "MUTE_PRINT", Value: "False"},
-							},
-							Ports: []corev1.ContainerPort{
-								{ContainerPort: 80, Name: appLabel, Protocol: corev1.ProtocolTCP},
-							},
-						},
-					},
-					RestartPolicy: corev1.RestartPolicyAlways,
-				},
-			},
-		},
-	}
-}
-
-// creates a service for the vllme deployment
-func CreateVllmeService(namespace, serviceName, appLabel string, nodePort int) *corev1.Service {
-	return &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      serviceName,
-			Namespace: namespace,
-			Labels: map[string]string{
-				"app": appLabel,
-			},
-		},
-		Spec: corev1.ServiceSpec{
-			Selector: map[string]string{
-				"app": appLabel,
-			},
-			Ports: []corev1.ServicePort{
-				{
-					Name:       appLabel,
-					Port:       80,
-					Protocol:   corev1.ProtocolTCP,
-					TargetPort: intstr.FromInt32(80),
-					NodePort:   int32(nodePort),
-				},
-			},
-			Type: corev1.ServiceTypeNodePort,
-		},
-	}
-}
-
-// creates a ServiceMonitor for vllme metrics collection
-func CreateVllmeServiceMonitor(name, namespace, appLabel string) *unstructured.Unstructured {
-	serviceMonitor := &unstructured.Unstructured{}
-	serviceMonitor.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "monitoring.coreos.com",
-		Version: "v1",
-		Kind:    "ServiceMonitor",
-	})
-	serviceMonitor.SetName(name)
-	serviceMonitor.SetNamespace(namespace)
-	serviceMonitor.SetLabels(map[string]string{
-		"app":     appLabel,
-		"release": "kube-prometheus-stack",
-	})
-
-	spec := map[string]any{
-		"selector": map[string]any{
-			"matchLabels": map[string]any{
-				"app": appLabel,
-			},
-		},
-		"endpoints": []any{
-			map[string]any{
-				"port":     appLabel,
-				"path":     "/metrics",
-				"interval": "15s",
-			},
-		},
-		"namespaceSelector": map[string]any{
-			"any": true,
-		},
-	}
-	serviceMonitor.Object["spec"] = spec
-
-	return serviceMonitor
-}
-
-// StartLoadGenerator starts a load generator process sending traffic to localhost:port
-func StartLoadGenerator(rate, contentLength int, port int, modelName string) *exec.Cmd {
-	// Install the load generator requirements
-	requirementsCmd := exec.Command("pip", "install", "-r", "tools/vllm-emulator/requirements.txt")
-	_, err := Run(requirementsCmd)
-	gom.Expect(err).NotTo(gom.HaveOccurred(), "Failed to install loadgen requirements")
-	loadGenCmd := exec.Command("python",
-		"tools/vllm-emulator/loadgen.py",
-		"--url", fmt.Sprintf("http://localhost:%d/v1", port),
-		"--rate", fmt.Sprintf("%d", rate),
-		"--content", fmt.Sprintf("%d", contentLength),
-		"--model", modelName)
-	err = loadGenCmd.Start()
-	gom.Expect(err).NotTo(gom.HaveOccurred(), fmt.Sprintf("Failed to start load generator sending requests to model: %s, at \"http://localhost:%d/v1\"", modelName, port))
-
-	// Check if the loadgen process is still running
-	gom.Eventually(func() error {
-		if loadGenCmd.ProcessState != nil && loadGenCmd.ProcessState.Exited() {
-			return fmt.Errorf("load generator exited unexpectedly with code: %d", loadGenCmd.ProcessState.ExitCode())
-		}
-		return nil
-	}, 10*time.Second, 1*time.Second).Should(gom.Succeed(), fmt.Sprintf("Load generator sending requests to model: %s at \"http://localhost:%d/v1\" should keep running", modelName, port))
-
-	return loadGenCmd
-}
-
-// creates an InferenceModel resource for the specified model
-func CreateInferenceModel(name, namespace, modelName string) *unstructured.Unstructured {
-	inferenceModel := &unstructured.Unstructured{}
-	inferenceModel.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "inference.networking.x-k8s.io",
-		Version: "v1alpha2",
-		Kind:    "InferenceModel",
-	})
-	inferenceModel.SetName(name)
-	inferenceModel.SetNamespace(namespace)
-
-	spec := map[string]any{
-		"modelName":   modelName,
-		"criticality": "Critical",
-		"poolRef": map[string]any{
-			"name": "gaie-sim",
-		},
-		"targetModels": []any{
-			map[string]any{
-				"name":   modelName,
-				"weight": 100,
-			},
-		},
-	}
-	inferenceModel.Object["spec"] = spec
-
-	return inferenceModel
-}
-
-// GetWVAReplicaMetrics queries Prometheus for metrics emitted by the WVA controller
-func GetWVAReplicaMetrics(targetName, targetKind, namespace, acceleratorType string) (currentReplicas, desiredReplicas, desiredRatio float64, err error) {
-	client, err := NewPrometheusClient("https://localhost:9090", true)
-	if err != nil {
-		return 0, 0, 0, fmt.Errorf("failed to create prometheus client: %w", err)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	labels := fmt.Sprintf(`target_name="%s",target_kind="%s",exported_namespace="%s",accelerator_type="%s"`, targetName, targetKind, namespace, acceleratorType)
-
-	// Query metrics with retries
-	currentQuery := fmt.Sprintf(`wva_current_replicas{%s}`, labels)
-	currentReplicas, err = client.QueryWithRetry(ctx, currentQuery)
-	if err != nil {
-		return 0, 0, 0, fmt.Errorf("failed to query current replicas: %w", err)
-	}
-
-	desiredQuery := fmt.Sprintf(`wva_desired_replicas{%s}`, labels)
-	desiredReplicas, err = client.QueryWithRetry(ctx, desiredQuery)
-	if err != nil {
-		return 0, 0, 0, fmt.Errorf("failed to query desired replicas: %w", err)
-	}
-
-	desiredRatioQuery := fmt.Sprintf(`wva_desired_ratio{%s}`, labels)
-	desiredRatio, err = client.QueryWithRetry(ctx, desiredRatioQuery)
-	if err != nil {
-		return 0, 0, 0, fmt.Errorf("failed to query desired ratio: %w", err)
-	}
-
-	return currentReplicas, desiredReplicas, desiredRatio, nil
-}
-
 // creates a VariantAutoscaling resource with owner reference to deployment
-// Note: Updated to use new single-variant API structure (API refactor)
 func CreateVariantAutoscalingResource(namespace, resourceName, modelId, acc string) *v1alpha1.VariantAutoscaling {
-	// Determine performance parameters based on accelerator type
-	var decodeParms, prefillParms map[string]string
-	var maxBatchSize int
-
-	switch acc {
-	case "A100", "H100":
-		decodeParms = map[string]string{"alpha": "20.58", "beta": "0.41"}
-		prefillParms = map[string]string{"gamma": "20.58", "delta": "0.041"}
-		maxBatchSize = 4
-	case "MI300X":
-		decodeParms = map[string]string{"alpha": "0.77", "beta": "0.15"}
-		prefillParms = map[string]string{"gamma": "0.77", "delta": "0.15"}
-		maxBatchSize = 4
-	case "G2":
-		decodeParms = map[string]string{"alpha": "17.15", "beta": "0.34"}
-		prefillParms = map[string]string{"gamma": "17.15", "delta": "0.34"}
-		maxBatchSize = 4
-	default:
-		// Default values for unknown accelerator types
-		decodeParms = map[string]string{"alpha": "20.58", "beta": "0.41"}
-		prefillParms = map[string]string{"gamma": "20.58", "delta": "0.041"}
-		maxBatchSize = 4
-	}
-
 	return &v1alpha1.VariantAutoscaling{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      resourceName,
@@ -1224,26 +915,50 @@ func CreateVariantAutoscalingResource(namespace, resourceName, modelId, acc stri
 			},
 		},
 		Spec: v1alpha1.VariantAutoscalingSpec{
-			ScaleTargetRef: v1alpha1.CrossVersionObjectReference{
-				APIVersion: "apps/v1",
-				Kind:       "Deployment",
-				Name:       resourceName,
-			},
-			ModelID:   modelId,
-			VariantID: modelId + "-" + acc + "-1", // Format: modelId-accelerator-count
+			ModelID: modelId,
 			SLOClassRef: v1alpha1.ConfigMapKeyRef{
 				Name: "premium",
 				Key:  "slo",
 			},
-			// Single-variant API: One accelerator per VariantAutoscaling
-			Accelerator:      acc,
-			AcceleratorCount: 1,
-			VariantProfile: v1alpha1.VariantProfile{
-				PerfParms: v1alpha1.PerfParms{
-					DecodeParms:  decodeParms,
-					PrefillParms: prefillParms,
+			ModelProfile: v1alpha1.ModelProfile{
+				Accelerators: []v1alpha1.AcceleratorProfile{
+					{
+						Acc:      "A100",
+						AccCount: 1,
+						PerfParms: v1alpha1.PerfParms{
+							DecodeParms:  map[string]string{"alpha": "20.58", "beta": "0.41"},
+							PrefillParms: map[string]string{"gamma": "20.58", "delta": "0.041"},
+						},
+						MaxBatchSize: 4,
+					},
+					{
+						Acc:      "H100",
+						AccCount: 1,
+						PerfParms: v1alpha1.PerfParms{
+							DecodeParms:  map[string]string{"alpha": "20.58", "beta": "0.41"},
+							PrefillParms: map[string]string{"gamma": "20.58", "delta": "0.041"},
+						},
+						MaxBatchSize: 4,
+					},
+					{
+						Acc:      "MI300X",
+						AccCount: 1,
+						PerfParms: v1alpha1.PerfParms{
+							DecodeParms:  map[string]string{"alpha": "0.77", "beta": "0.15"},
+							PrefillParms: map[string]string{"gamma": "0.77", "delta": "0.15"},
+						},
+						MaxBatchSize: 4,
+					},
+					{
+						Acc:      "G2",
+						AccCount: 1,
+						PerfParms: v1alpha1.PerfParms{
+							DecodeParms:  map[string]string{"alpha": "17.15", "beta": "0.34"},
+							PrefillParms: map[string]string{"gamma": "17.15", "delta": "0.34"},
+						},
+						MaxBatchSize: 4,
+					},
 				},
-				MaxBatchSize: maxBatchSize,
 			},
 		},
 	}
