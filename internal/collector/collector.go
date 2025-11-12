@@ -177,7 +177,7 @@ func AddMetricsToOptStatus(ctx context.Context,
 	opt *llmdVariantAutoscalingV1alpha1.VariantAutoscaling,
 	deployment appsv1.Deployment,
 	acceleratorCostVal float64,
-	promAPI promv1.API) (llmdVariantAutoscalingV1alpha1.Allocation, error) {
+	promAPI promv1.API) (llmdVariantAutoscalingV1alpha1.Allocation, float64, float64, float64, float64, float64, error) {
 
 	deployNamespace := deployment.Namespace
 	modelName := opt.Spec.ModelID
@@ -251,32 +251,35 @@ func AddMetricsToOptStatus(ctx context.Context,
 
 	// --- 2. Execute Queries with fallback ---
 
-	// In single-variant architecture, these metrics are collected but not stored in status
-	// They will be used directly by the controller/optimizer in PR2
-	_, err := queryWithFallback(ctx, promAPI, arrivalQuery, arrivalQueryFallback, "ArrivalRate")
+	// In single-variant architecture, these metrics are collected and returned to the controller
+	// They are not stored in status, but passed directly to the optimizer
+	arrivalRate, err := queryWithFallback(ctx, promAPI, arrivalQuery, arrivalQueryFallback, "ArrivalRate")
 	if err != nil {
-		return llmdVariantAutoscalingV1alpha1.Allocation{}, err
+		return llmdVariantAutoscalingV1alpha1.Allocation{}, 0, 0, 0, 0, 0, err
+	}
+	arrivalRate *= 60 // convert from req/sec to req/min
+
+	avgInputTokens, err := queryWithFallback(ctx, promAPI, avgPromptToksQuery, avgPromptToksQueryFallback, "AvgInputTokens")
+	if err != nil {
+		return llmdVariantAutoscalingV1alpha1.Allocation{}, 0, 0, 0, 0, 0, err
 	}
 
-	_, err = queryWithFallback(ctx, promAPI, avgPromptToksQuery, avgPromptToksQueryFallback, "AvgInputTokens")
+	avgOutputTokens, err := queryWithFallback(ctx, promAPI, avgDecToksQuery, avgDecToksQueryFallback, "AvgOutputTokens")
 	if err != nil {
-		return llmdVariantAutoscalingV1alpha1.Allocation{}, err
+		return llmdVariantAutoscalingV1alpha1.Allocation{}, 0, 0, 0, 0, 0, err
 	}
 
-	_, err = queryWithFallback(ctx, promAPI, avgDecToksQuery, avgDecToksQueryFallback, "AvgOutputTokens")
+	ttftAverage, err := queryWithFallback(ctx, promAPI, ttftQuery, ttftQueryFallback, "TTFTAverageTime")
 	if err != nil {
-		return llmdVariantAutoscalingV1alpha1.Allocation{}, err
+		return llmdVariantAutoscalingV1alpha1.Allocation{}, 0, 0, 0, 0, 0, err
 	}
+	ttftAverage *= 1000 // convert from seconds to milliseconds
 
-	_, err = queryWithFallback(ctx, promAPI, ttftQuery, ttftQueryFallback, "TTFTAverageTime")
+	itlAverage, err := queryWithFallback(ctx, promAPI, itlQuery, itlQueryFallback, "ITLAverage")
 	if err != nil {
-		return llmdVariantAutoscalingV1alpha1.Allocation{}, err
+		return llmdVariantAutoscalingV1alpha1.Allocation{}, 0, 0, 0, 0, 0, err
 	}
-
-	_, err = queryWithFallback(ctx, promAPI, itlQuery, itlQueryFallback, "ITLAverage")
-	if err != nil {
-		return llmdVariantAutoscalingV1alpha1.Allocation{}, err
-	}
+	itlAverage *= 1000 // convert from seconds to milliseconds
 
 	// --- 3. Collect K8s and Static Info ---
 
@@ -301,11 +304,11 @@ func AddMetricsToOptStatus(ctx context.Context,
 	// populate current alloc
 	// In single-variant architecture, only numReplicas is stored in status.
 	// Variant characteristics (accelerator, maxBatch, cost) are in spec.
-	// Load metrics, TTFT, ITL are collected but not stored in status.
+	// Load metrics, TTFT, ITL are collected and returned to the controller (not stored in status).
 	currentAlloc := llmdVariantAutoscalingV1alpha1.Allocation{
 		NumReplicas: int32(numReplicas),
 	}
-	return currentAlloc, nil
+	return currentAlloc, arrivalRate, avgInputTokens, avgOutputTokens, itlAverage, ttftAverage, nil
 }
 
 // Helper to handle if a value is NaN or infinite

@@ -302,7 +302,7 @@ var _ = Describe("Collector", func() {
 				&model.Sample{Value: model.SampleValue(0.05)}, // 0.05 seconds
 			}
 
-			allocation, err := AddMetricsToOptStatus(ctx, &va, deployment, accCost, mockProm)
+			allocation, _, _, _, _, _, err := AddMetricsToOptStatus(ctx, &va, deployment, accCost, mockProm)
 
 			Expect(err).NotTo(HaveOccurred())
 			// In the new API, Allocation only has NumReplicas
@@ -337,7 +337,7 @@ var _ = Describe("Collector", func() {
 				&model.Sample{Value: model.SampleValue(0.05)},
 			}
 
-			allocation, err := AddMetricsToOptStatus(ctx, &va, deployment, accCost, mockProm)
+			allocation, _, _, _, _, _, err := AddMetricsToOptStatus(ctx, &va, deployment, accCost, mockProm)
 
 			Expect(err).NotTo(HaveOccurred())
 			// In the new API, Allocation only has NumReplicas - accelerator is in Spec
@@ -349,7 +349,7 @@ var _ = Describe("Collector", func() {
 			arrivalQuery := utils.CreateArrivalQuery(modelID, testNamespace)
 			mockProm.QueryErrors[arrivalQuery] = fmt.Errorf("prometheus connection failed")
 
-			allocation, err := AddMetricsToOptStatus(ctx, &va, deployment, accCost, mockProm)
+			allocation, _, _, _, _, _, err := AddMetricsToOptStatus(ctx, &va, deployment, accCost, mockProm)
 
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("prometheus connection failed"))
@@ -371,7 +371,7 @@ var _ = Describe("Collector", func() {
 			mockProm.QueryResults[ttftQuery] = model.Vector{}
 			mockProm.QueryResults[itlQuery] = model.Vector{}
 
-			allocation, err := AddMetricsToOptStatus(ctx, &va, deployment, accCost, mockProm)
+			allocation, _, _, _, _, _, err := AddMetricsToOptStatus(ctx, &va, deployment, accCost, mockProm)
 
 			Expect(err).NotTo(HaveOccurred())
 			// In the new API, Allocation only has NumReplicas

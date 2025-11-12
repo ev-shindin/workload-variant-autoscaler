@@ -319,7 +319,7 @@ func (r *VariantAutoscalingReconciler) prepareVariantAutoscalings(
 			continue
 		}
 
-		currentAllocation, err := collector.AddMetricsToOptStatus(ctx, &updateVA, deploy, acceleratorCostValFloat, r.PromAPI)
+		currentAllocation, arrivalRate, avgInputTokens, avgOutputTokens, itlAverage, ttftAverage, err := collector.AddMetricsToOptStatus(ctx, &updateVA, deploy, acceleratorCostValFloat, r.PromAPI)
 		if err != nil {
 			logger.Log.Error(err, "unable to fetch metrics, skipping this variantAutoscaling loop")
 			// Don't update status here - will be updated in next reconcile when metrics are available
@@ -327,8 +327,8 @@ func (r *VariantAutoscalingReconciler) prepareVariantAutoscalings(
 		}
 		updateVA.Status.CurrentAlloc = currentAllocation
 
-		// Pass placeholder metrics (0) for now - will be collected from Prometheus in PR2
-		if err := utils.AddServerInfoToSystemData(systemData, &updateVA, className, 0, 0, 0, 0, 0); err != nil {
+		// Pass collected metrics to optimizer
+		if err := utils.AddServerInfoToSystemData(systemData, &updateVA, className, arrivalRate, avgInputTokens, avgOutputTokens, itlAverage, ttftAverage); err != nil {
 			logger.Log.Info("variantAutoscaling bad deployment server data, skipping optimization - ", "variantAutoscaling-name: ", updateVA.Name)
 			continue
 		}
