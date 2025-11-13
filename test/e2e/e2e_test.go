@@ -440,7 +440,50 @@ var _ = Describe("Test workload-variant-autoscaler in emulated environment - sin
 			Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to stop load generator sending requests to: %s", deployName))
 		}()
 
-		By("getting the current number of replicas")
+		// When load generation restarts, there's a transient period where:
+		// 1. The previous job has just finished (load drops)
+		// 2. The new job is starting (load ramps up)
+		// During this time, the controller may still be adjusting replicas based on the changing load.
+		// We must wait for the system to stabilize BEFORE capturing the baseline replica count,
+		// otherwise we might capture a transient value that doesn't represent the steady state.
+		By("waiting for the controller to stabilize replica count after load restart")
+		var lastObservedReplicas int32
+		Eventually(func(g Gomega) {
+			va := &v1alpha1.VariantAutoscaling{}
+			err = crClient.Get(ctx, client.ObjectKey{
+				Namespace: namespace,
+				Name:      deployName,
+			}, va)
+			g.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to fetch VariantAutoscaling for: %s", deployName))
+
+			// Wait for DesiredOptimizedAlloc to be computed
+			g.Expect(va.Status.DesiredOptimizedAlloc.NumReplicas).To(BeNumerically(">", 0),
+				fmt.Sprintf("DesiredOptimizedAlloc should be computed for VA: %s", va.Name))
+
+			lastObservedReplicas = va.Status.DesiredOptimizedAlloc.NumReplicas
+
+			// Note: In the new single-variant API, load metrics are not stored in the VA status.
+			// Load metrics are collected directly from Prometheus when needed by the controller.
+
+		}, 3*time.Minute, 10*time.Second).Should(Succeed())
+
+		// Now verify that replicas stay stable for a period of time before capturing the baseline
+		By("verifying replicas have stabilized before capturing baseline")
+		Consistently(func(g Gomega) {
+			va := &v1alpha1.VariantAutoscaling{}
+			err := crClient.Get(ctx, client.ObjectKey{
+				Namespace: namespace,
+				Name:      deployName,
+			}, va)
+			g.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to fetch VariantAutoscaling for: %s", deployName))
+
+			g.Expect(va.Status.DesiredOptimizedAlloc.NumReplicas).To(Equal(lastObservedReplicas),
+				fmt.Sprintf("Replicas should be stable before capturing baseline for VA: %s", va.Name))
+
+		}, 1*time.Minute, 10*time.Second).Should(Succeed())
+
+		// NOW capture the stable replica count as our baseline for the constant load test
+		By("capturing the stabilized replica count as baseline")
 		var initialDesiredReplicas int32
 		va := &v1alpha1.VariantAutoscaling{}
 		err = crClient.Get(ctx, client.ObjectKey{
@@ -449,26 +492,7 @@ var _ = Describe("Test workload-variant-autoscaler in emulated environment - sin
 		}, va)
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to fetch VariantAutoscaling for: %s", deployName))
 		initialDesiredReplicas = va.Status.DesiredOptimizedAlloc.NumReplicas
-
-		// Since the previous Job has just finished and a new Job has started, there is an interval in which
-		// higher load is being generated. During this time, the controller may decide to scale up further.
-		// To avoid false negatives, we first wait for the load to stabilize, then we verify that
-		// the number of replicas remains constant over a period of time.
-		By("waiting for the load generator to stabilize the load")
-		Consistently(func(g Gomega) {
-			Eventually(func(g Gomega) {
-				va := &v1alpha1.VariantAutoscaling{}
-				err = crClient.Get(ctx, client.ObjectKey{
-					Namespace: namespace,
-					Name:      deployName,
-				}, va)
-				g.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to fetch VariantAutoscaling for: %s", deployName))
-
-				// Note: In the new single-variant API, load metrics are not stored in the VA status.
-				// Load metrics are collected directly from Prometheus when needed by the controller.
-
-			}, 2*time.Minute, 10*time.Second).Should(Succeed())
-		}, 2*time.Minute, 10*time.Second).Should(Succeed())
+		fmt.Printf("Baseline replica count captured: %d for VA: %s\n", initialDesiredReplicas, deployName)
 
 		var desiredReplicasProm float64
 		By("verifying that the number of replicas remains constant over several minutes with constant load")
