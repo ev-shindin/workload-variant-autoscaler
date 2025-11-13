@@ -447,8 +447,12 @@ var _ = Describe("Test workload-variant-autoscaler in emulated environment - sin
 		// During this time, the controller continues scaling based on the transient load.
 		//
 		// We MUST wait for the system to reach steady state before capturing the baseline.
-		// Strategy: Repeatedly check if replicas stay constant for 2 minutes. If they change
-		// during that period, Eventually retries with the new value until we find stability.
+		// Strategy: Manually check if replicas stay constant for 2 minutes.
+		// If they change during that period, Eventually retries with the new value.
+		//
+		// IMPORTANT: Cannot use Consistently().Should(Succeed()) inside Eventually()
+		// because Should() throws assertion errors that terminate the test immediately
+		// instead of allowing Eventually to retry.
 		By("waiting for replica count to stabilize after load restart")
 		var stableReplicaCount int32
 		Eventually(func(g Gomega) {
@@ -466,9 +470,11 @@ var _ = Describe("Test workload-variant-autoscaler in emulated environment - sin
 			currentReplicas := va.Status.DesiredOptimizedAlloc.NumReplicas
 			fmt.Printf("Checking stability for VA %s: current replicas = %d\n", deployName, currentReplicas)
 
-			// Verify this value stays constant for 2 minutes
-			// If it changes, Eventually will catch the failure and retry
-			Consistently(func(g Gomega) {
+			// Manually check stability: verify replicas don't change for 2 minutes
+			// Check every 10 seconds for 2 minutes (12 iterations)
+			for i := 0; i < 12; i++ {
+				time.Sleep(10 * time.Second)
+
 				va := &v1alpha1.VariantAutoscaling{}
 				err := crClient.Get(ctx, client.ObjectKey{
 					Namespace: namespace,
@@ -476,12 +482,18 @@ var _ = Describe("Test workload-variant-autoscaler in emulated environment - sin
 				}, va)
 				g.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to fetch VariantAutoscaling for: %s", deployName))
 
-				g.Expect(va.Status.DesiredOptimizedAlloc.NumReplicas).To(Equal(currentReplicas),
-					fmt.Sprintf("Replicas should remain at %d during stability check for VA: %s", currentReplicas, va.Name))
+				newReplicas := va.Status.DesiredOptimizedAlloc.NumReplicas
+				if newReplicas != currentReplicas {
+					// Replicas changed - not stable yet
+					// Use g.Expect to fail this Eventually iteration so it will retry
+					fmt.Printf("Replicas changed from %d to %d during stability check - retrying\n", currentReplicas, newReplicas)
+					g.Expect(newReplicas).To(Equal(currentReplicas),
+						fmt.Sprintf("Replicas should remain stable during 2min check for VA: %s", va.Name))
+					return // Eventually will retry
+				}
+			}
 
-			}, 2*time.Minute, 10*time.Second).Should(Succeed())
-
-			// If we reach here, replicas have been stable for 2 minutes
+			// If we get here, replicas were stable for 2 minutes
 			stableReplicaCount = currentReplicas
 			fmt.Printf("✓ Replicas stabilized at %d for VA %s\n", stableReplicaCount, deployName)
 
