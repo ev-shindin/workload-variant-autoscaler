@@ -441,14 +441,18 @@ var _ = Describe("Test workload-variant-autoscaler in emulated environment - sin
 		}()
 
 		// When load generation restarts, there's a transient period where:
-		// 1. The previous job has just finished (load drops)
-		// 2. The new job is starting (load ramps up)
-		// During this time, the controller may still be adjusting replicas based on the changing load.
-		// We must wait for the system to stabilize BEFORE capturing the baseline replica count,
-		// otherwise we might capture a transient value that doesn't represent the steady state.
-		By("waiting for the controller to stabilize replica count after load restart")
-		var lastObservedReplicas int32
+		// 1. The previous test has just finished (load drops to zero)
+		// 2. The new load generator starts ramping up
+		// 3. The load generator may initially produce HIGHER load than steady state
+		// During this time, the controller continues scaling based on the transient load.
+		//
+		// We MUST wait for the system to reach steady state before capturing the baseline.
+		// Strategy: Repeatedly check if replicas stay constant for 2 minutes. If they change
+		// during that period, Eventually retries with the new value until we find stability.
+		By("waiting for replica count to stabilize after load restart")
+		var stableReplicaCount int32
 		Eventually(func(g Gomega) {
+			// Get current replica count
 			va := &v1alpha1.VariantAutoscaling{}
 			err = crClient.Get(ctx, client.ObjectKey{
 				Namespace: namespace,
@@ -456,43 +460,40 @@ var _ = Describe("Test workload-variant-autoscaler in emulated environment - sin
 			}, va)
 			g.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to fetch VariantAutoscaling for: %s", deployName))
 
-			// Wait for DesiredOptimizedAlloc to be computed
 			g.Expect(va.Status.DesiredOptimizedAlloc.NumReplicas).To(BeNumerically(">", 0),
 				fmt.Sprintf("DesiredOptimizedAlloc should be computed for VA: %s", va.Name))
 
-			lastObservedReplicas = va.Status.DesiredOptimizedAlloc.NumReplicas
+			currentReplicas := va.Status.DesiredOptimizedAlloc.NumReplicas
+			fmt.Printf("Checking stability for VA %s: current replicas = %d\n", deployName, currentReplicas)
+
+			// Verify this value stays constant for 2 minutes
+			// If it changes, Eventually will catch the failure and retry
+			Consistently(func(g Gomega) {
+				va := &v1alpha1.VariantAutoscaling{}
+				err := crClient.Get(ctx, client.ObjectKey{
+					Namespace: namespace,
+					Name:      deployName,
+				}, va)
+				g.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to fetch VariantAutoscaling for: %s", deployName))
+
+				g.Expect(va.Status.DesiredOptimizedAlloc.NumReplicas).To(Equal(currentReplicas),
+					fmt.Sprintf("Replicas should remain at %d during stability check for VA: %s", currentReplicas, va.Name))
+
+			}, 2*time.Minute, 10*time.Second).Should(Succeed())
+
+			// If we reach here, replicas have been stable for 2 minutes
+			stableReplicaCount = currentReplicas
+			fmt.Printf("✓ Replicas stabilized at %d for VA %s\n", stableReplicaCount, deployName)
 
 			// Note: In the new single-variant API, load metrics are not stored in the VA status.
 			// Load metrics are collected directly from Prometheus when needed by the controller.
 
-		}, 3*time.Minute, 10*time.Second).Should(Succeed())
+		}, 10*time.Minute, 30*time.Second).Should(Succeed())
 
-		// Now verify that replicas stay stable for a period of time before capturing the baseline
-		By("verifying replicas have stabilized before capturing baseline")
-		Consistently(func(g Gomega) {
-			va := &v1alpha1.VariantAutoscaling{}
-			err := crClient.Get(ctx, client.ObjectKey{
-				Namespace: namespace,
-				Name:      deployName,
-			}, va)
-			g.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to fetch VariantAutoscaling for: %s", deployName))
-
-			g.Expect(va.Status.DesiredOptimizedAlloc.NumReplicas).To(Equal(lastObservedReplicas),
-				fmt.Sprintf("Replicas should be stable before capturing baseline for VA: %s", va.Name))
-
-		}, 1*time.Minute, 10*time.Second).Should(Succeed())
-
-		// NOW capture the stable replica count as our baseline for the constant load test
-		By("capturing the stabilized replica count as baseline")
-		var initialDesiredReplicas int32
-		va := &v1alpha1.VariantAutoscaling{}
-		err = crClient.Get(ctx, client.ObjectKey{
-			Namespace: namespace,
-			Name:      deployName,
-		}, va)
-		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Should be able to fetch VariantAutoscaling for: %s", deployName))
-		initialDesiredReplicas = va.Status.DesiredOptimizedAlloc.NumReplicas
-		fmt.Printf("Baseline replica count captured: %d for VA: %s\n", initialDesiredReplicas, deployName)
+		// NOW capture the stable replica count as our baseline
+		By("using the stabilized replica count as baseline for constant load test")
+		initialDesiredReplicas := stableReplicaCount
+		fmt.Printf("Baseline for constant load test: %d replicas for VA %s\n", initialDesiredReplicas, deployName)
 
 		var desiredReplicasProm float64
 		By("verifying that the number of replicas remains constant over several minutes with constant load")
