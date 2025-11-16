@@ -138,7 +138,12 @@ func CreateAllocation(serverName string, gName string) *Allocation {
 		totalRate = target.TPS / float32(K)
 	}
 	numReplicas := int(math.Ceil(float64(totalRate) / float64(rateStar)))
+
+	// Enforce min/max replica bounds
 	numReplicas = max(numReplicas, server.minNumReplicas)
+	if server.maxNumReplicas != nil {
+		numReplicas = min(numReplicas, *server.maxNumReplicas)
+	}
 
 	// calculate cost
 	totalNumInstances := model.NumInstances(gName) * numReplicas

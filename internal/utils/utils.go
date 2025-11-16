@@ -273,16 +273,38 @@ func AddServerInfoToSystemData(
 	}
 
 	// all server data
-	minNumReplicas := 1 // scale to zero is disabled by default
-	if os.Getenv("WVA_SCALE_TO_ZERO") == "true" {
-		minNumReplicas = 0
+	// Read MinReplicas from VA spec with scale-to-zero protection:
+	// - If MinReplicas is set AND > 0, use that value
+	// - If MinReplicas is not set OR is 0:
+	//   - If WVA_SCALE_TO_ZERO=true, allow minReplicas=0 (scale to zero)
+	//   - Otherwise, enforce minReplicas=1 (default minimum)
+	minNumReplicas := 1
+	if va.Spec.MinReplicas != nil && *va.Spec.MinReplicas > 0 {
+		minNumReplicas = int(*va.Spec.MinReplicas)
+	} else if os.Getenv("WVA_SCALE_TO_ZERO") == "true" {
+		// Scale-to-zero is explicitly enabled
+		if va.Spec.MinReplicas != nil {
+			minNumReplicas = int(*va.Spec.MinReplicas)
+		} else {
+			minNumReplicas = 0
+		}
 	}
+	// else: default to 1 (safe minimum)
+
+	// Read MaxReplicas from VA spec (nil means unlimited)
+	var maxNumReplicas *int
+	if va.Spec.MaxReplicas != nil {
+		maxVal := int(*va.Spec.MaxReplicas)
+		maxNumReplicas = &maxVal
+	}
+
 	serverSpec := &infernoConfig.ServerSpec{
 		Name:            FullName(va.Name, va.Namespace),
 		Class:           className,
 		Model:           va.Spec.ModelID,
 		KeepAccelerator: true,
 		MinNumReplicas:  minNumReplicas,
+		MaxNumReplicas:  maxNumReplicas,
 		CurrentAlloc:    *AllocationData,
 		DesiredAlloc:    infernoConfig.AllocationData{},
 	}
@@ -301,7 +323,8 @@ func AddServerInfoToSystemData(
 // Adapter from inferno alloc solution to optimized alloc
 func CreateOptimizedAlloc(name string,
 	namespace string,
-	allocationSolution *infernoConfig.AllocationSolution) (*llmdVariantAutoscalingV1alpha1.OptimizedAlloc, error) {
+	allocationSolution *infernoConfig.AllocationSolution,
+	va *llmdVariantAutoscalingV1alpha1.VariantAutoscaling) (*llmdVariantAutoscalingV1alpha1.OptimizedAlloc, error) {
 
 	serverName := FullName(name, namespace)
 	var allocationData infernoConfig.AllocationData
@@ -310,10 +333,34 @@ func CreateOptimizedAlloc(name string,
 		return nil, fmt.Errorf("server %s not found", serverName)
 	}
 	logger.Log.Debug("Setting allocation ", "accelerator ", allocationData.Accelerator, "replicas ", allocationData.NumReplicas)
+
+	// Get optimizer's suggested replica count
+	numReplicas := int32(allocationData.NumReplicas)
+
+	// Safety bounds enforcement: Clamp replicas to min/max bounds from VA spec
+	// This is a safety check in case the optimizer somehow violates the bounds
+	if va.Spec.MinReplicas != nil && numReplicas < *va.Spec.MinReplicas {
+		logger.Log.Warn("Optimizer returned replicas below minimum, clamping to minReplicas",
+			"variant", va.Name,
+			"namespace", va.Namespace,
+			"optimizer_value", numReplicas,
+			"min_replicas", *va.Spec.MinReplicas)
+		numReplicas = *va.Spec.MinReplicas
+	}
+
+	if va.Spec.MaxReplicas != nil && numReplicas > *va.Spec.MaxReplicas {
+		logger.Log.Warn("Optimizer returned replicas above maximum, clamping to maxReplicas",
+			"variant", va.Name,
+			"namespace", va.Namespace,
+			"optimizer_value", numReplicas,
+			"max_replicas", *va.Spec.MaxReplicas)
+		numReplicas = *va.Spec.MaxReplicas
+	}
+
 	// In single-variant architecture, accelerator is in spec, not in OptimizedAlloc
 	optimizedAlloc := &llmdVariantAutoscalingV1alpha1.OptimizedAlloc{
 		LastRunTime: metav1.NewTime(time.Now()),
-		NumReplicas: int32(allocationData.NumReplicas),
+		NumReplicas: numReplicas,
 	}
 	return optimizedAlloc, nil
 }

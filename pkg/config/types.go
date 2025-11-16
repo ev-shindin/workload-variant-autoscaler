@@ -115,6 +115,7 @@ type ServerSpec struct {
 	Model           string         `json:"model"`           // model name
 	KeepAccelerator bool           `json:"keepAccelerator"` // option to not change accelerator
 	MinNumReplicas  int            `json:"minNumReplicas"`  // minimum number of replicas
+	MaxNumReplicas  *int           `json:"maxNumReplicas"`  // maximum number of replicas (nil means unlimited)
 	MaxBatchSize    int            `json:"maxBatchSize"`    // overriding value for the maximum batch size
 	CurrentAlloc    AllocationData `json:"currentAlloc"`    // current allocation
 	DesiredAlloc    AllocationData `json:"desiredAlloc"`    // desired allocation
