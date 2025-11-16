@@ -193,9 +193,9 @@ var _ = Describe("Optimizer", Ordered, func() {
 							Kind:       "Deployment",
 							Name:       fmt.Sprintf("test-variantautoscaling-%d", i),
 						},
-						ModelID:   "meta/llama0-70b",
-						VariantID: fmt.Sprintf("meta/llama0-70b-A100-%d", i),
-						Accelerator: "A100",
+						ModelID:          "meta/llama0-70b",
+						VariantID:        fmt.Sprintf("meta/llama0-70b-A100-%d", i),
+						Accelerator:      "A100",
 						AcceleratorCount: 1,
 						VariantProfile: llmdVariantAutoscalingV1alpha1.VariantProfile{
 							PerfParms: llmdVariantAutoscalingV1alpha1.PerfParms{
@@ -337,9 +337,9 @@ var _ = Describe("Optimizer", Ordered, func() {
 		})
 
 		// FIXME(PR1): This test is temporarily skipped due to load metrics refactoring
-	// The test will be fixed in PR2 when controller collects metrics from Prometheus
-	// See: https://github.com/llm-d-incubation/workload-variant-autoscaler/issues/XXX
-	PIt("should perform optimization for multiple VariantAutoscalings - scale out under load pressure", func() {
+		// The test will be fixed in PR2 when controller collects metrics from Prometheus
+		// See: https://github.com/llm-d-incubation/workload-variant-autoscaler/issues/XXX
+		PIt("should perform optimization for multiple VariantAutoscalings - scale out under load pressure", func() {
 			allAnalyzerResponses := make(map[string]*interfaces.ModelAnalyzeResponse)
 			vaMap := make(map[string]*llmdVariantAutoscalingV1alpha1.VariantAutoscaling)
 
@@ -427,8 +427,8 @@ var _ = Describe("Optimizer", Ordered, func() {
 				arrivalRate := 20.0
 				avgInputTokens := 20.0
 				avgOutputTokens := 200.0
-				ttftAverage := 20.0  // 0.02 seconds * 1000 = 20 milliseconds
-				itlAverage := 8.0    // 0.008 seconds * 1000 = 8 milliseconds
+				ttftAverage := 20.0 // 0.02 seconds * 1000 = 20 milliseconds
+				itlAverage := 8.0   // 0.008 seconds * 1000 = 8 milliseconds
 				err = utils.AddServerInfoToSystemData(systemData, &updateVA, className, arrivalRate, avgInputTokens, avgOutputTokens, itlAverage, ttftAverage)
 				Expect(err).NotTo(HaveOccurred(), "failed to add server info to system data for variantAutoscaling - ", "variantAutoscaling-name: ", va.Name)
 

@@ -543,7 +543,7 @@ var _ = Describe("VariantAutoscalings Controller", func() {
 					Accelerator:      "A100",
 					AcceleratorCount: 1,
 					VariantCost:      "10.00",
-					SLOClassRef: llmdVariantAutoscalingV1alpha1.ConfigMapKeyRef{
+					SLOClassRef:      llmdVariantAutoscalingV1alpha1.ConfigMapKeyRef{
 						// no configuration for SLOClassRef
 					},
 					VariantProfile: llmdVariantAutoscalingV1alpha1.VariantProfile{
