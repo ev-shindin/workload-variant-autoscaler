@@ -46,11 +46,12 @@ type MetricKV struct {
 	Value  float64
 }
 
-// queryAndExtractMetric performs a Prometheus query and extracts the float value,
-func queryAndExtractMetric(ctx context.Context, promAPI promv1.API, query string, metricName string) (float64, error) {
+// queryAndExtractMetric performs a Prometheus query and extracts the float value.
+// Returns (value, dataFound, error) where dataFound indicates if any time series data was returned.
+func queryAndExtractMetric(ctx context.Context, promAPI promv1.API, query string, metricName string) (float64, bool, error) {
 	val, warn, err := promAPI.Query(ctx, query, time.Now())
 	if err != nil {
-		return 0.0, fmt.Errorf("failed to query Prometheus for %s: %w", metricName, err)
+		return 0.0, false, fmt.Errorf("failed to query Prometheus for %s: %w", metricName, err)
 	}
 
 	if warn != nil {
@@ -60,37 +61,42 @@ func queryAndExtractMetric(ctx context.Context, promAPI promv1.API, query string
 	// Check if the result type is a Vector
 	if val.Type() != model.ValVector {
 		logger.Log.Debug("Prometheus query returned non-vector type", "metric", metricName, "type", val.Type().String())
-		return 0.0, nil
+		return 0.0, false, nil
 	}
 
 	vec := val.(model.Vector)
-	resultVal := 0.0
-	if len(vec) > 0 {
-		resultVal = float64(vec[0].Value)
-		// Handle NaN or Inf values
-		FixValue(&resultVal)
+	if len(vec) == 0 {
+		// No data found - this is different from "data found with value 0.0"
+		return 0.0, false, nil
 	}
 
-	return resultVal, nil
+	// Data found - extract the value
+	resultVal := float64(vec[0].Value)
+	// Handle NaN or Inf values
+	FixValue(&resultVal)
+
+	return resultVal, true, nil
 }
 
-// queryWithFallback tries a query with namespace label first, then falls back to without namespace
-// This supports both real vLLM deployments (with namespace) and vllm-emulator (without namespace)
+// queryWithFallback tries a query with namespace label first, then falls back to without namespace.
+// This supports both real vLLM deployments (with namespace) and vllm-emulator (without namespace).
+// The fallback only happens when NO data is found (empty result set), not when data is found with value 0.0.
 func queryWithFallback(ctx context.Context, promAPI promv1.API, queryWithNS, queryWithoutNS, metricName string) (float64, error) {
 	// Try with namespace first
-	result, err := queryAndExtractMetric(ctx, promAPI, queryWithNS, metricName)
+	result, dataFound, err := queryAndExtractMetric(ctx, promAPI, queryWithNS, metricName)
 	if err != nil {
 		return 0.0, err
 	}
 
-	// If result is non-zero, return it
-	if result != 0.0 {
+	// If data was found (even if value is 0.0), return it
+	if dataFound {
 		return result, nil
 	}
 
-	// Otherwise try fallback query without namespace (for vllm-emulator compatibility)
-	logger.Log.Debug("Primary query returned zero, trying fallback without namespace", "metric", metricName)
-	return queryAndExtractMetric(ctx, promAPI, queryWithoutNS, metricName)
+	// No data found - try fallback query without namespace (for vllm-emulator compatibility)
+	logger.Log.Debug("Primary query returned no data, trying fallback without namespace", "metric", metricName)
+	result, _, err = queryAndExtractMetric(ctx, promAPI, queryWithoutNS, metricName)
+	return result, err
 }
 
 // MetricsValidationResult contains the result of metrics availability check
