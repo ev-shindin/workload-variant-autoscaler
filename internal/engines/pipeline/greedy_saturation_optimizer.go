@@ -7,7 +7,7 @@ import (
 
 	ctrl "sigs.k8s.io/controller-runtime"
 
-	"github.com/llm-d-incubation/workload-variant-autoscaler/internal/interfaces"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/interfaces"
 )
 
 // GreedyBySaturationOptimizer is a multi-model optimizer for GPU-constrained
