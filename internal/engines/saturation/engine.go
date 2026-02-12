@@ -457,8 +457,20 @@ func (e *Engine) optimizeV2(
 		return nil
 	}
 
-	// Stage 2: Call optimizer (no constraints for now — CostAwareOptimizer ignores them)
-	allDecisions := e.optimizer.Optimize(ctx, requests, nil)
+	// Stage 2: Compute GPU constraints and call optimizer
+	var constraints []*pipeline.ResourceConstraints
+	if _, ok := e.optimizer.(*pipeline.GreedyBySaturationOptimizer); ok {
+		currentUsage := computeCurrentGPUUsage(requests)
+		if limiter, ok := e.GPULimiter.(*pipeline.DefaultLimiter); ok {
+			constraint, err := limiter.ComputeConstraints(ctx, currentUsage)
+			if err != nil {
+				logger.Error(err, "Failed to compute GPU constraints, falling back to unlimited")
+			} else {
+				constraints = append(constraints, constraint)
+			}
+		}
+	}
+	allDecisions := e.optimizer.Optimize(ctx, requests, constraints)
 
 	logger.Info("V2 optimizer produced decisions",
 		"optimizer", e.optimizer.Name(),
