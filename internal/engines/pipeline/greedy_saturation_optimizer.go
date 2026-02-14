@@ -90,7 +90,7 @@ func (o *GreedyBySaturationOptimizer) Optimize(
 		targets := initTargets(req.VariantStates)
 
 		if req.Result.SpareCapacity > 0 {
-			costAwareScaleDown(ctx, req.Result, vcMap, targets)
+			costAwareScaleDown(ctx, req.Result, targets)
 		}
 
 		decisions := buildDecisionsWithOptimizer(req, stateMap, vcMap, targets, "greedy-by-saturation")

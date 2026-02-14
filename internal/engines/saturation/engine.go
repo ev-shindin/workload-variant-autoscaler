@@ -482,23 +482,18 @@ func (e *Engine) optimizeV2(
 		"decisionCount", len(allDecisions),
 		"modelCount", len(requests))
 
-	// Stage 3: Apply enforcer per-model (bridge from decisions to targets map)
+	// Stage 3: Apply enforcer per-model (directly on decisions)
 	for _, req := range requests {
 		scaleToZeroConfig := e.Config.ScaleToZeroConfigForNamespace(req.Namespace)
 
-		targets := extractTargetsFromDecisions(allDecisions, req.ModelID, req.Namespace)
-		variantAnalyses := buildVariantAnalysesFromDecisions(allDecisions, req.ModelID, req.Namespace)
-
-		enforcedTargets, scaledToZero := e.ScaleToZeroEnforcer.EnforcePolicy(
+		scaledToZero := e.ScaleToZeroEnforcer.EnforcePolicyOnDecisions(
 			ctx, req.ModelID, req.Namespace,
-			targets, variantAnalyses, scaleToZeroConfig,
+			allDecisions, scaleToZeroConfig, e.optimizer.Name(),
 		)
 		if scaledToZero {
 			logger.Info("Scale-to-zero enforcement applied (V2)",
-				"modelID", req.ModelID, "enforcedTargets", enforcedTargets)
+				"modelID", req.ModelID)
 		}
-
-		allDecisions = applyEnforcedTargetsToDecisions(allDecisions, enforcedTargets, req.ModelID, req.Namespace, e.optimizer.Name())
 	}
 
 	return allDecisions

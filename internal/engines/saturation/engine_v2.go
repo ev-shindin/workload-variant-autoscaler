@@ -71,61 +71,6 @@ func (e *Engine) runV2AnalysisOnly(
 	return result, nil
 }
 
-// extractTargetsFromDecisions builds a targets map from optimizer decisions
-// for a specific model, for use by the enforcer.
-func extractTargetsFromDecisions(decisions []interfaces.VariantDecision, modelID, namespace string) map[string]int {
-	targets := make(map[string]int)
-	for _, d := range decisions {
-		if d.ModelID == modelID && d.Namespace == namespace {
-			targets[d.VariantName] = d.TargetReplicas
-		}
-	}
-	return targets
-}
-
-// buildVariantAnalysesFromDecisions builds VariantSaturationAnalysis from decisions
-// for enforcer compatibility. The enforcer only needs Cost and VariantName from these.
-func buildVariantAnalysesFromDecisions(decisions []interfaces.VariantDecision, modelID, namespace string) []interfaces.VariantSaturationAnalysis {
-	var analyses []interfaces.VariantSaturationAnalysis
-	for _, d := range decisions {
-		if d.ModelID == modelID && d.Namespace == namespace {
-			analyses = append(analyses, interfaces.VariantSaturationAnalysis{
-				VariantName:     d.VariantName,
-				AcceleratorName: d.AcceleratorName,
-				Cost:            d.Cost,
-				ReplicaCount:    d.CurrentReplicas,
-			})
-		}
-	}
-	return analyses
-}
-
-// applyEnforcedTargetsToDecisions updates the optimizer's decisions with
-// enforced targets after the enforcer has run. This bridges the enforcer's
-// map[string]int output back into []VariantDecision.
-func applyEnforcedTargetsToDecisions(decisions []interfaces.VariantDecision, enforcedTargets map[string]int, modelID, namespace, optimizerName string) []interfaces.VariantDecision {
-	for i := range decisions {
-		d := &decisions[i]
-		if d.ModelID != modelID || d.Namespace != namespace {
-			continue
-		}
-		if enforced, ok := enforcedTargets[d.VariantName]; ok && enforced != d.TargetReplicas {
-			d.TargetReplicas = enforced
-			// Update action based on enforced target
-			switch {
-			case enforced > d.CurrentReplicas:
-				d.Action = interfaces.ActionScaleUp
-			case enforced < d.CurrentReplicas:
-				d.Action = interfaces.ActionScaleDown
-			default:
-				d.Action = interfaces.ActionNoChange
-			}
-			d.Reason = fmt.Sprintf("V2 %s (optimizer: %s, enforced)", d.Action, optimizerName)
-		}
-	}
-	return decisions
-}
-
 // computeCurrentGPUUsage iterates over model scaling requests to compute the
 // current GPU usage per accelerator type. Used to provide current usage to
 // the ConstraintProvider when building GPU constraints for the optimizer.
