@@ -51,8 +51,8 @@ var _ = Describe("GreedyBySaturationOptimizer", func() {
 			}
 			constraints := []*ResourceConstraints{
 				{Pools: map[string]ResourcePool{
-					"A100": {Available: 10},
-					"H100": {Available: 8},
+					"A100": {Limit: 10},
+					"H100": {Limit: 8},
 				}},
 			}
 
@@ -110,7 +110,7 @@ var _ = Describe("GreedyBySaturationOptimizer", func() {
 			}
 			constraints := []*ResourceConstraints{
 				{Pools: map[string]ResourcePool{
-					"A100": {Available: 4}, // Only 2 replicas worth
+					"A100": {Limit: 4}, // Only 2 replicas worth
 				}},
 			}
 
@@ -156,7 +156,7 @@ var _ = Describe("GreedyBySaturationOptimizer", func() {
 			}
 			constraints := []*ResourceConstraints{
 				{Pools: map[string]ResourcePool{
-					"A100": {Available: 8}, // 4 replicas worth
+					"A100": {Limit: 8}, // 4 replicas worth
 				}},
 			}
 
@@ -229,7 +229,7 @@ var _ = Describe("GreedyBySaturationOptimizer", func() {
 			}
 			constraints := []*ResourceConstraints{
 				{Pools: map[string]ResourcePool{
-					"A100": {Available: 12}, // 6 replicas worth
+					"A100": {Limit: 12}, // 6 replicas worth
 				}},
 			}
 
@@ -278,7 +278,7 @@ var _ = Describe("GreedyBySaturationOptimizer", func() {
 			}
 			constraints := []*ResourceConstraints{
 				{Pools: map[string]ResourcePool{
-					"A100": {Available: 8}, // 4 replicas worth
+					"A100": {Limit: 8}, // 4 replicas worth
 				}},
 			}
 
@@ -339,8 +339,8 @@ var _ = Describe("GreedyBySaturationOptimizer", func() {
 			}
 			constraints := []*ResourceConstraints{
 				{Pools: map[string]ResourcePool{
-					"H100": {Available: 4}, // 1 H100 replica
-					"A100": {Available: 6}, // 3 A100 replicas
+					"H100": {Limit: 4}, // 1 H100 replica
+					"A100": {Limit: 6}, // 3 A100 replicas
 				}},
 			}
 
@@ -381,8 +381,8 @@ var _ = Describe("GreedyBySaturationOptimizer", func() {
 			}
 			constraints := []*ResourceConstraints{
 				{Pools: map[string]ResourcePool{
-					"A100": {Available: 4}, // 2 A100 replicas
-					"H100": {Available: 0}, // no H100 GPUs
+					"A100": {Limit: 4}, // 2 A100 replicas
+					"H100": {Limit: 0}, // no H100 GPUs
 				}},
 			}
 
@@ -416,7 +416,7 @@ var _ = Describe("GreedyBySaturationOptimizer", func() {
 			}
 			constraints := []*ResourceConstraints{
 				{Pools: map[string]ResourcePool{
-					"A100": {Available: 0},
+					"A100": {Limit: 0},
 				}},
 			}
 
@@ -512,7 +512,7 @@ var _ = Describe("GreedyBySaturationOptimizer", func() {
 			}
 			constraints := []*ResourceConstraints{
 				{Pools: map[string]ResourcePool{
-					"A100": {Available: 4},
+					"A100": {Limit: 4},
 				}},
 			}
 
@@ -551,7 +551,7 @@ var _ = Describe("GreedyBySaturationOptimizer", func() {
 			}
 			constraints := []*ResourceConstraints{
 				{Pools: map[string]ResourcePool{
-					"A100": {Available: 10},
+					"A100": {Limit: 10},
 				}},
 			}
 
@@ -596,7 +596,7 @@ var _ = Describe("GreedyBySaturationOptimizer", func() {
 			}
 			constraints := []*ResourceConstraints{
 				{Pools: map[string]ResourcePool{
-					"A100": {Available: 10},
+					"A100": {Limit: 10},
 				}},
 			}
 
@@ -655,7 +655,7 @@ var _ = Describe("GreedyBySaturationOptimizer", func() {
 			}
 			constraints := []*ResourceConstraints{
 				{Pools: map[string]ResourcePool{
-					"A100": {Available: 2}, // enough for 2 replicas at 1 GPU each
+					"A100": {Limit: 2}, // enough for 2 replicas at 1 GPU each
 				}},
 			}
 
@@ -687,7 +687,7 @@ var _ = Describe("GreedyBySaturationOptimizer", func() {
 			}
 			constraints := []*ResourceConstraints{
 				{Pools: map[string]ResourcePool{
-					"A100": {Available: 4},
+					"A100": {Limit: 4},
 				}},
 			}
 
@@ -718,7 +718,7 @@ var _ = Describe("GreedyBySaturationOptimizer", func() {
 			}
 			constraints := []*ResourceConstraints{
 				{Pools: map[string]ResourcePool{
-					"A100": {Available: 4},
+					"A100": {Limit: 4},
 				}},
 			}
 

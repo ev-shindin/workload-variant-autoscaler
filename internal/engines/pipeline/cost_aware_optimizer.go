@@ -41,7 +41,7 @@ func (o *CostAwareOptimizer) Optimize(
 	requests []ModelScalingRequest,
 	constraints []*ResourceConstraints,
 ) []interfaces.VariantDecision {
-	logger := ctrl.LoggerFrom(ctx)
+	logger := ctrl.LoggerFrom(ctx).WithName(o.Name())
 	var allDecisions []interfaces.VariantDecision
 
 	for _, req := range requests {
@@ -286,8 +286,8 @@ func mergeConstraints(constraints []*ResourceConstraints) map[string]int {
 			continue
 		}
 		for accType, pool := range c.Pools {
-			if existing, ok := merged[accType]; !ok || pool.Available < existing {
-				merged[accType] = pool.Available
+			if existing, ok := merged[accType]; !ok || pool.Available() < existing {
+				merged[accType] = pool.Available()
 			}
 		}
 	}

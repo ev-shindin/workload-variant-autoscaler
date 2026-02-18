@@ -45,7 +45,7 @@ func (o *GreedyBySaturationOptimizer) Optimize(
 	requests []ModelScalingRequest,
 	constraints []*ResourceConstraints,
 ) []interfaces.VariantDecision {
-	logger := ctrl.LoggerFrom(ctx)
+	logger := ctrl.LoggerFrom(ctx).WithName(o.Name())
 	available := mergeConstraints(constraints)
 
 	// Separate scale-up and scale-down/steady models
