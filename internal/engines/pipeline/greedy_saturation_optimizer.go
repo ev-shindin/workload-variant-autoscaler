@@ -8,6 +8,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/interfaces"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/logging"
 )
 
 // GreedyBySaturationOptimizer is a multi-model optimizer for GPU-constrained
@@ -17,7 +18,6 @@ import (
 // Key differences from CostAwareOptimizer:
 //   - Respects ResourceConstraints (GPU budgets per accelerator type)
 //   - Fair-shares GPUs across models (most starved model gets GPUs first)
-//   - Skips variants with pending replicas (GPUs are scarce, don't pile on)
 //   - Scale-down is identical to CostAwareOptimizer (reuses costAwareScaleDown)
 type GreedyBySaturationOptimizer struct{}
 
@@ -78,7 +78,7 @@ func (o *GreedyBySaturationOptimizer) Optimize(
 		stateMap := buildStateMap(w.req.VariantStates)
 		vcMap := buildCapacityMap(w.req.Result.VariantCapacities)
 		decisions := buildDecisionsWithOptimizer(w.req, stateMap, vcMap, w.targets, "greedy-by-saturation")
-		logger.V(1).Info("Greedy-by-saturation optimizer decisions (scale-up)",
+		logger.V(logging.DEBUG).Info("Greedy-by-saturation optimizer decisions (scale-up)",
 			"modelID", w.req.ModelID,
 			"decisions", len(decisions))
 		allDecisions = append(allDecisions, decisions...)
@@ -94,7 +94,7 @@ func (o *GreedyBySaturationOptimizer) Optimize(
 		}
 
 		decisions := buildDecisionsWithOptimizer(req, stateMap, vcMap, targets, "greedy-by-saturation")
-		logger.V(1).Info("Greedy-by-saturation optimizer decisions (other)",
+		logger.V(logging.DEBUG).Info("Greedy-by-saturation optimizer decisions (other)",
 			"modelID", req.ModelID,
 			"decisions", len(decisions))
 		allDecisions = append(allDecisions, decisions...)
@@ -126,13 +126,13 @@ func (o *GreedyBySaturationOptimizer) fairShareScaleUp(
 			totalGPUs += v
 		}
 		if totalGPUs == 0 {
-			logger.V(1).Info("GreedyBySaturation: no GPUs remaining, stopping fair-share")
+			logger.V(logging.DEBUG).Info("GreedyBySaturation: no GPUs remaining, stopping fair-share")
 			break
 		}
 
 		// Compute mean required capacity
 		mean := computeMean(active)
-		logger.V(1).Info("GreedyBySaturation: iteration",
+		logger.V(logging.DEBUG).Info("GreedyBySaturation: iteration",
 			"activeModels", len(active), "meanRequired", mean)
 
 		// Sort by remaining DESC (most starved first)
@@ -141,16 +141,19 @@ func (o *GreedyBySaturationOptimizer) fairShareScaleUp(
 		// Pick the most starved model
 		w := active[0]
 
-		if w.remaining <= mean && len(active) > 1 {
-			// All models are at or below mean — done
-			break
-		}
-
-		// For allocation target: when there's only one active model, use mean=0
-		// to allocate its full remaining demand (not target=remaining-mean=0).
+		// Compute allocation target (how far below the mean to bring this model).
+		// Three cases:
+		//   1. Single model: allocationMean=0 → satisfy full demand
+		//   2. Tied models (max remaining == mean, implies all equal):
+		//      allocationMean = mean * (N-1)/N → each gets 1/N of demand per iteration
+		//   3. Normal: allocationMean = mean → bring to average
 		allocationMean := mean
 		if len(active) == 1 {
 			allocationMean = 0
+		} else if w.remaining <= mean {
+			// All models tied (max ≤ avg implies all equal).
+			// Allocate 1/N of demand per iteration for fair distribution.
+			allocationMean = mean - (w.remaining / float64(len(active)))
 		}
 
 		// Allocate replicas to bring this model below mean
@@ -159,7 +162,7 @@ func (o *GreedyBySaturationOptimizer) fairShareScaleUp(
 		if !allocated {
 			// No GPUs available for any variant of this model — remove from working set
 			w.remaining = -1
-			logger.V(1).Info("GreedyBySaturation: no GPUs available for model, removing",
+			logger.V(logging.DEBUG).Info("GreedyBySaturation: no GPUs available for model, removing",
 				"model", w.req.ModelID)
 			continue
 		}
@@ -167,7 +170,7 @@ func (o *GreedyBySaturationOptimizer) fairShareScaleUp(
 		// Check outcome after allocation
 		if w.remaining > mean {
 			// Still above mean even after allocation — remove from working set
-			logger.V(1).Info("GreedyBySaturation: model still above mean, removing",
+			logger.V(logging.DEBUG).Info("GreedyBySaturation: model still above mean, removing",
 				"model", w.req.ModelID, "remaining", w.remaining, "mean", mean)
 			w.remaining = -1
 		}
@@ -204,10 +207,9 @@ func (o *GreedyBySaturationOptimizer) allocateForModel(
 
 		state := stateMap[vc.VariantName]
 
-		// Skip variants with pending replicas (GPUs are scarce)
-		if state.PendingReplicas > 0 {
-			continue
-		}
+		// Pending replicas are NOT skipped: the V2 analyzer already accounts
+		// for pending replicas' capacity in the anticipated supply calculation.
+		// If RequiredCapacity > 0, demand exceeds total supply including pending.
 		if vc.PerReplicaCapacity <= 0 {
 			continue
 		}
@@ -241,7 +243,7 @@ func (o *GreedyBySaturationOptimizer) allocateForModel(
 		target -= capacityAdded
 		available[vc.AcceleratorName] -= n * gpusPerReplica
 
-		logger.V(1).Info("GreedyBySaturation: allocated replicas",
+		logger.V(logging.DEBUG).Info("GreedyBySaturation: allocated replicas",
 			"model", w.req.ModelID,
 			"variant", vc.VariantName,
 			"replicas", n,

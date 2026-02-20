@@ -241,7 +241,7 @@ func (e *Engine) optimize(ctx context.Context) error {
 		} else {
 			e.optimizer = pipeline.NewCostAwareOptimizer()
 		}
-		logger.Info("V2 optimizer selected", "optimizer", e.optimizer.Name(), "enableLimiter", enableLimiter)
+		logger.V(logging.DEBUG).Info("V2 optimizer selected", "optimizer", e.optimizer.Name(), "enableLimiter", enableLimiter)
 	}
 
 	var allDecisions []interfaces.VariantDecision

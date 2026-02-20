@@ -285,24 +285,13 @@ var _ = Describe("GreedyBySaturationOptimizer", func() {
 			decisions := optimizer.Optimize(ctx, requests, constraints)
 			dm := decisionMap(decisions)
 
-			// Equal demand: mean=20000. Both at mean.
-			// w.remaining <= mean && len(active) > 1 → break immediately.
-			// But wait - one of them is "picked first" (sort is stable or deterministic).
-			// Actually: mean=20000, pick first (both at 20000).
-			// remaining(20000) <= mean(20000) && len(active)==2 → break!
-			// So NO allocation happens for equal models with the "break" condition.
-			// This means they each keep their original targets.
-			// That seems wrong. The issue is: when remaining == mean for all, nothing happens.
-			//
-			// Looking at the algorithm more carefully: sortByRemainingDesc puts them in some order.
-			// w = active[0]. w.remaining(20000) <= mean(20000) AND len(active)>1 → break.
-			// So with exactly equal remaining, the algorithm breaks immediately.
-			// This is actually correct behavior — there's no "most starved" to prioritize,
-			// so the algorithm can't decide. Each model keeps its current replicas.
-
-			// Both models keep original replicas
-			Expect(dm["x-v1"].TargetReplicas).To(Equal(1))
-			Expect(dm["y-v1"].TargetReplicas).To(Equal(1))
+			// Equal demand: mean=20000. Both tied at mean.
+			// Fair-share: allocationMean = mean - (remaining / N) = 20000 - 10000 = 10000
+			// target = 20000 - 10000 = 10000. Each model gets 1 replica per iteration.
+			// With 8 GPUs (4 replicas worth), both models get 2 replicas each.
+			// Total: X=1+2=3, Y=1+2=3. 4 replicas × 2 GPUs = 8 GPUs used.
+			Expect(dm["x-v1"].TargetReplicas).To(Equal(3))
+			Expect(dm["y-v1"].TargetReplicas).To(Equal(3))
 		})
 	})
 
@@ -349,16 +338,17 @@ var _ = Describe("GreedyBySaturationOptimizer", func() {
 
 			// H100: only 4 GPUs available / 4 per replica = 1 replica max
 			// A100: 6 GPUs / 2 per replica = 3 replicas max
-			// Fair share: mean=(30000+20000)/2=25000.
-			// Pick h100(30000): target=30000-25000=5000, ceil(5000/20000)=1 replica
-			// h100.remaining=30000-20000=10000. H100 GPUs left: 0.
-			// Then a100(20000): mean=(10000+20000)/2=15000. Pick a100(20000).
-			// target=20000-15000=5000, ceil(5000/10000)=1 replica (2 GPUs).
-			// a100.remaining=20000-10000=10000. A100 GPUs left: 4.
-			// Then: mean=(10000+10000)/2=10000. Both at mean → break.
+			// Iter 1: mean=25000. Pick h100(30000). target=5000, ceil(5000/20000)=1.
+			//   h100.remaining=10000. H100 GPUs left: 0.
+			// Iter 2: mean=15000. Pick a100(20000). target=5000, ceil(5000/10000)=1.
+			//   a100.remaining=10000. A100 GPUs left: 4.
+			// Iter 3: mean=10000. Both tied. Fair-share: allocationMean=10000-5000=5000.
+			//   Pick h100(10000): target=5000, but H100 GPUs=0 → can't allocate → removed.
+			// Iter 4: a100(10000) single model. allocationMean=0. target=10000.
+			//   ceil(10000/10000)=1 replica (2 GPUs). A100 GPUs left: 2.
 
 			Expect(dm["h100-v"].TargetReplicas).To(Equal(2)) // 1 + 1
-			Expect(dm["a100-v"].TargetReplicas).To(Equal(2)) // 1 + 1
+			Expect(dm["a100-v"].TargetReplicas).To(Equal(3)) // 1 + 2
 		})
 
 		It("should handle mixed accelerator types across variants", func() {
@@ -531,7 +521,7 @@ var _ = Describe("GreedyBySaturationOptimizer", func() {
 
 	Context("Pending Replicas", func() {
 
-		It("should skip variants with pending replicas for scale-up", func() {
+		It("should allocate to most cost-efficient variant regardless of pending replicas", func() {
 			requests := []ModelScalingRequest{
 				{
 					ModelID:   "model-1",
@@ -558,10 +548,13 @@ var _ = Describe("GreedyBySaturationOptimizer", func() {
 			decisions := optimizer.Optimize(ctx, requests, constraints)
 			dm := decisionMap(decisions)
 
-			// cheap-pending has PendingReplicas > 0 → skipped
-			// expensive-ready gets the allocation
-			Expect(dm["cheap-pending"].TargetReplicas).To(Equal(2))  // unchanged
-			Expect(dm["expensive-ready"].TargetReplicas).To(Equal(2)) // +1
+			// Pending replicas are NOT skipped — the V2 analyzer already accounts
+			// for pending capacity in anticipated supply. If RequiredCapacity > 0,
+			// demand exceeds total supply including pending.
+			// cheap-pending is more cost-efficient (5/10000=0.0005 vs 15/20000=0.00075)
+			// → it gets the allocation.
+			Expect(dm["cheap-pending"].TargetReplicas).To(Equal(3))    // +1
+			Expect(dm["expensive-ready"].TargetReplicas).To(Equal(1)) // unchanged
 		})
 	})
 
