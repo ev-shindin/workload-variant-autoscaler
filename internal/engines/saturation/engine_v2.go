@@ -71,6 +71,42 @@ func (e *Engine) runV2AnalysisOnly(
 	return result, nil
 }
 
+// runAnalyzersAndScore runs the V2 saturation analyzer, then computes the
+// weighted composite score from enabled analyzers and model priority.
+func (e *Engine) runAnalyzersAndScore(
+	ctx context.Context,
+	modelID, namespace string,
+	replicaMetrics []interfaces.ReplicaMetrics,
+	config interfaces.SaturationScalingConfig,
+	variantStates []interfaces.VariantReplicaState,
+	deployments map[string]*appsv1.Deployment,
+	variantAutoscalings map[string]*llmdVariantAutoscalingV1alpha1.VariantAutoscaling,
+) (*interfaces.AnalyzerResult, error) {
+	// Run saturation analyzer (always needed for PerReplicaCapacity)
+	baseResult, err := e.runV2AnalysisOnly(ctx, modelID, namespace, replicaMetrics, config,
+		variantStates, deployments, variantAutoscalings)
+	if err != nil {
+		return nil, err
+	}
+
+	// Compute weighted score from enabled analyzers
+	totalWeighted := 0.0
+	for _, aw := range config.Analyzers {
+		if aw.Enabled != nil && !*aw.Enabled {
+			continue
+		}
+		switch aw.Name {
+		case "saturation":
+			totalWeighted += baseResult.RequiredCapacity * aw.Score
+		// future: case "throughput", "slo"
+		}
+	}
+
+	// Score = priority * weighted sum
+	baseResult.Score = config.Priority * totalWeighted
+	return baseResult, nil
+}
+
 // computeCurrentGPUUsage iterates over model scaling requests to compute the
 // current GPU usage per accelerator type. Used to provide current usage to
 // the ConstraintProvider when building GPU constraints for the optimizer.
@@ -107,10 +143,19 @@ func (e *Engine) collectV2ModelRequest(
 	deployments map[string]*appsv1.Deployment,
 	variantAutoscalings map[string]*llmdVariantAutoscalingV1alpha1.VariantAutoscaling,
 ) (*pipeline.ModelScalingRequest, error) {
-	result, err := e.runV2AnalysisOnly(ctx, modelID, namespace, replicaMetrics, config,
+	result, err := e.runAnalyzersAndScore(ctx, modelID, namespace, replicaMetrics, config,
 		variantStates, deployments, variantAutoscalings)
 	if err != nil {
 		return nil, fmt.Errorf("collecting V2 model request for %s/%s: %w", namespace, modelID, err)
+	}
+
+	// Detect P/D disaggregation: true when any variant has role != "both"
+	disaggregated := false
+	for _, vs := range variantStates {
+		if vs.Role != "" && vs.Role != "both" {
+			disaggregated = true
+			break
+		}
 	}
 
 	return &pipeline.ModelScalingRequest{
@@ -118,5 +163,7 @@ func (e *Engine) collectV2ModelRequest(
 		Namespace:     namespace,
 		Result:        result,
 		VariantStates: variantStates,
+		Priority:      config.Priority,
+		Disaggregated: disaggregated,
 	}, nil
 }

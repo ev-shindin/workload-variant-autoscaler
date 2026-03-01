@@ -49,6 +49,25 @@ import (
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/utils"
 )
 
+// resolveSaturationConfig resolves config for a model.
+// Lookup: "{modelID}#{namespace}" → "default" → zero-value with defaults.
+func resolveSaturationConfig(
+	configMap map[string]interfaces.SaturationScalingConfig,
+	modelID, namespace string,
+) interfaces.SaturationScalingConfig {
+	if cfg, ok := configMap[modelID+"#"+namespace]; ok {
+		cfg.ApplyDefaults()
+		return cfg
+	}
+	if cfg, ok := configMap["default"]; ok {
+		cfg.ApplyDefaults()
+		return cfg
+	}
+	cfg := interfaces.SaturationScalingConfig{}
+	cfg.ApplyDefaults()
+	return cfg
+}
+
 type Engine struct {
 	client   client.Client
 	scheme   *runtime.Scheme
@@ -82,7 +101,7 @@ type Engine struct {
 
 	// optimizer is the V2 scaling optimizer that produces VariantDecisions from
 	// AnalyzerResults. Selected per-cycle based on enableLimiter config:
-	// CostAwareOptimizer (unlimited) or GreedyBySaturationOptimizer (limited).
+	// CostAwareOptimizer (unlimited) or GreedyByScoreOptimizer (limited).
 	optimizer pipeline.ScalingOptimizer
 }
 
@@ -249,7 +268,7 @@ func (e *Engine) optimize(ctx context.Context) error {
 	// Applies to V2 and queueing-model paths which both use the optimizer pipeline.
 	if analyzerName == "saturation" || analyzerName == interfaces.QueueingModelAnalyzerName {
 		if enableLimiter {
-			e.optimizer = pipeline.NewGreedyBySaturationOptimizer()
+			e.optimizer = pipeline.NewGreedyByScoreOptimizer()
 		} else {
 			e.optimizer = pipeline.NewCostAwareOptimizer()
 		}
@@ -325,13 +344,7 @@ func (e *Engine) optimizeV1(
 			continue
 		}
 
-		saturationConfig, ok := saturationConfigMap["default"]
-		if !ok {
-			logger.Info("Default saturation scaling config not found for namespace, skipping model",
-				"namespace", namespace,
-				"modelID", modelID)
-			continue
-		}
+		saturationConfig := resolveSaturationConfig(saturationConfigMap, modelID, namespace)
 
 		saturationTargets, saturationAnalysis, variantStates, err := e.RunSaturationAnalysis(ctx, modelID, modelVAs, saturationConfig, e.client)
 		if err != nil {
@@ -443,13 +456,7 @@ func (e *Engine) optimizeV2(
 				"namespace", namespace, "modelID", modelID)
 			continue
 		}
-		saturationConfig, ok := saturationConfigMap["default"]
-		if !ok {
-			logger.Info("Default saturation scaling config not found for namespace, skipping model",
-				"namespace", namespace, "modelID", modelID)
-			continue
-		}
-		saturationConfig.ApplyDefaults()
+		saturationConfig := resolveSaturationConfig(saturationConfigMap, modelID, namespace)
 
 		data, err := e.prepareModelData(ctx, modelID, modelVAs, e.client)
 		if err != nil {
@@ -480,7 +487,7 @@ func (e *Engine) optimizeV2(
 
 	// Stage 2: Compute GPU constraints and call optimizer
 	var constraints []*pipeline.ResourceConstraints
-	if _, ok := e.optimizer.(*pipeline.GreedyBySaturationOptimizer); ok {
+	if _, ok := e.optimizer.(*pipeline.GreedyByScoreOptimizer); ok {
 		currentUsage := computeCurrentGPUUsage(requests)
 		if limiter, ok := e.GPULimiter.(*pipeline.DefaultLimiter); ok {
 			constraint, err := limiter.ComputeConstraints(ctx, currentUsage)
@@ -569,7 +576,10 @@ func (e *Engine) BuildVariantStates(
 		// Extract GPUs per replica from deployment's pod template
 		gpusPerReplica := getDeploymentGPUsPerReplica(deploy)
 
-		ctrl.LoggerFrom(ctx).V(logging.DEBUG).Info("BuildVariantStates result", "variant", va.Name, "currentReplicas", currentReplicas, "readyReplicas", readyReplicas, "pendingReplicas", pendingReplicas, "gpusPerReplica", gpusPerReplica)
+		// Extract P/D role from deployment labels
+		role := getRoleFromDeployment(deploy)
+
+		ctrl.LoggerFrom(ctx).V(logging.DEBUG).Info("BuildVariantStates result", "variant", va.Name, "currentReplicas", currentReplicas, "readyReplicas", readyReplicas, "pendingReplicas", pendingReplicas, "gpusPerReplica", gpusPerReplica, "role", role)
 
 		states = append(states, interfaces.VariantReplicaState{
 			VariantName:     va.Name,
@@ -577,10 +587,34 @@ func (e *Engine) BuildVariantStates(
 			DesiredReplicas: va.Status.DesiredOptimizedAlloc.NumReplicas,
 			PendingReplicas: pendingReplicas,
 			GPUsPerReplica:  gpusPerReplica,
+			Role:            role,
 		})
 	}
 
 	return states
+}
+
+// getRoleFromDeployment extracts the P/D role from a deployment's pod template labels.
+// Returns "prefill", "decode", or "both" (default when no role label is present).
+func getRoleFromDeployment(deploy *appsv1.Deployment) string {
+	if deploy == nil {
+		return "both"
+	}
+	labels := deploy.Spec.Template.Labels
+	if labels == nil {
+		return "both"
+	}
+	if val, ok := labels["llm-d.ai/role"]; ok {
+		switch val {
+		case "prefill":
+			return "prefill"
+		case "decode":
+			return "decode"
+		default:
+			return "both"
+		}
+	}
+	return "both"
 }
 
 // gpuVendors lists the resource name prefixes for GPU vendors

@@ -21,7 +21,7 @@ import (
 //   - Variants with pending replicas are skipped for scale-up
 //
 // This optimizer ignores ResourceConstraints (unlimited mode). For GPU-limited
-// environments, use GreedyBySaturationOptimizer instead.
+// environments, use GreedyByScoreOptimizer instead.
 type CostAwareOptimizer struct{}
 
 // NewCostAwareOptimizer creates a new CostAwareOptimizer.
@@ -268,6 +268,7 @@ func buildDecisionsWithOptimizer(
 			Namespace:       req.Namespace,
 			AcceleratorName: vc.AcceleratorName,
 			Cost:            vc.Cost,
+			Role:            state.Role,
 			CurrentReplicas: state.CurrentReplicas,
 			TargetReplicas:  target,
 			Action:          action,

@@ -2,6 +2,10 @@ package interfaces
 
 import "fmt"
 
+// DefaultPriority is the default model priority multiplier.
+// Higher priority → preferential GPU allocation in fair-share.
+const DefaultPriority = 1.0
+
 // SaturationScalingConfig holds saturation-based scaling thresholds for a model variant.
 // Saturation scaling is enabled by default and uses these thresholds to determine when
 // replicas are saturated and when to scale up.
@@ -44,6 +48,24 @@ type SaturationScalingConfig struct {
 	// Used by V2 analyzer: spareCapacity = currentSupply - totalDemand / ScaleDownBoundary
 	// Default: 0.70 (70% utilization allows scale-down)
 	ScaleDownBoundary float64 `yaml:"scaleDownBoundary,omitempty"`
+
+	// Priority is a multiplier for this model's scaling urgency.
+	// Higher priority → preferential GPU allocation in fair-share.
+	// Default: 1.0 (neutral).
+	Priority float64 `yaml:"priority,omitempty"`
+
+	// Analyzers configures the set of analyzers and their weights.
+	// When empty and AnalyzerName is "saturation", defaults to
+	// [{Name: "saturation", Score: 1.0, Enabled: true}].
+	Analyzers []AnalyzerScoreConfig `yaml:"analyzers,omitempty"`
+}
+
+// AnalyzerScoreConfig configures an individual analyzer's weight in the
+// composite scoring function.
+type AnalyzerScoreConfig struct {
+	Name    string  `yaml:"name"`
+	Enabled *bool   `yaml:"enabled,omitempty"` // default true
+	Score   float64 `yaml:"score,omitempty"`   // default 1.0
 }
 
 // GetAnalyzerName implements the AnalyzerConfig interface.
@@ -60,12 +82,32 @@ const (
 // ApplyDefaults fills in zero-valued V2 fields with their defaults.
 // Must be called before Validate() to handle omitempty zero-values correctly.
 func (c *SaturationScalingConfig) ApplyDefaults() {
+	if c.Priority == 0 {
+		c.Priority = DefaultPriority
+	}
 	if c.AnalyzerName == "saturation" {
 		if c.ScaleUpThreshold == 0 {
 			c.ScaleUpThreshold = DefaultScaleUpThreshold
 		}
 		if c.ScaleDownBoundary == 0 {
 			c.ScaleDownBoundary = DefaultScaleDownBoundary
+		}
+		// Default analyzers list when empty
+		if len(c.Analyzers) == 0 {
+			enabled := true
+			c.Analyzers = []AnalyzerScoreConfig{
+				{Name: "saturation", Score: 1.0, Enabled: &enabled},
+			}
+		}
+		// Apply per-entry defaults
+		for i := range c.Analyzers {
+			if c.Analyzers[i].Score == 0 {
+				c.Analyzers[i].Score = 1.0
+			}
+			if c.Analyzers[i].Enabled == nil {
+				enabled := true
+				c.Analyzers[i].Enabled = &enabled
+			}
 		}
 	}
 }
@@ -86,6 +128,10 @@ func (c *SaturationScalingConfig) Validate() error {
 	if c.QueueSpareTrigger < 0 {
 		return fmt.Errorf("queueSpareTrigger must be >= 0, got %.1f", c.QueueSpareTrigger)
 	}
+	if c.Priority < 0 {
+		return fmt.Errorf("priority must be >= 0, got %.2f", c.Priority)
+	}
+
 	// KV cache threshold should be greater than spare trigger (otherwise contradictory)
 	if c.KvCacheThreshold < c.KvSpareTrigger {
 		return fmt.Errorf("kvCacheThreshold (%.2f) should be >= kvSpareTrigger (%.2f)",

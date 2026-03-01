@@ -172,6 +172,7 @@ type VariantDecision struct {
 	ModelID         string
 	AcceleratorName string
 	Cost            float64
+	Role            string // "prefill", "decode", "both"
 
 	// --- Scaling state ---
 	Action                 SaturationAction
@@ -272,6 +273,8 @@ type VariantReplicaState struct {
 	// the deployment's container resource requests (nvidia.com/gpu, amd.com/gpu, etc.).
 	// Defaults to 1 if no GPU requests are found.
 	GPUsPerReplica int
+	// Role is the P/D disaggregation role: "prefill", "decode", or "both" (default).
+	Role string
 }
 
 // SaturationAnalyzer analyzes replica saturation metrics and recommends scaling decisions

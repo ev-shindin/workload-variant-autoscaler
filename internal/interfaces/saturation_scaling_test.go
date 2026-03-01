@@ -172,6 +172,28 @@ func TestSaturationScalingConfigValidate(t *testing.T) {
 			},
 			wantErr: false,
 		},
+		{
+			name: "valid priority",
+			config: SaturationScalingConfig{
+				KvCacheThreshold:     0.80,
+				QueueLengthThreshold: 5,
+				KvSpareTrigger:       0.10,
+				QueueSpareTrigger:    3,
+				Priority:             5.0,
+			},
+			wantErr: false,
+		},
+		{
+			name: "invalid negative priority",
+			config: SaturationScalingConfig{
+				KvCacheThreshold:     0.80,
+				QueueLengthThreshold: 5,
+				KvSpareTrigger:       0.10,
+				QueueSpareTrigger:    3,
+				Priority:             -1.0,
+			},
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -223,6 +245,86 @@ func TestSaturationScalingConfigApplyDefaults(t *testing.T) {
 		}
 		if config.ScaleDownBoundary != 0 {
 			t.Errorf("expected ScaleDownBoundary=0 for V1, got %v", config.ScaleDownBoundary)
+		}
+	})
+
+	t.Run("applies default priority when zero", func(t *testing.T) {
+		config := SaturationScalingConfig{}
+		config.ApplyDefaults()
+		if config.Priority != DefaultPriority {
+			t.Errorf("expected Priority=%v, got %v", DefaultPriority, config.Priority)
+		}
+	})
+
+	t.Run("does not overwrite explicit priority", func(t *testing.T) {
+		config := SaturationScalingConfig{
+			Priority: 5.0,
+		}
+		config.ApplyDefaults()
+		if config.Priority != 5.0 {
+			t.Errorf("expected Priority=5.0, got %v", config.Priority)
+		}
+	})
+
+	t.Run("applies default analyzers list for V2", func(t *testing.T) {
+		config := SaturationScalingConfig{
+			AnalyzerName: "saturation",
+		}
+		config.ApplyDefaults()
+		if len(config.Analyzers) != 1 {
+			t.Fatalf("expected 1 analyzer, got %d", len(config.Analyzers))
+		}
+		if config.Analyzers[0].Name != "saturation" {
+			t.Errorf("expected analyzer name 'saturation', got %q", config.Analyzers[0].Name)
+		}
+		if config.Analyzers[0].Score != 1.0 {
+			t.Errorf("expected score 1.0, got %v", config.Analyzers[0].Score)
+		}
+		if config.Analyzers[0].Enabled == nil || !*config.Analyzers[0].Enabled {
+			t.Errorf("expected analyzer to be enabled")
+		}
+	})
+
+	t.Run("does not overwrite explicit analyzers", func(t *testing.T) {
+		disabled := false
+		config := SaturationScalingConfig{
+			AnalyzerName: "saturation",
+			Analyzers: []AnalyzerScoreConfig{
+				{Name: "saturation", Score: 0.5, Enabled: &disabled},
+			},
+		}
+		config.ApplyDefaults()
+		if config.Analyzers[0].Score != 0.5 {
+			t.Errorf("expected score 0.5, got %v", config.Analyzers[0].Score)
+		}
+		if *config.Analyzers[0].Enabled != false {
+			t.Errorf("expected analyzer to remain disabled")
+		}
+	})
+
+	t.Run("applies per-entry defaults for zero score", func(t *testing.T) {
+		config := SaturationScalingConfig{
+			AnalyzerName: "saturation",
+			Analyzers: []AnalyzerScoreConfig{
+				{Name: "saturation"},
+			},
+		}
+		config.ApplyDefaults()
+		if config.Analyzers[0].Score != 1.0 {
+			t.Errorf("expected default score 1.0, got %v", config.Analyzers[0].Score)
+		}
+		if config.Analyzers[0].Enabled == nil || !*config.Analyzers[0].Enabled {
+			t.Errorf("expected analyzer to be enabled by default")
+		}
+	})
+
+	t.Run("does not add analyzers for V1", func(t *testing.T) {
+		config := SaturationScalingConfig{
+			AnalyzerName: "",
+		}
+		config.ApplyDefaults()
+		if len(config.Analyzers) != 0 {
+			t.Errorf("expected no analyzers for V1, got %d", len(config.Analyzers))
 		}
 	})
 
