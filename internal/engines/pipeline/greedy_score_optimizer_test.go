@@ -690,9 +690,12 @@ var _ = Describe("GreedyByScoreOptimizer", func() {
 		})
 	})
 
-	Context("Per-Role Work Units (P/D)", func() {
+	Context("Demand-Proportional P/D Distribution", func() {
 
-		It("should create separate work units for disaggregated model", func() {
+		It("should distribute replicas proportional to per-role demand", func() {
+			// Prefill RequiredCapacity=15000 (75%), Decode RequiredCapacity=5000 (25%)
+			// Total model RequiredCapacity=20000, Score=20000
+			// With 10 A100 GPUs available, each variant uses 2 GPUs/replica
 			requests := []ModelScalingRequest{
 				{
 					ModelID:       "model-pd",
@@ -703,8 +706,8 @@ var _ = Describe("GreedyByScoreOptimizer", func() {
 						RequiredCapacity: 20000,
 						Score:            20000,
 						RoleCapacities: map[string]interfaces.RoleCapacity{
-							"prefill": {Role: "prefill", RequiredCapacity: 15000, TotalSupply: 10000, TotalDemand: 20000},
-							"decode":  {Role: "decode", RequiredCapacity: 5000, TotalSupply: 30000, TotalDemand: 25000},
+							"prefill": {Role: "prefill", RequiredCapacity: 15000},
+							"decode":  {Role: "decode", RequiredCapacity: 5000},
 						},
 						VariantCapacities: []interfaces.VariantCapacity{
 							{VariantName: "prefill-v", AcceleratorName: "A100", Cost: 5.0, Role: "prefill", ReplicaCount: 1, PerReplicaCapacity: 10000},
@@ -726,10 +729,135 @@ var _ = Describe("GreedyByScoreOptimizer", func() {
 			decisions := optimizer.Optimize(ctx, requests, constraints)
 			dm := decisionMap(decisions)
 
-			// Prefill has higher RequiredCapacity → should get more replicas
-			Expect(dm["prefill-v"].TargetReplicas).To(BeNumerically(">", 1))
-			// Decode should also get allocation
-			Expect(dm["decode-v"].TargetReplicas).To(BeNumerically(">=", 3))
+			// target = 20000 (single model, allocationMean=0)
+			// prefill fraction=0.75: roleTarget=15000 → ceil(15000/10000)=2 replicas
+			Expect(dm["prefill-v"].TargetReplicas).To(Equal(3)) // 1 + 2
+			// decode fraction=0.25: roleTarget=5000 → ceil(5000/10000)=1 replica
+			Expect(dm["decode-v"].TargetReplicas).To(Equal(4)) // 3 + 1
+		})
+
+		It("should distribute equally when roles have equal demand", func() {
+			requests := []ModelScalingRequest{
+				{
+					ModelID:       "model-equal",
+					Namespace:     "default",
+					Disaggregated: true,
+					Priority:      1.0,
+					Result: &interfaces.AnalyzerResult{
+						RequiredCapacity: 20000,
+						Score:            20000,
+						RoleCapacities: map[string]interfaces.RoleCapacity{
+							"prefill": {Role: "prefill", RequiredCapacity: 10000},
+							"decode":  {Role: "decode", RequiredCapacity: 10000},
+						},
+						VariantCapacities: []interfaces.VariantCapacity{
+							{VariantName: "prefill-v", AcceleratorName: "A100", Cost: 5.0, Role: "prefill", ReplicaCount: 1, PerReplicaCapacity: 10000},
+							{VariantName: "decode-v", AcceleratorName: "A100", Cost: 5.0, Role: "decode", ReplicaCount: 1, PerReplicaCapacity: 10000},
+						},
+					},
+					VariantStates: []interfaces.VariantReplicaState{
+						{VariantName: "prefill-v", CurrentReplicas: 1, GPUsPerReplica: 2, Role: "prefill"},
+						{VariantName: "decode-v", CurrentReplicas: 1, GPUsPerReplica: 2, Role: "decode"},
+					},
+				},
+			}
+			constraints := []*ResourceConstraints{
+				{Pools: map[string]ResourcePool{
+					"A100": {Limit: 8},
+				}},
+			}
+
+			decisions := optimizer.Optimize(ctx, requests, constraints)
+			dm := decisionMap(decisions)
+
+			// Each role gets 50%: roleTarget=10000 → ceil(10000/10000)=1 replica each
+			Expect(dm["prefill-v"].TargetReplicas).To(Equal(2)) // 1 + 1
+			Expect(dm["decode-v"].TargetReplicas).To(Equal(2))  // 1 + 1
+		})
+
+		It("should only allocate to the role that needs scale-up", func() {
+			// Only prefill needs scale-up; decode has 0 RequiredCapacity
+			requests := []ModelScalingRequest{
+				{
+					ModelID:       "model-prefill-only",
+					Namespace:     "default",
+					Disaggregated: true,
+					Priority:      1.0,
+					Result: &interfaces.AnalyzerResult{
+						RequiredCapacity: 10000,
+						Score:            10000,
+						RoleCapacities: map[string]interfaces.RoleCapacity{
+							"prefill": {Role: "prefill", RequiredCapacity: 10000},
+							"decode":  {Role: "decode", RequiredCapacity: 0},
+						},
+						VariantCapacities: []interfaces.VariantCapacity{
+							{VariantName: "prefill-v", AcceleratorName: "A100", Cost: 5.0, Role: "prefill", ReplicaCount: 1, PerReplicaCapacity: 10000},
+							{VariantName: "decode-v", AcceleratorName: "A100", Cost: 5.0, Role: "decode", ReplicaCount: 3, PerReplicaCapacity: 10000},
+						},
+					},
+					VariantStates: []interfaces.VariantReplicaState{
+						{VariantName: "prefill-v", CurrentReplicas: 1, GPUsPerReplica: 2, Role: "prefill"},
+						{VariantName: "decode-v", CurrentReplicas: 3, GPUsPerReplica: 2, Role: "decode"},
+					},
+				},
+			}
+			constraints := []*ResourceConstraints{
+				{Pools: map[string]ResourcePool{
+					"A100": {Limit: 10},
+				}},
+			}
+
+			decisions := optimizer.Optimize(ctx, requests, constraints)
+			dm := decisionMap(decisions)
+
+			// Only prefill fraction=1.0: roleTarget=10000 → 1 replica
+			Expect(dm["prefill-v"].TargetReplicas).To(Equal(2)) // 1 + 1
+			// Decode unchanged (0 RequiredCapacity → not in roleDemands)
+			Expect(dm["decode-v"].TargetReplicas).To(Equal(3))
+		})
+
+		It("should handle GPU exhaustion for one role without affecting the other", func() {
+			// Prefill uses H100s (exhausted), decode uses A100s (available)
+			requests := []ModelScalingRequest{
+				{
+					ModelID:       "model-mixed-gpu",
+					Namespace:     "default",
+					Disaggregated: true,
+					Priority:      1.0,
+					Result: &interfaces.AnalyzerResult{
+						RequiredCapacity: 20000,
+						Score:            20000,
+						RoleCapacities: map[string]interfaces.RoleCapacity{
+							"prefill": {Role: "prefill", RequiredCapacity: 10000},
+							"decode":  {Role: "decode", RequiredCapacity: 10000},
+						},
+						VariantCapacities: []interfaces.VariantCapacity{
+							{VariantName: "prefill-v", AcceleratorName: "H100", Cost: 15.0, Role: "prefill", ReplicaCount: 1, PerReplicaCapacity: 20000},
+							{VariantName: "decode-v", AcceleratorName: "A100", Cost: 5.0, Role: "decode", ReplicaCount: 1, PerReplicaCapacity: 10000},
+						},
+					},
+					VariantStates: []interfaces.VariantReplicaState{
+						{VariantName: "prefill-v", CurrentReplicas: 1, GPUsPerReplica: 4, Role: "prefill"},
+						{VariantName: "decode-v", CurrentReplicas: 1, GPUsPerReplica: 2, Role: "decode"},
+					},
+				},
+			}
+			constraints := []*ResourceConstraints{
+				{Pools: map[string]ResourcePool{
+					"H100": {Limit: 0}, // No H100s available
+					"A100": {Limit: 4},
+				}},
+			}
+
+			decisions := optimizer.Optimize(ctx, requests, constraints)
+			dm := decisionMap(decisions)
+
+			// Prefill can't scale (no H100 GPUs)
+			Expect(dm["prefill-v"].TargetReplicas).To(Equal(1))
+			// Decode absorbs the full model allocation across iterations:
+			// Iter 1: decode gets roleTarget=10000 (50% of 20000) → +1 replica, remaining=10000
+			// Iter 2: decode gets roleTarget=5000 (50% of 10000) → +1 replica, remaining=0
+			Expect(dm["decode-v"].TargetReplicas).To(Equal(3)) // 1 + 2
 		})
 
 		It("should handle non-disaggregated model with Score", func() {
@@ -810,20 +938,29 @@ var _ = Describe("GreedyByScoreOptimizer", func() {
 			Expect(active[2].req.ModelID).To(Equal("low"))
 		})
 
-		It("initTargetsForRole should filter by role", func() {
-			states := []interfaces.VariantReplicaState{
-				{VariantName: "prefill-v", CurrentReplicas: 2, Role: "prefill"},
-				{VariantName: "decode-v", CurrentReplicas: 3, Role: "decode"},
-				{VariantName: "both-v", CurrentReplicas: 1, Role: "both"},
+		It("filterVariantCapacitiesByRole should filter by role", func() {
+			capacities := []interfaces.VariantCapacity{
+				{VariantName: "prefill-v", Role: "prefill"},
+				{VariantName: "decode-v", Role: "decode"},
+				{VariantName: "both-v", Role: "both"},
+				{VariantName: "empty-v", Role: ""},
 			}
 
-			prefillTargets := initTargetsForRole(states, "prefill")
-			Expect(prefillTargets).To(HaveLen(1))
-			Expect(prefillTargets["prefill-v"]).To(Equal(2))
+			prefill := filterVariantCapacitiesByRole(capacities, "prefill")
+			Expect(prefill).To(HaveLen(1))
+			Expect(prefill[0].VariantName).To(Equal("prefill-v"))
 
-			decodeTargets := initTargetsForRole(states, "decode")
-			Expect(decodeTargets).To(HaveLen(1))
-			Expect(decodeTargets["decode-v"]).To(Equal(3))
+			decode := filterVariantCapacitiesByRole(capacities, "decode")
+			Expect(decode).To(HaveLen(1))
+			Expect(decode[0].VariantName).To(Equal("decode-v"))
+
+			// "both" returns all
+			both := filterVariantCapacitiesByRole(capacities, "both")
+			Expect(both).To(HaveLen(4))
+
+			// empty returns all
+			empty := filterVariantCapacitiesByRole(capacities, "")
+			Expect(empty).To(HaveLen(4))
 		})
 	})
 })
