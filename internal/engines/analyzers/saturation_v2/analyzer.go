@@ -609,7 +609,7 @@ func estimateSchedulerQueueDemand(
 
 	// Build per-role attribution
 	byRole := make(map[string]float64)
-	if activeRoles != nil && len(activeRoles) > 0 {
+	if len(activeRoles) > 0 {
 		for role := range activeRoles {
 			switch role {
 			case "prefill":
