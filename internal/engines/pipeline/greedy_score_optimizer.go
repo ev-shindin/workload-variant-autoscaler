@@ -232,7 +232,9 @@ func (o *GreedyByScoreOptimizer) allocateForModel(
 }
 
 // allocateByRole distributes replicas between roles proportional to their demand.
-// Higher-demand roles are allocated first.
+// Higher-demand roles are allocated first. If a role cannot fully allocate
+// (e.g. accelerator exhausted), its unallocated portion is consumed from
+// remaining so it does not overflow to other roles in subsequent iterations.
 func (o *GreedyByScoreOptimizer) allocateByRole(
 	ctx context.Context,
 	w *modelWork,
@@ -240,6 +242,8 @@ func (o *GreedyByScoreOptimizer) allocateByRole(
 	stateMap map[string]interfaces.VariantReplicaState,
 	available map[string]int,
 ) bool {
+	logger := ctrl.LoggerFrom(ctx)
+
 	// Sort roles by demand fraction DESC to prioritize higher-demand roles
 	type roleFraction struct {
 		role     string
@@ -262,11 +266,24 @@ func (o *GreedyByScoreOptimizer) allocateByRole(
 
 		roleVariants := filterVariantCapacitiesByRole(w.req.Result.VariantCapacities, rf.role)
 		if len(roleVariants) == 0 {
+			// Role has no variants — consume its share so it doesn't overflow
+			w.remaining -= roleTarget
+			logger.V(logging.DEBUG).Info("GreedyByScore: no variants for role, consuming share",
+				"model", w.req.ModelID, "role", rf.role, "consumed", roleTarget)
 			continue
 		}
 
+		remainingBefore := w.remaining
 		if o.allocateToVariants(ctx, w, roleTarget, roleVariants, stateMap, available, rf.role) {
 			allocated = true
+		}
+		// Consume any unallocated portion so it doesn't overflow to other roles
+		capacityAllocated := remainingBefore - w.remaining
+		unallocated := roleTarget - capacityAllocated
+		if unallocated > 0 {
+			w.remaining -= unallocated
+			logger.V(logging.DEBUG).Info("GreedyByScore: role partially allocated, consuming remainder",
+				"model", w.req.ModelID, "role", rf.role, "allocated", capacityAllocated, "consumed", unallocated)
 		}
 	}
 	return allocated

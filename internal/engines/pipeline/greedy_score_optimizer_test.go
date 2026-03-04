@@ -852,12 +852,12 @@ var _ = Describe("GreedyByScoreOptimizer", func() {
 			decisions := optimizer.Optimize(ctx, requests, constraints)
 			dm := decisionMap(decisions)
 
-			// Prefill can't scale (no H100 GPUs)
+			// Prefill can't scale (no H100 GPUs) — its share is consumed, not overflowed
 			Expect(dm["prefill-v"].TargetReplicas).To(Equal(1))
-			// Decode absorbs the full model allocation across iterations:
-			// Iter 1: decode gets roleTarget=10000 (50% of 20000) → +1 replica, remaining=10000
-			// Iter 2: decode gets roleTarget=5000 (50% of 10000) → +1 replica, remaining=0
-			Expect(dm["decode-v"].TargetReplicas).To(Equal(3)) // 1 + 2
+			// Decode gets only its proportional share (50% of demand)
+			// roleTarget = 10000 (50% of 20000) → +1 replica
+			// Prefill's 10000 is consumed (not absorbed by decode)
+			Expect(dm["decode-v"].TargetReplicas).To(Equal(2)) // 1 + 1
 		})
 
 		It("should handle non-disaggregated model with Score", func() {
