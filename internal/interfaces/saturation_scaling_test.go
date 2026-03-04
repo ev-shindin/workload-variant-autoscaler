@@ -4,6 +4,8 @@ import (
 	"testing"
 )
 
+func float64Ptr(v float64) *float64 { return &v }
+
 func TestSaturationScalingConfigValidate(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -121,7 +123,7 @@ func TestSaturationScalingConfigValidate(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "V2 valid config with explicit thresholds",
+			name: "V2 valid config with explicit thresholds (old-style analyzerName)",
 			config: SaturationScalingConfig{
 				KvCacheThreshold:     0.80,
 				QueueLengthThreshold: 5,
@@ -130,6 +132,21 @@ func TestSaturationScalingConfigValidate(t *testing.T) {
 				AnalyzerName:         "saturation",
 				ScaleUpThreshold:     0.90,
 				ScaleDownBoundary:    0.60,
+			},
+			wantErr: false,
+		},
+		{
+			name: "V2 valid config with analyzers list (new-style)",
+			config: SaturationScalingConfig{
+				KvCacheThreshold:     0.80,
+				QueueLengthThreshold: 5,
+				KvSpareTrigger:       0.10,
+				QueueSpareTrigger:    3,
+				ScaleUpThreshold:     0.90,
+				ScaleDownBoundary:    0.60,
+				Analyzers: []AnalyzerScoreConfig{
+					{Name: "saturation", Score: 1.0},
+				},
 			},
 			wantErr: false,
 		},
@@ -160,7 +177,7 @@ func TestSaturationScalingConfigValidate(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name: "V2 thresholds ignored when analyzerName is not saturation",
+			name: "V2 thresholds ignored when not V2",
 			config: SaturationScalingConfig{
 				KvCacheThreshold:     0.80,
 				QueueLengthThreshold: 5,
@@ -194,6 +211,51 @@ func TestSaturationScalingConfigValidate(t *testing.T) {
 			},
 			wantErr: true,
 		},
+		{
+			name: "V2 valid per-analyzer threshold override",
+			config: SaturationScalingConfig{
+				ScaleUpThreshold:  0.85,
+				ScaleDownBoundary: 0.70,
+				Analyzers: []AnalyzerScoreConfig{
+					{Name: "saturation", ScaleUpThreshold: float64Ptr(0.90)},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "V2 invalid per-analyzer scaleUpThreshold > 1",
+			config: SaturationScalingConfig{
+				ScaleUpThreshold:  0.85,
+				ScaleDownBoundary: 0.70,
+				Analyzers: []AnalyzerScoreConfig{
+					{Name: "saturation", ScaleUpThreshold: float64Ptr(1.5)},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "V2 invalid per-analyzer scaleDownBoundary > 1",
+			config: SaturationScalingConfig{
+				ScaleUpThreshold:  0.85,
+				ScaleDownBoundary: 0.70,
+				Analyzers: []AnalyzerScoreConfig{
+					{Name: "saturation", ScaleDownBoundary: float64Ptr(1.5)},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "V2 invalid per-analyzer effective up <= down",
+			config: SaturationScalingConfig{
+				ScaleUpThreshold:  0.85,
+				ScaleDownBoundary: 0.70,
+				Analyzers: []AnalyzerScoreConfig{
+					// Override scaleUpThreshold to 0.60, but global down is 0.70 → 0.60 <= 0.70
+					{Name: "saturation", ScaleUpThreshold: float64Ptr(0.60)},
+				},
+			},
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -207,7 +269,7 @@ func TestSaturationScalingConfigValidate(t *testing.T) {
 }
 
 func TestSaturationScalingConfigApplyDefaults(t *testing.T) {
-	t.Run("applies defaults for V2 analyzer when thresholds are zero", func(t *testing.T) {
+	t.Run("applies defaults for V2 via analyzerName (backward compat)", func(t *testing.T) {
 		config := SaturationScalingConfig{
 			AnalyzerName: "saturation",
 		}
@@ -217,6 +279,30 @@ func TestSaturationScalingConfigApplyDefaults(t *testing.T) {
 		}
 		if config.ScaleDownBoundary != DefaultScaleDownBoundary {
 			t.Errorf("expected ScaleDownBoundary=%v, got %v", DefaultScaleDownBoundary, config.ScaleDownBoundary)
+		}
+		if len(config.Analyzers) != 1 {
+			t.Fatalf("expected 1 analyzer, got %d", len(config.Analyzers))
+		}
+	})
+
+	t.Run("applies defaults for V2 via analyzers list (new-style)", func(t *testing.T) {
+		config := SaturationScalingConfig{
+			Analyzers: []AnalyzerScoreConfig{
+				{Name: "saturation"},
+			},
+		}
+		config.ApplyDefaults()
+		if config.ScaleUpThreshold != DefaultScaleUpThreshold {
+			t.Errorf("expected ScaleUpThreshold=%v, got %v", DefaultScaleUpThreshold, config.ScaleUpThreshold)
+		}
+		if config.ScaleDownBoundary != DefaultScaleDownBoundary {
+			t.Errorf("expected ScaleDownBoundary=%v, got %v", DefaultScaleDownBoundary, config.ScaleDownBoundary)
+		}
+		if config.Analyzers[0].Score != 1.0 {
+			t.Errorf("expected default score 1.0, got %v", config.Analyzers[0].Score)
+		}
+		if config.Analyzers[0].Enabled == nil || !*config.Analyzers[0].Enabled {
+			t.Errorf("expected analyzer to be enabled by default")
 		}
 	})
 
@@ -235,7 +321,7 @@ func TestSaturationScalingConfigApplyDefaults(t *testing.T) {
 		}
 	})
 
-	t.Run("no-op when analyzerName is not saturation", func(t *testing.T) {
+	t.Run("no-op when not V2", func(t *testing.T) {
 		config := SaturationScalingConfig{
 			AnalyzerName: "",
 		}
@@ -245,6 +331,9 @@ func TestSaturationScalingConfigApplyDefaults(t *testing.T) {
 		}
 		if config.ScaleDownBoundary != 0 {
 			t.Errorf("expected ScaleDownBoundary=0 for V1, got %v", config.ScaleDownBoundary)
+		}
+		if len(config.Analyzers) != 0 {
+			t.Errorf("expected no analyzers for V1, got %d", len(config.Analyzers))
 		}
 	})
 
@@ -266,29 +355,9 @@ func TestSaturationScalingConfigApplyDefaults(t *testing.T) {
 		}
 	})
 
-	t.Run("applies default analyzers list for V2", func(t *testing.T) {
-		config := SaturationScalingConfig{
-			AnalyzerName: "saturation",
-		}
-		config.ApplyDefaults()
-		if len(config.Analyzers) != 1 {
-			t.Fatalf("expected 1 analyzer, got %d", len(config.Analyzers))
-		}
-		if config.Analyzers[0].Name != "saturation" {
-			t.Errorf("expected analyzer name 'saturation', got %q", config.Analyzers[0].Name)
-		}
-		if config.Analyzers[0].Score != 1.0 {
-			t.Errorf("expected score 1.0, got %v", config.Analyzers[0].Score)
-		}
-		if config.Analyzers[0].Enabled == nil || !*config.Analyzers[0].Enabled {
-			t.Errorf("expected analyzer to be enabled")
-		}
-	})
-
 	t.Run("does not overwrite explicit analyzers", func(t *testing.T) {
 		disabled := false
 		config := SaturationScalingConfig{
-			AnalyzerName: "saturation",
 			Analyzers: []AnalyzerScoreConfig{
 				{Name: "saturation", Score: 0.5, Enabled: &disabled},
 			},
@@ -304,7 +373,6 @@ func TestSaturationScalingConfigApplyDefaults(t *testing.T) {
 
 	t.Run("applies per-entry defaults for zero score", func(t *testing.T) {
 		config := SaturationScalingConfig{
-			AnalyzerName: "saturation",
 			Analyzers: []AnalyzerScoreConfig{
 				{Name: "saturation"},
 			},
@@ -318,28 +386,124 @@ func TestSaturationScalingConfigApplyDefaults(t *testing.T) {
 		}
 	})
 
-	t.Run("does not add analyzers for V1", func(t *testing.T) {
-		config := SaturationScalingConfig{
-			AnalyzerName: "",
-		}
-		config.ApplyDefaults()
-		if len(config.Analyzers) != 0 {
-			t.Errorf("expected no analyzers for V1, got %d", len(config.Analyzers))
-		}
-	})
-
 	t.Run("ApplyDefaults then Validate passes with zero-valued omitempty fields", func(t *testing.T) {
 		config := SaturationScalingConfig{
 			KvCacheThreshold:     0.80,
 			QueueLengthThreshold: 5,
 			KvSpareTrigger:       0.10,
 			QueueSpareTrigger:    3,
-			AnalyzerName:         "saturation",
-			// ScaleUpThreshold and ScaleDownBoundary omitted (zero)
+			Analyzers: []AnalyzerScoreConfig{
+				{Name: "saturation"},
+			},
 		}
 		config.ApplyDefaults()
 		if err := config.Validate(); err != nil {
 			t.Errorf("ApplyDefaults + Validate should pass, got: %v", err)
+		}
+	})
+}
+
+func TestIsV2(t *testing.T) {
+	t.Run("false when no analyzers and no analyzerName", func(t *testing.T) {
+		config := SaturationScalingConfig{}
+		if config.IsV2() {
+			t.Error("expected IsV2()=false")
+		}
+	})
+
+	t.Run("true when analyzerName is saturation (backward compat)", func(t *testing.T) {
+		config := SaturationScalingConfig{AnalyzerName: "saturation"}
+		if !config.IsV2() {
+			t.Error("expected IsV2()=true")
+		}
+	})
+
+	t.Run("true when analyzers list is populated", func(t *testing.T) {
+		config := SaturationScalingConfig{
+			Analyzers: []AnalyzerScoreConfig{
+				{Name: "saturation"},
+			},
+		}
+		if !config.IsV2() {
+			t.Error("expected IsV2()=true")
+		}
+	})
+
+	t.Run("true when both analyzerName and analyzers set", func(t *testing.T) {
+		config := SaturationScalingConfig{
+			AnalyzerName: "saturation",
+			Analyzers: []AnalyzerScoreConfig{
+				{Name: "saturation"},
+			},
+		}
+		if !config.IsV2() {
+			t.Error("expected IsV2()=true")
+		}
+	})
+}
+
+func TestGetAnalyzerName(t *testing.T) {
+	t.Run("returns saturation when analyzers list populated", func(t *testing.T) {
+		config := SaturationScalingConfig{
+			Analyzers: []AnalyzerScoreConfig{
+				{Name: "saturation"},
+			},
+		}
+		if config.GetAnalyzerName() != "saturation" {
+			t.Errorf("expected 'saturation', got %q", config.GetAnalyzerName())
+		}
+	})
+
+	t.Run("returns raw analyzerName when no analyzers list", func(t *testing.T) {
+		config := SaturationScalingConfig{AnalyzerName: "saturation"}
+		if config.GetAnalyzerName() != "saturation" {
+			t.Errorf("expected 'saturation', got %q", config.GetAnalyzerName())
+		}
+	})
+
+	t.Run("returns empty when no analyzers and no analyzerName", func(t *testing.T) {
+		config := SaturationScalingConfig{}
+		if config.GetAnalyzerName() != "" {
+			t.Errorf("expected empty, got %q", config.GetAnalyzerName())
+		}
+	})
+}
+
+func TestEffectiveThresholds(t *testing.T) {
+	t.Run("returns global when per-analyzer not set", func(t *testing.T) {
+		a := AnalyzerScoreConfig{Name: "saturation"}
+		if a.EffectiveScaleUpThreshold(0.85) != 0.85 {
+			t.Errorf("expected 0.85, got %v", a.EffectiveScaleUpThreshold(0.85))
+		}
+		if a.EffectiveScaleDownBoundary(0.70) != 0.70 {
+			t.Errorf("expected 0.70, got %v", a.EffectiveScaleDownBoundary(0.70))
+		}
+	})
+
+	t.Run("returns per-analyzer when set", func(t *testing.T) {
+		a := AnalyzerScoreConfig{
+			Name:              "saturation",
+			ScaleUpThreshold:  float64Ptr(0.90),
+			ScaleDownBoundary: float64Ptr(0.60),
+		}
+		if a.EffectiveScaleUpThreshold(0.85) != 0.90 {
+			t.Errorf("expected 0.90, got %v", a.EffectiveScaleUpThreshold(0.85))
+		}
+		if a.EffectiveScaleDownBoundary(0.70) != 0.60 {
+			t.Errorf("expected 0.60, got %v", a.EffectiveScaleDownBoundary(0.70))
+		}
+	})
+
+	t.Run("partial override: only scaleUpThreshold", func(t *testing.T) {
+		a := AnalyzerScoreConfig{
+			Name:             "saturation",
+			ScaleUpThreshold: float64Ptr(0.95),
+		}
+		if a.EffectiveScaleUpThreshold(0.85) != 0.95 {
+			t.Errorf("expected 0.95, got %v", a.EffectiveScaleUpThreshold(0.85))
+		}
+		if a.EffectiveScaleDownBoundary(0.70) != 0.70 {
+			t.Errorf("expected 0.70 (global fallback), got %v", a.EffectiveScaleDownBoundary(0.70))
 		}
 	})
 }

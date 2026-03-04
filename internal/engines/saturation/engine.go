@@ -255,7 +255,7 @@ func (e *Engine) optimize(ctx context.Context) error {
 	enableLimiter := false
 	if cfg, ok := globalSatCfgMap["default"]; ok {
 		cfg.ApplyDefaults()
-		analyzerName = cfg.AnalyzerName
+		analyzerName = cfg.GetAnalyzerName()
 		enableLimiter = cfg.EnableLimiter
 	}
 

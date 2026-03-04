@@ -82,6 +82,21 @@ func (e *Engine) runAnalyzersAndScore(
 	deployments map[string]*appsv1.Deployment,
 	variantAutoscalings map[string]*llmdVariantAutoscalingV1alpha1.VariantAutoscaling,
 ) (*interfaces.AnalyzerResult, error) {
+	// Resolve per-analyzer threshold overrides before running the analyzer.
+	// The saturation analyzer reads thresholds from the config, so we apply
+	// per-analyzer overrides to the config's top-level fields.
+	for _, aw := range config.Analyzers {
+		if aw.Name == "saturation" && (aw.Enabled == nil || *aw.Enabled) {
+			if aw.ScaleUpThreshold != nil {
+				config.ScaleUpThreshold = *aw.ScaleUpThreshold
+			}
+			if aw.ScaleDownBoundary != nil {
+				config.ScaleDownBoundary = *aw.ScaleDownBoundary
+			}
+			break
+		}
+	}
+
 	// Run saturation analyzer (always needed for PerReplicaCapacity)
 	baseResult, err := e.runV2AnalysisOnly(ctx, modelID, namespace, replicaMetrics, config,
 		variantStates, deployments, variantAutoscalings)
