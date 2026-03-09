@@ -37,6 +37,7 @@ import (
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/collector/registration"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/collector/source"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/config"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/constants"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/discovery"
 	queueingmodel "github.com/llm-d/llm-d-workload-variant-autoscaler/internal/engines/analyzers/queueingmodel"
 	saturation_v2 "github.com/llm-d/llm-d-workload-variant-autoscaler/internal/engines/analyzers/saturation_v2"
@@ -358,14 +359,20 @@ func (e *Engine) optimizeV1(
 			// Convert saturation targets to decisions first, then apply enforcer
 			finalDecisions = e.convertSaturationTargetsToDecisions(ctx, saturationTargets, saturationAnalysis, variantStates)
 
-			// Apply scale-to-zero enforcement on decisions
-			scaleToZeroConfig := e.Config.ScaleToZeroConfigForNamespace(namespace)
-			scaledToZero := e.ScaleToZeroEnforcer.EnforcePolicyOnDecisions(
-				ctx, modelID, namespace,
-				finalDecisions, scaleToZeroConfig, "v1-saturation",
-			)
-			if scaledToZero {
-				logger.Info("Scale-to-zero enforcement applied",
+			// Check if any variant has minReplicas > 0 — if so, skip scale-to-zero enforcement
+			if !hasMinReplicasAboveZero(variantStates) {
+				// Apply scale-to-zero enforcement on decisions
+				scaleToZeroConfig := e.Config.ScaleToZeroConfigForNamespace(namespace)
+				scaledToZero := e.ScaleToZeroEnforcer.EnforcePolicyOnDecisions(
+					ctx, modelID, namespace,
+					finalDecisions, scaleToZeroConfig, "v1-saturation",
+				)
+				if scaledToZero {
+					logger.Info("Scale-to-zero enforcement applied",
+						"modelID", modelID)
+				}
+			} else {
+				logger.V(logging.DEBUG).Info("Skipping scale-to-zero enforcement: variant has minReplicas > 0",
 					"modelID", modelID)
 			}
 
@@ -494,6 +501,13 @@ func (e *Engine) optimizeV2(
 
 	// Stage 3: Apply enforcer per-model (directly on decisions)
 	for _, req := range requests {
+		// Skip scale-to-zero enforcement if any variant has minReplicas > 0
+		if hasMinReplicasAboveZero(req.VariantStates) {
+			logger.V(logging.DEBUG).Info("Skipping scale-to-zero enforcement (V2): variant has minReplicas > 0",
+				"modelID", req.ModelID)
+			continue
+		}
+
 		scaleToZeroConfig := e.Config.ScaleToZeroConfigForNamespace(req.Namespace)
 
 		scaledToZero := e.ScaleToZeroEnforcer.EnforcePolicyOnDecisions(
@@ -566,7 +580,14 @@ func (e *Engine) BuildVariantStates(
 		// Extract P/D role from deployment labels
 		role := getRoleFromDeployment(deploy)
 
-		ctrl.LoggerFrom(ctx).V(logging.DEBUG).Info("BuildVariantStates result", "variant", va.Name, "currentReplicas", currentReplicas, "readyReplicas", readyReplicas, "pendingReplicas", pendingReplicas, "gpusPerReplica", gpusPerReplica, "role", role)
+		// Parse min/max replica bounds from VA annotations
+		minReplicas, maxReplicas, boundsErr := constants.ParseReplicaBounds(va.Annotations)
+		if boundsErr != nil {
+			ctrl.LoggerFrom(ctx).Info("Warning: invalid replica bounds annotation, using defaults",
+				"variant", va.Name, "error", boundsErr)
+		}
+
+		ctrl.LoggerFrom(ctx).V(logging.DEBUG).Info("BuildVariantStates result", "variant", va.Name, "currentReplicas", currentReplicas, "readyReplicas", readyReplicas, "pendingReplicas", pendingReplicas, "gpusPerReplica", gpusPerReplica, "role", role, "minReplicas", minReplicas, "maxReplicas", maxReplicas)
 
 		states = append(states, interfaces.VariantReplicaState{
 			VariantName:     va.Name,
@@ -575,6 +596,8 @@ func (e *Engine) BuildVariantStates(
 			PendingReplicas: pendingReplicas,
 			GPUsPerReplica:  gpusPerReplica,
 			Role:            role,
+			MinReplicas:     minReplicas,
+			MaxReplicas:     maxReplicas,
 		})
 	}
 
@@ -691,6 +714,8 @@ func (e *Engine) convertSaturationTargetsToDecisions(
 			SafetyOverride:         false,
 			Reason:                 "saturation-only mode: " + string(action),
 			GPUsPerReplica:         gpusPerReplica,
+			MinReplicas:            state.MinReplicas,
+			MaxReplicas:            state.MaxReplicas,
 		}
 
 		if va != nil {
@@ -707,6 +732,16 @@ func (e *Engine) convertSaturationTargetsToDecisions(
 	}
 
 	return decisions
+}
+
+// hasMinReplicasAboveZero returns true if any variant in the states has MinReplicas > 0.
+func hasMinReplicasAboveZero(states []interfaces.VariantReplicaState) bool {
+	for _, state := range states {
+		if state.MinReplicas != nil && *state.MinReplicas > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // modelData holds the pre-processed data for a model, shared between V1 and V2 paths.

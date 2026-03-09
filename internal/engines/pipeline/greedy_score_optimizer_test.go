@@ -924,6 +924,41 @@ var _ = Describe("GreedyByScoreOptimizer", func() {
 			Expect(mean).To(Equal(0.0))
 		})
 
+		It("allocateForModel should respect maxReplicas", func() {
+			intPtr := func(n int) *int { return &n }
+			constraints := []*ResourceConstraints{
+				{Pools: map[string]ResourcePool{"A100": {Limit: 20}}},
+			}
+
+			requests := []ModelScalingRequest{
+				{
+					ModelID:   "model-1",
+					Namespace: "default",
+					Result: &interfaces.AnalyzerResult{
+						ModelID:          "model-1",
+						Namespace:        "default",
+						AnalyzedAt:       time.Now(),
+						RequiredCapacity: 50000,
+						VariantCapacities: []interfaces.VariantCapacity{
+							{VariantName: "cheap", AcceleratorName: "A100", Cost: 5.0, ReplicaCount: 1, PerReplicaCapacity: 10000},
+							{VariantName: "expensive", AcceleratorName: "A100", Cost: 15.0, ReplicaCount: 1, PerReplicaCapacity: 20000},
+						},
+					},
+					VariantStates: []interfaces.VariantReplicaState{
+						{VariantName: "cheap", CurrentReplicas: 1, GPUsPerReplica: 1, MaxReplicas: intPtr(3)},
+						{VariantName: "expensive", CurrentReplicas: 1, GPUsPerReplica: 1},
+					},
+				},
+			}
+
+			decisions := optimizer.Optimize(ctx, requests, constraints)
+			dm := decisionMap(decisions)
+
+			// cheap: capped at max=3 (starts at 1, can add 2)
+			// expensive: gets remaining capacity
+			Expect(dm["cheap"].TargetReplicas).To(BeNumerically("<=", 3))
+		})
+
 		It("sortByRemainingDesc should sort descending", func() {
 			active := []*modelWork{
 				{remaining: 100, req: ModelScalingRequest{ModelID: "low"}},
