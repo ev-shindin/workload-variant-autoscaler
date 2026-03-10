@@ -8,7 +8,7 @@ patches:
 - path: configmap-patch.yaml
   target:
     kind: ConfigMap
-    name: workload-variant-autoscaler-variantautoscaling-config
+    name: wva-variantautoscaling-config
 - path: prometheus-patch.yaml
   target:
     kind: Deployment

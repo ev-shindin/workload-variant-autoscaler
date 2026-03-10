@@ -30,22 +30,19 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	llmdVariantAutoscalingV1alpha1 "github.com/llm-d-incubation/workload-variant-autoscaler/api/v1alpha1"
-	"github.com/llm-d-incubation/workload-variant-autoscaler/internal/collector/source"
-	"github.com/llm-d-incubation/workload-variant-autoscaler/internal/collector/source/prometheus"
-	"github.com/llm-d-incubation/workload-variant-autoscaler/internal/config"
-	"github.com/llm-d-incubation/workload-variant-autoscaler/internal/engines/common"
-	interfaces "github.com/llm-d-incubation/workload-variant-autoscaler/internal/interfaces"
-	"github.com/llm-d-incubation/workload-variant-autoscaler/internal/logging"
-	utils "github.com/llm-d-incubation/workload-variant-autoscaler/internal/utils"
-	testutils "github.com/llm-d-incubation/workload-variant-autoscaler/test/utils"
+	llmdVariantAutoscalingV1alpha1 "github.com/llm-d/llm-d-workload-variant-autoscaler/api/v1alpha1"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/collector/source"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/collector/source/prometheus"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/config"
+	interfaces "github.com/llm-d/llm-d-workload-variant-autoscaler/internal/interfaces"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/logging"
+	utils "github.com/llm-d/llm-d-workload-variant-autoscaler/internal/utils"
+	testutils "github.com/llm-d/llm-d-workload-variant-autoscaler/test/utils"
 )
 
 var _ = Describe("Saturation Engine", func() {
 
-	var getNamespace = func() string {
-		return "workload-variant-autoscaler-system"
-	}
+	// Use config.SystemNamespace() instead of local function
 
 	// CreateServiceClassConfigMap creates a service class ConfigMap for testing
 	var CreateServiceClassConfigMap = func(controllerNamespace string, models ...string) *v1.ConfigMap {
@@ -79,174 +76,10 @@ data:
 		}
 	}
 
-	Context("When validating configurations", func() {
-		const configMapName = "workload-variant-autoscaler-variantautoscaling-config"
-		var configMapNamespace = getNamespace()
-
-		BeforeEach(func() {
-			logging.NewTestLogger()
-			ns := &v1.Namespace{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: configMapNamespace,
-				},
-			}
-			Expect(client.IgnoreAlreadyExists(k8sClient.Create(ctx, ns))).NotTo(HaveOccurred())
-
-			By("creating the required configmaps")
-			configMap := testutils.CreateServiceClassConfigMap(ns.Name)
-			Expect(k8sClient.Create(ctx, configMap)).NotTo(HaveOccurred())
-
-			configMap = testutils.CreateAcceleratorUnitCostConfigMap(ns.Name)
-			Expect(k8sClient.Create(ctx, configMap)).NotTo(HaveOccurred())
-
-			configMap = testutils.CreateVariantAutoscalingConfigMap(configMapName, ns.Name)
-			Expect(k8sClient.Create(ctx, configMap)).NotTo(HaveOccurred())
-		})
-
-		AfterEach(func() {
-			By("Deleting the configmap resources")
-			configMap := &v1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "service-classes-config",
-					Namespace: configMapNamespace,
-				},
-			}
-			err := k8sClient.Delete(ctx, configMap)
-			Expect(client.IgnoreNotFound(err)).NotTo(HaveOccurred())
-
-			configMap = &v1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "accelerator-unit-costs",
-					Namespace: configMapNamespace,
-				},
-			}
-			err = k8sClient.Delete(ctx, configMap)
-			Expect(client.IgnoreNotFound(err)).NotTo(HaveOccurred())
-
-			configMap = &v1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      configMapName,
-					Namespace: configMapNamespace,
-				},
-			}
-			err = k8sClient.Delete(ctx, configMap)
-			Expect(client.IgnoreNotFound(err)).NotTo(HaveOccurred())
-		})
-
-		It("should return empty on variant autoscaling optimization ConfigMap with missing prometheus base URL", func() {
-
-			// delete correct configMap
-			configMap := &v1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      configMapName,
-					Namespace: configMapNamespace,
-				},
-			}
-			err := k8sClient.Delete(ctx, configMap)
-			Expect(err).NotTo(HaveOccurred())
-
-			configMap = &v1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      configMapName,
-					Namespace: configMapNamespace,
-					Labels: map[string]string{
-						"app.kubernetes.io/name": "workload-variant-autoscaler",
-					},
-				},
-				Data: map[string]string{
-					"PROMETHEUS_BASE_URL": "",
-					"GLOBAL_OPT_INTERVAL": "60s",
-					"GLOBAL_OPT_TRIGGER":  "false",
-				},
-			}
-			Expect(k8sClient.Create(ctx, configMap)).To(Succeed())
-
-			prometheusURL, err := config.GetPrometheusConfigFromConfigMap(ctx, k8sClient)
-			Expect(err).NotTo(HaveOccurred(), "Unexpected error when reading variant autoscaling optimization ConfigMap with missing Prometheus URL")
-			Expect(prometheusURL).To(BeNil(), "Expected empty Prometheus URL")
-		})
-
-		It("should return error on VA optimization ConfigMap with missing prometheus base URL and no env variable", func() {
-
-			// delete correct configMap
-			configMap := &v1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      configMapName,
-					Namespace: configMapNamespace,
-				},
-			}
-			err := k8sClient.Delete(ctx, configMap)
-			Expect(err).NotTo(HaveOccurred())
-
-			configMap = &v1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      configMapName,
-					Namespace: configMapNamespace,
-					Labels: map[string]string{
-						"app.kubernetes.io/name": "workload-variant-autoscaler",
-					},
-				},
-				Data: map[string]string{
-					"PROMETHEUS_BASE_URL": "",
-					"GLOBAL_OPT_INTERVAL": "60s",
-					"GLOBAL_OPT_TRIGGER":  "false",
-				},
-			}
-			Expect(k8sClient.Create(ctx, configMap)).To(Succeed())
-
-			_, err = config.GetPrometheusConfig(ctx, k8sClient)
-			Expect(err).To(HaveOccurred(), "It should fail when neither env variable nor Prometheus URL are found")
-		})
-
-		It("should return default values on variant autoscaling optimization ConfigMap with missing TLS values", func() {
-
-			// delete correct configMap
-			configMap := &v1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      configMapName,
-					Namespace: configMapNamespace,
-				},
-			}
-			err := k8sClient.Delete(ctx, configMap)
-			Expect(err).NotTo(HaveOccurred())
-
-			configMap = &v1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      configMapName,
-					Namespace: configMapNamespace,
-					Labels: map[string]string{
-						"app.kubernetes.io/name": "workload-variant-autoscaler",
-					},
-				},
-				Data: map[string]string{
-					"PROMETHEUS_BASE_URL":                 "https://kube-prometheus-stack-prometheus.workload-variant-autoscaler-monitoring.svc.cluster.local:9090",
-					"GLOBAL_OPT_INTERVAL":                 "60s",
-					"GLOBAL_OPT_TRIGGER":                  "false",
-					"PROMETHEUS_TLS_INSECURE_SKIP_VERIFY": "true",
-					// no values set for TLS config - dev env
-				},
-			}
-			Expect(k8sClient.Create(ctx, configMap)).To(Succeed())
-
-			prometheusConfig, err := config.GetPrometheusConfigFromConfigMap(ctx, k8sClient)
-			Expect(err).NotTo(HaveOccurred(), "It should not fail when neither env variable nor Prometheus URL are found")
-
-			Expect(prometheusConfig.BaseURL).To(Equal("https://kube-prometheus-stack-prometheus.workload-variant-autoscaler-monitoring.svc.cluster.local:9090"), "Expected Base URL to be set")
-			Expect(prometheusConfig.InsecureSkipVerify).To(BeTrue(), "Expected Insecure Skip Verify to be true")
-
-			Expect(prometheusConfig.CACertPath).To(Equal(""), "Expected CA Cert Path to be empty")
-			Expect(prometheusConfig.ClientCertPath).To(Equal(""), "Expected Client Cert path to be empty")
-			Expect(prometheusConfig.ClientKeyPath).To(Equal(""), "Expected Client Key path to be empty")
-			Expect(prometheusConfig.BearerToken).To(Equal(""), "Expected Bearer Token to be empty")
-			Expect(prometheusConfig.TokenPath).To(Equal(""), "Expected Token Path to be empty")
-			Expect(prometheusConfig.ServerName).To(Equal(""), "Expected Server Name to be empty")
-		})
-	})
-
 	Context("When handling multiple VariantAutoscalings", func() {
 		const totalVAs = 3
-		const configMapName = "workload-variant-autoscaler-variantautoscaling-config"
-		var configMapNamespace = getNamespace()
+		const configMapName = "wva-variantautoscaling-config"
+		var configMapNamespace = config.SystemNamespace()
 
 		BeforeEach(func() {
 			logging.NewTestLogger()
@@ -265,9 +98,6 @@ data:
 				modelNames = append(modelNames, fmt.Sprintf("model-%d-model-%d", i, i))
 			}
 			configMap := CreateServiceClassConfigMap(ns.Name, modelNames...)
-			Expect(k8sClient.Create(ctx, configMap)).To(Succeed())
-
-			configMap = testutils.CreateAcceleratorUnitCostConfigMap(ns.Name)
 			Expect(k8sClient.Create(ctx, configMap)).To(Succeed())
 
 			configMap = testutils.CreateVariantAutoscalingConfigMap(configMapName, ns.Name)
@@ -296,7 +126,7 @@ data:
 								Containers: []v1.Container{
 									{
 										Name:  "test-container",
-										Image: "quay.io/infernoautoscaler/vllme:0.2.1-multi-arch",
+										Image: "registry.k8s.io/pause:3.9",
 										Ports: []v1.ContainerPort{{ContainerPort: 80}},
 									},
 								},
@@ -335,15 +165,6 @@ data:
 				},
 			}
 			err := k8sClient.Delete(ctx, configMap)
-			Expect(client.IgnoreNotFound(err)).NotTo(HaveOccurred())
-
-			configMap = &v1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "accelerator-unit-costs",
-					Namespace: configMapNamespace,
-				},
-			}
-			err = k8sClient.Delete(ctx, configMap)
 			Expect(client.IgnoreNotFound(err)).NotTo(HaveOccurred())
 
 			configMap = &v1.ConfigMap{
@@ -392,12 +213,12 @@ data:
 			sourceRegistry := source.NewSourceRegistry()
 			promSource := prometheus.NewPrometheusSource(ctx, mockPromAPI, prometheus.DefaultPrometheusSourceConfig())
 			sourceRegistry.Register("prometheus", promSource) // nolint:errcheck
-			engine := NewEngine(k8sClient, k8sClient.Scheme(), nil, sourceRegistry)
-
-			// Populate global config
-			common.Config.UpdateSaturationConfig(map[string]interfaces.SaturationScalingConfig{
+			// Create minimal test config with saturation config
+			testConfig := config.NewTestConfig()
+			testConfig.UpdateSaturationConfig(map[string]interfaces.SaturationScalingConfig{
 				"default": {},
 			})
+			engine := NewEngine(k8sClient, k8sClient.Scheme(), nil, sourceRegistry, testConfig)
 
 			By("Performing optimization loop")
 			err := engine.optimize(ctx)
@@ -455,7 +276,9 @@ data:
 			By("Converting saturation targets to decisions")
 			sourceRegistry := source.NewSourceRegistry()
 			sourceRegistry.Register("prometheus", source.NewNoOpSource()) // nolint:errcheck
-			engine := NewEngine(k8sClient, k8sClient.Scheme(), nil, sourceRegistry)
+			// Create minimal test config
+			testConfig := config.NewTestConfig()
+			engine := NewEngine(k8sClient, k8sClient.Scheme(), nil, sourceRegistry, testConfig)
 			decisions := engine.convertSaturationTargetsToDecisions(context.Background(), saturationTargets, saturationAnalysis, variantStates)
 
 			By("Verifying all variants are included in decisions")
@@ -476,8 +299,8 @@ data:
 
 	Context("Source Infrastructure Optimization Tests", func() {
 		const totalVAs = 3
-		const configMapName = "workload-variant-autoscaler-variantautoscaling-config"
-		var configMapNamespace = getNamespace()
+		const configMapName = "wva-variantautoscaling-config"
+		var configMapNamespace = config.SystemNamespace()
 		var sourceRegistry *source.SourceRegistry
 		var mockPromAPI *testutils.MockPromAPI
 
@@ -513,9 +336,6 @@ data:
 			configMap := CreateServiceClassConfigMap(ns.Name, modelNames...)
 			Expect(k8sClient.Create(ctx, configMap)).To(Succeed())
 
-			configMap = testutils.CreateAcceleratorUnitCostConfigMap(ns.Name)
-			Expect(k8sClient.Create(ctx, configMap)).To(Succeed())
-
 			configMap = testutils.CreateVariantAutoscalingConfigMap(configMapName, ns.Name)
 			Expect(k8sClient.Create(ctx, configMap)).To(Succeed())
 
@@ -542,7 +362,7 @@ data:
 								Containers: []v1.Container{
 									{
 										Name:  "test-container",
-										Image: "quay.io/infernoautoscaler/vllme:0.2.1-multi-arch",
+										Image: "registry.k8s.io/pause:3.9",
 										Ports: []v1.ContainerPort{{ContainerPort: 80}},
 									},
 								},
@@ -585,15 +405,6 @@ data:
 
 			configMap = &v1.ConfigMap{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:      "accelerator-unit-costs",
-					Namespace: configMapNamespace,
-				},
-			}
-			err = k8sClient.Delete(ctx, configMap)
-			Expect(client.IgnoreNotFound(err)).NotTo(HaveOccurred())
-
-			configMap = &v1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
 					Name:      configMapName,
 					Namespace: configMapNamespace,
 				},
@@ -632,12 +443,12 @@ data:
 		It("should successfully run optimization with source infrastructure", func() {
 
 			// Initialize legacy MetricsCollector for non-saturation metrics
-			engine := NewEngine(k8sClient, k8sClient.Scheme(), nil, sourceRegistry)
-
-			// Populate global config
-			common.Config.UpdateSaturationConfig(map[string]interfaces.SaturationScalingConfig{
+			// Create minimal test config with saturation config
+			testConfig := config.NewTestConfig()
+			testConfig.UpdateSaturationConfig(map[string]interfaces.SaturationScalingConfig{
 				"default": {},
 			})
+			engine := NewEngine(k8sClient, k8sClient.Scheme(), nil, sourceRegistry, testConfig)
 
 			By("Performing optimization loop with source infrastructure")
 			err := engine.optimize(ctx)

@@ -1,8 +1,105 @@
 # workload-variant-autoscaler
 
-![Version: 0.4.1](https://img.shields.io/badge/Version-0.4.1-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: v0.4.1](https://img.shields.io/badge/AppVersion-v0.4.1-informational?style=flat-square)
+![Version: 0.5.1](https://img.shields.io/badge/Version-0.5.1-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: v0.5.1](https://img.shields.io/badge/AppVersion-v0.5.1-informational?style=flat-square)
 
 Helm chart for Workload-Variant-Autoscaler (WVA) - GPU-aware autoscaler for LLM inference workloads
+
+### Chart registry (OCI)
+
+The chart is published to GitHub Container Registry under the **llm-d** org (not llm-d-incubation). Use this OCI URL in Helm or Helmfile:
+
+- **OCI URL:** `oci://ghcr.io/llm-d/workload-variant-autoscaler`
+- **Example:** `helm pull oci://ghcr.io/llm-d/workload-variant-autoscaler --version 0.5.1`
+
+## Installation (OpenShift)
+Helm is the recommended installation method. Before running, be sure to delete all previous helm installations for `workload-variant-autoscaler` and `prometheus-adapter`. To list all helm charts installed in the cluster run `helm ls -A`.
+
+### Step 1: Setup Variables, Secret, Helm repo
+```
+export OWNER="llm-d"
+export WVA_PROJECT="llm-d-workload-variant-autoscaler"
+export WVA_RELEASE="v0.5.1"
+export WVA_NS="workload-variant-autoscaler-system"
+export MON_NS="openshift-user-workload-monitoring"
+
+kubectl get secret thanos-querier-tls -n openshift-monitoring -o jsonpath='{.data.tls\.crt}' | base64 -d > /tmp/prometheus-ca.crt
+
+git clone -b $WVA_RELEASE -- https://github.com/$OWNER/$WVA_PROJECT.git $WVA_PROJECT
+cd $WVA_PROJECT
+export WVA_PROJECT=$PWD
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo update
+```
+
+### Step 2: Update prometheus-adapter To Export WVA Metrics
+**Important:** The following helm upgrade command updates the global `prometheus-adapter` 
+configmap. If this is a shared cluster then you might want to get the current
+settings, manually append the values in `config/samples/prometheus-adapter-values-ocp.yaml`
+then run helm upgrade with the appended values. Here's an example how to get the current
+values: `kubectl get configmap prometheus-adapter -n $MON_NS -o yaml`
+
+```
+helm upgrade -i prometheus-adapter prometheus-community/prometheus-adapter \
+  -n $MON_NS \
+  -f config/samples/prometheus-adapter-values-ocp.yaml
+```
+
+### Step 3: Install WVA Controller Into a Namespace
+```
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: $WVA_NS
+  labels:
+    app.kubernetes.io/name: workload-variant-autoscaler
+    control-plane: controller-manager
+    openshift.io/user-monitoring: "true"
+EOF
+
+cd $WVA_PROJECT/charts
+helm upgrade -i workload-variant-autoscaler ./workload-variant-autoscaler \
+  -n $WVA_NS \
+  --set-file wva.prometheus.caCert=/tmp/prometheus-ca.crt \
+  --set controller.enabled=true \
+  --set va.enabled=false \
+  --set hpa.enabled=false \
+  --set vllmService.enabled=false
+```
+
+### Step 4: Add Models as Scale Targets To WVA Controller
+After a WVA controller has been installed,
+you can add one or more models running in LLMD namespaces as scale targets to the WVA controller. As an example, the following command adds model name `my-model-a` with model ID `meta-llama/Llama-3.1-8` running in `team-a` LLMD namespace. This command creates the corresponding VA, HPA resources in `team-a` namespace.
+```
+helm install wva-model-a ./workload-variant-autoscaler \
+  -n $WVA_NS \
+  --set controller.enabled=false \
+  --set va.enabled=true \
+  --set hpa.enabled=true \
+  --set llmd.namespace=team-a \
+  --set llmd.modelName=my-model-a \
+  --set llmd.modelID="meta-llama/Llama-3.1-8"
+```
+Here is an example to add another model to the same WVA controller:
+```
+helm install wva-model-b ./workload-variant-autoscaler \
+  -n $WVA_NS \
+  --set controller.enabled=false \
+  --set va.enabled=true \
+  --set hpa.enabled=true \
+  --set llmd.namespace=team-a \
+  --set llmd.modelName=my-model-b \
+  --set llmd.modelID="Qwen/Qwen3-0.6B"
+```
+**Notes**:
+- When there are multiple WVA controllers installed in different namespaces, there's the possibility of adding models in a LLMD namespace as scale targets using the **same** `release name`. If `helm install` was used to add then there will be a clear message such as:
+  ```
+  INSTALLATION FAILED: cannot re-use a name that is still in use
+  ``` 
+  However, if `helm upgrade -i` (combine upgrade and install) was used then the message is less clear as shown below. In this case, different release names should be used:
+  ```
+  Error: UPGRADE FAILED: Unable to continue with update: Service "workload-variant-autoscaler-vllm" in namespace "xyz" exists and cannot be imported into the current release: invalid ownership metadata; annotation validation error: key "meta.helm.sh/release-namespace" must equal "abc": current value is "xyz"
+  ```
 
 ## Values
 
@@ -28,9 +125,10 @@ Helm chart for Workload-Variant-Autoscaler (WVA) - GPU-aware autoscaler for LLM 
 | vllmService.interval | string | `"15s"` |  |
 | vllmService.nodePort | int | `30000` |  |
 | vllmService.scheme | string | `"http"` |  |
+| wva.configMap.immutable | bool | `false` | If true, makes the main controller ConfigMap (`{release-name}-variantautoscaling-config`) immutable (cannot be updated after creation). Provides security benefits by preventing accidental or malicious configuration changes, but disables runtime config updates. Note: This only affects the main ConfigMap; other ConfigMaps (saturation scaling, scale-to-zero) are not affected. See [Configuration Guide](../../docs/user-guide/configuration.md) |
 | wva.controllerInstance | string | `""` | Controller instance label for multi-controller isolation. When set, adds `controller_instance` label to all metrics and filters VariantAutoscaling resources by matching label. Use for parallel testing or multi-tenant environments. See [Multi-Controller Isolation](../../docs/user-guide/multi-controller-isolation.md) |
 | wva.enabled | bool | `true` |  |
-| wva.image.repository | string | `"ghcr.io/llm-d-incubation/workload-variant-autoscaler"` |  |
+| wva.image.repository | string | `"ghcr.io/llm-d/llm-d-workload-variant-autoscaler"` |  |
 | wva.image.tag | string | `"latest"` |  |
 | wva.imagePullPolicy | string | `"Always"` |  |
 | wva.metrics.enabled | bool | `true` |  |
@@ -45,55 +143,6 @@ Helm chart for Workload-Variant-Autoscaler (WVA) - GPU-aware autoscaler for LLM 
 
 ----------------------------------------------
 Autogenerated from chart metadata using [helm-docs v1.14.2](https://github.com/norwoodj/helm-docs/releases/v1.14.2)
-
-### INSTALL (on OpenShift)
-1. Before running, be sure to delete all previous helm installations for workload-variant-scheduler and prometheus-adapter.
-2. llm-d must be installed for WVA to do it's magic. If you plan on installing llm-d with these instructions, please be sure to remove any other helm installation of llm-d before proceeding.
-
-#### NOTE: to view which helm charts you already have installed in your cluster, use:
-```
-helm ls -A
-```
-
-```
-export OWNER="llm-d-incubation"
-export WVA_PROJECT="workload-variant-autoscaler"
-export WVA_RELEASE="v0.4.1"
-export WVA_NS="workload-variant-autoscaler-system"
-export MON_NS="openshift-user-workload-monitoring"
-
-kubectl get secret thanos-querier-tls -n openshift-monitoring -o jsonpath='{.data.tls\.crt}' | base64 -d > /tmp/prometheus-ca.crt
-
-git clone -b $WVA_RELEASE -- https://github.com/$OWNER/$WVA_PROJECT.git $WVA_PROJECT
-cd $WVA_PROJECT
-export WVA_PROJECT=$PWD
-helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
-helm repo update
-
-helm upgrade -i prometheus-adapter prometheus-community/prometheus-adapter \
-  -n $MON_NS \
-  -f config/samples/prometheus-adapter-values-ocp.yaml
-
-kubectl apply -f - <<EOF
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: $WVA_NS
-  labels:
-    app.kubernetes.io/name: workload-variant-autoscaler
-    control-plane: controller-manager
-    openshift.io/user-monitoring: "true"
-EOF
-
-cd $WVA_PROJECT/charts
-helm upgrade -i workload-variant-autoscaler ./workload-variant-autoscaler \
-  -n $WVA_NS \
-  --set-file wva.prometheus.caCert=/tmp/prometheus-ca.crt \
-  --set va.accelerator=L40S \
-  --set llmd.modelID=unsloth/Meta-Llama-3.1-8B \
-  --set vllmService.enabled=true \
-  --set vllmService.nodePort=30000
-```
 
 ## Configuration Files
 
@@ -293,36 +342,33 @@ helm install workload-variant-autoscaler ./workload-variant-autoscaler \
   --set wva.image.tag=v0.0.1-dev
 ```
 
+#### Immutable ConfigMap (Security Hardening)
+```bash
+# Enable immutable ConfigMap for enhanced security
+# This prevents accidental or malicious configuration changes
+# Note: Disables runtime config updates (requires ConfigMap recreation for changes)
+helm install workload-variant-autoscaler ./workload-variant-autoscaler \
+  -n workload-variant-autoscaler-system \
+  --values values.yaml \
+  --set wva.configMap.immutable=true
+```
+
+**Security Benefits:**
+- Prevents accidental configuration changes
+- Protects against malicious modifications
+- Ensures configuration integrity
+- Reduces attack surface
+
+**Trade-offs:**
+- Runtime config updates are disabled
+- Configuration changes require:
+  1. Deleting the ConfigMap
+  2. Updating Helm values and upgrading
+  3. Restarting the controller pod
+
 ### Multi-Controller Isolation
 
-When running multiple WVA controllers in the same cluster (e.g., for parallel e2e tests or multi-tenant environments), use the `controllerInstance` configuration to prevent metrics conflicts between controllers.
-
-#### How It Works
-
-When `wva.controllerInstance` is set:
-1. The controller adds a `controller_instance` label to all emitted metrics
-2. The HPA selector includes `controller_instance` to filter metrics from the specific controller
-3. Each controller only sees metrics from its own instance, preventing conflicts
-
-#### Configuration
-
-**Via Helm:**
-```bash
-helm install my-wva ./workload-variant-autoscaler \
-  -n my-namespace \
-  --set wva.controllerInstance="my-unique-instance-id"
-```
-
-**Via Environment Variable (install.sh):**
-```bash
-CONTROLLER_INSTANCE="my-unique-instance-id" ./deploy/install.sh
-```
-
-**Via values.yaml:**
-```yaml
-wva:
-  controllerInstance: "my-unique-instance-id"
-```
+When running multiple WVA controllers in the same cluster (e.g., for parallel e2e tests or multi-tenant environments), use the `controllerInstance` configuration to prevent metrics conflicts between controllers. See [Multi-Controller Isolation](../../docs/user-guide/multi-controller-isolation.md) for detailed configuration.
 
 #### E2E Testing Example
 

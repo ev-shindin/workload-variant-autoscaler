@@ -40,7 +40,7 @@ func CreateLlmdSimDeployment(namespace, deployName, modelName, appLabel, port st
 					Containers: []corev1.Container{
 						{
 							Name:            appLabel,
-							Image:           "ghcr.io/llm-d/llm-d-inference-sim:latest",
+							Image:           "ghcr.io/llm-d/llm-d-inference-sim:v0.7.1",
 							ImagePullPolicy: corev1.PullAlways,
 							Args: []string{
 								"--model",
@@ -53,6 +53,7 @@ func CreateLlmdSimDeployment(namespace, deployName, modelName, appLabel, port st
 								"--enable-kvcache",
 								"--kv-cache-size=1024",
 								"--block-size=16",
+								"--tokenizers-cache-dir=/tmp",
 							},
 							Env: []corev1.EnvVar{
 								{Name: "POD_NAME", ValueFrom: &corev1.EnvVarSource{
@@ -65,6 +66,12 @@ func CreateLlmdSimDeployment(namespace, deployName, modelName, appLabel, port st
 									FieldRef: &corev1.ObjectFieldSelector{
 										APIVersion: "v1",
 										FieldPath:  "metadata.namespace",
+									},
+								}},
+								{Name: "POD_IP", ValueFrom: &corev1.EnvVarSource{
+									FieldRef: &corev1.ObjectFieldSelector{
+										APIVersion: "v1",
+										FieldPath:  "status.podIP",
 									},
 								}},
 							},
@@ -92,7 +99,7 @@ func CreateLlmdSimDeploymentWithGPU(namespace, deployName, modelName, appLabel, 
 
 	container := corev1.Container{
 		Name:            appLabel,
-		Image:           "ghcr.io/llm-d/llm-d-inference-sim:latest",
+		Image:           "ghcr.io/llm-d/llm-d-inference-sim:v0.7.1",
 		ImagePullPolicy: corev1.PullAlways,
 		Args: []string{
 			"--model",
@@ -105,6 +112,7 @@ func CreateLlmdSimDeploymentWithGPU(namespace, deployName, modelName, appLabel, 
 			"--enable-kvcache",
 			"--kv-cache-size=1024",
 			"--block-size=16",
+			"--tokenizers-cache-dir=/tmp",
 		},
 		Env: []corev1.EnvVar{
 			{Name: "POD_NAME", ValueFrom: &corev1.EnvVarSource{
@@ -117,6 +125,12 @@ func CreateLlmdSimDeploymentWithGPU(namespace, deployName, modelName, appLabel, 
 				FieldRef: &corev1.ObjectFieldSelector{
 					APIVersion: "v1",
 					FieldPath:  "metadata.namespace",
+				},
+			}},
+			{Name: "POD_IP", ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{
+					APIVersion: "v1",
+					FieldPath:  "status.podIP",
 				},
 			}},
 		},
@@ -185,6 +199,19 @@ func CreateLlmdSimDeploymentWithGPUAndNodeSelector(
 
 	if len(nodeSelector) > 0 {
 		deployment.Spec.Template.Spec.NodeSelector = nodeSelector
+		// Add tolerations for control-plane nodes as H100s might be on control-plane in kind-emulator
+		deployment.Spec.Template.Spec.Tolerations = []corev1.Toleration{
+			{
+				Key:      "node-role.kubernetes.io/control-plane",
+				Operator: corev1.TolerationOpExists,
+				Effect:   corev1.TaintEffectNoSchedule,
+			},
+			{
+				Key:      "node-role.kubernetes.io/master",
+				Operator: corev1.TolerationOpExists,
+				Effect:   corev1.TaintEffectNoSchedule,
+			},
+		}
 	}
 
 	return deployment

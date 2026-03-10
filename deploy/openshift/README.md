@@ -65,7 +65,7 @@ export HF_TOKEN="your-hf-token-here"
 
 # Optional: Customize deployment
 export MODEL_ID="unsloth/Meta-Llama-3.1-8B"         # Default
-export WVA_IMAGE="ghcr.io/llm-d-incubation/workload-variant-autoscaler:latest"  # Default
+export WVA_IMAGE="ghcr.io/llm-d/llm-d-workload-variant-autoscaler:latest"  # Default
 ```
 
 ### 2. Deploy the Workload Variant Autoscaler and llm-d using Make
@@ -97,7 +97,6 @@ export HF_TOKEN="hf_xxxxx"                  # Required: HuggingFace token
 export MODEL_ID="unsloth/Meta-Llama-3.1-8B" # Model to deploy
 export ACCELERATOR_TYPE="H100"              # GPU type (auto-detected)
 export GATEWAY_PROVIDER="istio"             # Gateway: istio or kgateway
-export BENCHMARK_MODE="true"                # Use Istio benchmark config
 
 # Performance tuning (optional)
 export VLLM_MAX_NUM_SEQS=64                 # vLLM max concurrent sequences (batch size)
@@ -358,7 +357,8 @@ kubectl logs -n workload-variant-autoscaler-system \
 ### Run E2E Tests on OpenShift
 
 ```bash
-make test-e2e-openshift
+export ENVIRONMENT=openshift
+make test-e2e-full
 ```
 
 ### Generate Load

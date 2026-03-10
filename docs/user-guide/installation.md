@@ -11,22 +11,8 @@ This guide covers installing Workload-Variant-Autoscaler (WVA) on your Kubernete
 
 ## Installation Methods
 
-### Option 1: Helm Installation (Recommended)
-
-The simplest way to install WVA is using Helm:
-
-```bash
-# Install WVA with default configuration
-helm install workload-variant-autoscaler ./charts/workload-variant-autoscaler \
-  --namespace workload-variant-autoscaler-system \
-  --create-namespace
-
-# Or with custom values
-helm install workload-variant-autoscaler ./charts/workload-variant-autoscaler \
-  --namespace workload-variant-autoscaler-system \
-  --create-namespace \
-  --values custom-values.yaml
-```
+### Option 1: Helm Installation
+See the [Helm Installation](../../charts/workload-variant-autoscaler/README.md) for detailed instructions.
 
 **Verify the installation:**
 ```bash
@@ -42,30 +28,12 @@ Using kustomize for more control:
 make install
 
 # Deploy the controller
-make deploy IMG=quay.io/llm-d/workload-variant-autoscaler:latest
+make deploy IMG=quay.io/llm-d/llm-d-workload-variant-autoscaler:latest
 ```
 
-### Option 3: Using Installation Scripts
+### Option 3: Local Development (Kind Emulator):
+See the [Kind Emulator](../../deploy/kind-emulator/README.md) for detailed instructions.
 
-For specific platforms:
-
-**Kubernetes:**
-```bash
-cd deploy/kubernetes
-./install.sh
-```
-
-**OpenShift:**
-```bash
-cd deploy/openshift
-./install.sh
-```
-
-**Local Development (Kind Emulator):**
-```bash
-# See deploy/kind-emulator/README.md for detailed instructions
-make deploy-llm-d-wva-emulated-on-kind
-```
 
 ## Configuration
 
@@ -76,7 +44,7 @@ Key configuration options:
 ```yaml
 # custom-values.yaml
 image:
-  repository: quay.io/llm-d/workload-variant-autoscaler
+  repository: quay.io/llm-d/llm-d-workload-variant-autoscaler
   tag: latest
   pullPolicy: IfNotPresent
 
@@ -106,7 +74,6 @@ wva:
 
 WVA uses ConfigMaps for cluster configuration:
 
-- **Accelerator Unit Cost**: GPU pricing information
 - **Service Classes**: SLO definitions for different service tiers
 
 See [Configuration Guide](configuration.md) for details.

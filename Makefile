@@ -1,9 +1,9 @@
 # Image URL to use all building/pushing image targets
 IMAGE_TAG_BASE ?= ghcr.io/llm-d
 IMG_TAG ?= latest
-IMG ?= $(IMAGE_TAG_BASE)/workload-variant-autoscaler:$(IMG_TAG)
+IMG ?= $(IMAGE_TAG_BASE)/llm-d-workload-variant-autoscaler:$(IMG_TAG)
 KIND_ARGS ?= -t mix -n 3 -g 2   # Default: 3 nodes, 2 GPUs per node, mixed vendors
-CLUSTER_GPU_TYPE ?= mix
+CLUSTER_GPU_TYPE ?= nvidia-mix
 CLUSTER_NODES ?= 3
 CLUSTER_GPUS ?= 4
 KUBECONFIG ?= $(HOME)/.kube/config
@@ -17,6 +17,14 @@ MODEL_ID             ?= unsloth/Meta-Llama-3.1-8B
 DEPLOYMENT           ?= # discovered automatically in e2es
 REQUEST_RATE         ?= 20
 NUM_PROMPTS          ?= 3000
+
+# E2E test configuration (for test/e2e/ suite)
+ENVIRONMENT                 ?= kind-emulator
+USE_SIMULATOR               ?= true
+SCALE_TO_ZERO_ENABLED       ?= false
+SCALER_BACKEND              ?= prometheus-adapter  # prometheus-adapter (HPA) or keda (ScaledObject)
+E2E_MONITORING_NAMESPACE    ?= workload-variant-autoscaler-monitoring
+E2E_EMULATED_LLMD_NAMESPACE ?= llm-d-sim
 
 # Flags for deploy/install.sh installation script
 CREATE_CLUSTER ?= false
@@ -67,6 +75,7 @@ help: ## Display this help.
 .PHONY: manifests
 manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
 	$(CONTROLLER_GEN) rbac:roleName=manager-role crd webhook paths="./..." output:crd:artifacts:config=config/crd/bases
+	cp config/crd/bases/llmd.ai_variantautoscalings.yaml charts/workload-variant-autoscaler/crds/llmd.ai_variantautoscalings.yaml
 
 .PHONY: generate
 generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
@@ -81,8 +90,8 @@ vet: ## Run go vet against code.
 	go vet ./...
 
 .PHONY: test
-test: manifests generate fmt vet setup-envtest ## Run tests.
-	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
+test: manifests generate fmt vet setup-envtest helm ## Run tests.
+	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" PATH=$(LOCALBIN):$(PATH) go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
 
 # Creates a multi-node Kind cluster
 # Adds emulated GPU labels and capacities per node
@@ -97,18 +106,20 @@ destroy-kind-cluster:
 	export KIND=$(KIND) KUBECTL=$(KUBECTL) && \
         deploy/kind-emulator/teardown.sh
 
-# Deploys the WVA controller on a pre-existing Kind cluster or creates one if specified
+# Deploys the WVA controller on a pre-existing Kind cluster or creates one if specified.
+# Set SCALER_BACKEND=keda if you want to install KEDA instead of Prometheus Adapter.
 .PHONY: deploy-wva-emulated-on-kind
-deploy-wva-emulated-on-kind:
+deploy-wva-emulated-on-kind: ## Deploy WVA + llm-d on Kind (Prometheus Adapter as scaler backend)
 	@echo ">>> Deploying workload-variant-autoscaler (cluster args: $(KIND_ARGS), image: $(IMG))"
-	KIND=$(KIND) KUBECTL=$(KUBECTL) IMG=$(IMG) DEPLOY_LLM_D=$(DEPLOY_LLM_D) ENVIRONMENT=kind-emulator CREATE_CLUSTER=$(CREATE_CLUSTER) CLUSTER_GPU_TYPE=$(CLUSTER_GPU_TYPE) CLUSTER_NODES=$(CLUSTER_NODES) CLUSTER_GPUS=$(CLUSTER_GPUS) MULTI_MODEL_TESTING=$(MULTI_MODEL_TESTING) NAMESPACE_SCOPED=false \
+	KIND=$(KIND) KUBECTL=$(KUBECTL) IMG=$(IMG) DEPLOY_LLM_D=$(DEPLOY_LLM_D) ENVIRONMENT=kind-emulator CREATE_CLUSTER=$(CREATE_CLUSTER) CLUSTER_GPU_TYPE=$(CLUSTER_GPU_TYPE) CLUSTER_NODES=$(CLUSTER_NODES) CLUSTER_GPUS=$(CLUSTER_GPUS) MULTI_MODEL_TESTING=$(MULTI_MODEL_TESTING) NAMESPACE_SCOPED=false SCALER_BACKEND=$(SCALER_BACKEND) \
 		deploy/install.sh
 
 ## Undeploy WVA from the emulated environment on Kind.
+## Undeploy WVA from Kind (set SCALER_BACKEND=keda if you deployed with KEDA)
 .PHONY: undeploy-wva-emulated-on-kind
 undeploy-wva-emulated-on-kind:
 	@echo ">>> Undeploying workload-variant-autoscaler from Kind"
-	KIND=$(KIND) KUBECTL=$(KUBECTL) ENVIRONMENT=kind-emulator DEPLOY_LLM_D=$(DEPLOY_LLM_D) DELETE_NAMESPACES=$(DELETE_NAMESPACES) DELETE_CLUSTER=$(DELETE_CLUSTER) \
+	KIND=$(KIND) KUBECTL=$(KUBECTL) ENVIRONMENT=kind-emulator DEPLOY_LLM_D=$(DEPLOY_LLM_D) DELETE_NAMESPACES=$(DELETE_NAMESPACES) DELETE_CLUSTER=$(DELETE_CLUSTER) SCALER_BACKEND=$(SCALER_BACKEND) \
 		deploy/install.sh --undeploy
 
 ## Deploy WVA to OpenShift cluster with specified image.
@@ -147,33 +158,118 @@ undeploy-wva-on-k8s:
 # - IMAGE_BUILD_SKIP=true: Skip building the WVA docker image during test setup.
 # - INFRA_SETUP_SKIP=true: Skip setting up the llm-d and the WVA controller manager during test setup. Reload the docker image if necessary.
 # - INFRA_TEARDOWN_SKIP=true: Skip tearing down the Kind cluster during test teardown.
-.PHONY: test-e2e
-test-e2e: manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
-	@command -v $(KIND) >/dev/null 2>&1 || { \
-		echo "Kind is not installed. Please install Kind manually."; \
-		exit 1; \
-	}
+
+# Consolidated e2e test targets (environment-agnostic)
+# These targets use the test/e2e/ suite that works on any Kubernetes cluster
+# Supports FOCUS and SKIP variables for ginkgo test filtering.
+
+# Deploys only the infrastructure (WVA controller + llm-d) without VA/HPA resources.
+# If IMG is set, builds the image locally first (unless SKIP_BUILD=true).
+.PHONY: deploy-e2e-infra
+deploy-e2e-infra: ## Deploy e2e test infrastructure (infra-only: WVA + llm-d, no VA/HPA). Uses Prometheus Adapter unless SCALER_BACKEND=keda.
+	@echo "Deploying e2e test infrastructure (infra-only mode)..."
+	@if [ -n "$(IMG)" ]; then \
+		echo "IMG is set to '$(IMG)'"; \
+		if [ "$(SKIP_BUILD)" != "true" ]; then \
+			echo "Building local image (SKIP_BUILD not set)..."; \
+			$(MAKE) docker-build IMG=$(IMG); \
+		else \
+			echo "Skipping image build (SKIP_BUILD=true) - assuming image already exists"; \
+		fi; \
+		echo "Extracting image repo and tag from IMG..."; \
+		if echo "$(IMG)" | grep -q ":"; then \
+			IMAGE_REPO=$$(echo $(IMG) | cut -d: -f1); \
+			IMAGE_TAG=$$(echo $(IMG) | cut -d: -f2); \
+		else \
+			IMAGE_REPO="$(IMG)"; \
+			IMAGE_TAG="latest"; \
+		fi; \
+		echo "Using local image: $$IMAGE_REPO:$$IMAGE_TAG"; \
+		ENVIRONMENT=$(ENVIRONMENT) \
+		INFRA_ONLY=true \
+		USE_SIMULATOR=$(USE_SIMULATOR) \
+		SCALE_TO_ZERO_ENABLED=$(SCALE_TO_ZERO_ENABLED) \
+		SCALER_BACKEND=$(SCALER_BACKEND) \
+		INSTALL_GATEWAY_CTRLPLANE=true \
+		NAMESPACE_SCOPED=false \
+		WVA_IMAGE_REPO=$$IMAGE_REPO \
+		WVA_IMAGE_TAG=$$IMAGE_TAG \
+		WVA_IMAGE_PULL_POLICY=IfNotPresent \
+		./deploy/install.sh; \
+	else \
+		echo "IMG not set - using default image from registry (latest)"; \
+		ENVIRONMENT=$(ENVIRONMENT) \
+		INFRA_ONLY=true \
+		USE_SIMULATOR=$(USE_SIMULATOR) \
+		SCALE_TO_ZERO_ENABLED=$(SCALE_TO_ZERO_ENABLED) \
+		SCALER_BACKEND=$(SCALER_BACKEND) \
+		INSTALL_GATEWAY_CTRLPLANE=true \
+		NAMESPACE_SCOPED=false \
+		./deploy/install.sh; \
+	fi
+
+# Deploy e2e infrastructure with KEDA as scaler backend (installs KEDA, skips Prometheus Adapter).
+# Runs a subset of smoke tests from the e2e suite.
+.PHONY: test-e2e-smoke
+test-e2e-smoke: manifests generate fmt vet ## Run smoke e2e tests
+	@echo "Running smoke e2e tests..."
 	$(eval FOCUS_ARGS := $(if $(FOCUS),-ginkgo.focus="$(FOCUS)",))
 	$(eval SKIP_ARGS := $(if $(SKIP),-ginkgo.skip="$(SKIP)",))
-	export COLLECTOR_V2=1 KUBECONFIG=$(KUBECONFIG) K8S_EXPECTED_VERSION=$(K8S_VERSION) && go test ./test/e2e-saturation-based/ -timeout 50m -v -ginkgo.v $(FOCUS_ARGS) $(SKIP_ARGS)
-
-# E2E tests on OpenShift cluster
-# Supports KUBECONFIG or in-cluster authentication (for self-hosted runners).
-.PHONY: test-e2e-openshift
-test-e2e-openshift: ## Run the e2e tests on OpenShift. Supports KUBECONFIG or in-cluster auth.
-	@echo "Running e2e tests on OpenShift cluster..."
-	$(eval FOCUS_ARGS := $(if $(FOCUS),-ginkgo.focus="$(FOCUS)",))
-	$(eval SKIP_ARGS := $(if $(SKIP),-ginkgo.skip="$(SKIP)",))
-
-	CONTROLLER_NAMESPACE=$(CONTROLLER_NAMESPACE) \
-	MONITORING_NAMESPACE=$(MONITORING_NAMESPACE) \
-	LLMD_NAMESPACE=$(LLMD_NAMESPACE) \
-	GATEWAY_NAME=$(GATEWAY_NAME) \
+	KUBECONFIG=$(KUBECONFIG) \
+	ENVIRONMENT=$(ENVIRONMENT) \
+	WVA_NAMESPACE=$(CONTROLLER_NAMESPACE) \
+	LLMD_NAMESPACE=$(E2E_EMULATED_LLMD_NAMESPACE) \
+	MONITORING_NAMESPACE=$(E2E_MONITORING_NAMESPACE) \
+	USE_SIMULATOR=$(USE_SIMULATOR) \
+	SCALE_TO_ZERO_ENABLED=$(SCALE_TO_ZERO_ENABLED) \
+	SCALER_BACKEND=$(SCALER_BACKEND) \
 	MODEL_ID=$(MODEL_ID) \
-	DEPLOYMENT=$(DEPLOYMENT) \
 	REQUEST_RATE=$(REQUEST_RATE) \
 	NUM_PROMPTS=$(NUM_PROMPTS) \
-	go test ./test/e2e-openshift/ -timeout 50m -v -ginkgo.v $(FOCUS_ARGS) $(SKIP_ARGS)
+	go test ./test/e2e/ -timeout 20m -v -ginkgo.v \
+		-ginkgo.label-filter="smoke" $(FOCUS_ARGS) $(SKIP_ARGS); \
+	TEST_EXIT_CODE=$$?; \
+	echo ""; \
+	echo "=========================================="; \
+	echo "Test execution completed. Exit code: $$TEST_EXIT_CODE"; \
+	echo "=========================================="; \
+	exit $$TEST_EXIT_CODE
+
+# Runs the complete e2e test suite (excluding flaky tests).
+.PHONY: test-e2e-full
+test-e2e-full: manifests generate fmt vet ## Run full e2e test suite
+	@echo "Running full e2e test suite..."
+	$(eval FOCUS_ARGS := $(if $(FOCUS),-ginkgo.focus="$(FOCUS)",))
+	$(eval SKIP_ARGS := $(if $(SKIP),-ginkgo.skip="$(SKIP)",))
+	KUBECONFIG=$(KUBECONFIG) \
+	ENVIRONMENT=$(ENVIRONMENT) \
+	WVA_NAMESPACE=$(CONTROLLER_NAMESPACE) \
+	USE_SIMULATOR=$(USE_SIMULATOR) \
+	SCALE_TO_ZERO_ENABLED=$(SCALE_TO_ZERO_ENABLED) \
+	SCALER_BACKEND=$(SCALER_BACKEND) \
+	MODEL_ID=$(MODEL_ID) \
+	REQUEST_RATE=$(REQUEST_RATE) \
+	NUM_PROMPTS=$(NUM_PROMPTS) \
+	go test ./test/e2e/ -timeout 35m -v -ginkgo.v \
+		-ginkgo.label-filter="full && !flaky" $(FOCUS_ARGS) $(SKIP_ARGS); \
+	TEST_EXIT_CODE=$$?; \
+	echo ""; \
+	echo "=========================================="; \
+	echo "Test execution completed. Exit code: $$TEST_EXIT_CODE"; \
+	echo "=========================================="; \
+	exit $$TEST_EXIT_CODE
+
+# Convenience targets for local e2e testing
+
+# Convenience target that deploys infra + runs smoke tests.
+# Set DELETE_CLUSTER=true to delete Kind cluster after tests (default: keep cluster for debugging).
+.PHONY: test-e2e-smoke-with-setup
+test-e2e-smoke-with-setup: deploy-e2e-infra test-e2e-smoke
+
+# Convenience target that deploys infra + runs full test suite.
+# Set DELETE_CLUSTER=true to delete Kind cluster after tests (default: keep cluster for debugging).
+.PHONY: test-e2e-full-with-setup
+test-e2e-full-with-setup: deploy-e2e-infra test-e2e-full 
 
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter
@@ -270,6 +366,7 @@ KUSTOMIZE ?= $(LOCALBIN)/kustomize
 CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
 ENVTEST ?= $(LOCALBIN)/setup-envtest
 GOLANGCI_LINT = $(LOCALBIN)/golangci-lint
+HELM ?= $(LOCALBIN)/helm
 
 ## Tool Versions
 KUSTOMIZE_VERSION ?= v5.6.0
@@ -279,6 +376,7 @@ ENVTEST_VERSION ?= $(shell go list -m -f "{{ .Version }}" sigs.k8s.io/controller
 #ENVTEST_K8S_VERSION is the version of Kubernetes to use for setting up ENVTEST binaries (i.e. 1.31)
 ENVTEST_K8S_VERSION ?= $(shell go list -m -f "{{ .Version }}" k8s.io/api | awk -F'[v.]' '{printf "1.%d", $$3}')
 GOLANGCI_LINT_VERSION ?= v2.8.0
+HELM_VERSION ?= v3.17.1
 
 .PHONY: kustomize
 kustomize: $(KUSTOMIZE) ## Download kustomize locally if necessary.
@@ -343,6 +441,17 @@ $(GOLANGCI_LINT): $(LOCALBIN)
 	fi; \
 	} ;\
 	ln -sf golangci-lint-$(GOLANGCI_LINT_VERSION) $(GOLANGCI_LINT)
+
+.PHONY: helm
+helm: $(HELM) ## Download helm locally if necessary.
+$(HELM): $(LOCALBIN)
+	@[ -f "$(LOCALBIN)/helm-$(HELM_VERSION)" ] || { \
+	set -e; \
+	echo "Downloading helm $(HELM_VERSION)"; \
+	curl -sSfL https://get.helm.sh/helm-$(HELM_VERSION)-$(shell go env GOOS)-$(shell go env GOARCH).tar.gz | tar xz --no-same-owner -C $(LOCALBIN) --strip-components=1 $(shell go env GOOS)-$(shell go env GOARCH)/helm; \
+	mv $(LOCALBIN)/helm $(LOCALBIN)/helm-$(HELM_VERSION); \
+	} ;\
+	ln -sf helm-$(HELM_VERSION) $(HELM)
 
 # go-install-tool will 'go install' any package with custom target and name of binary, if it doesn't exist
 # $1 - target path with name of binary

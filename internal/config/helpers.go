@@ -1,14 +1,24 @@
 package config
 
 import (
+	"os"
 	"strconv"
 	"time"
 
 	ctrl "sigs.k8s.io/controller-runtime"
 )
 
-// GetConfigValue retrieves a value from a ConfigMap with a default fallback
-func GetConfigValue(data map[string]string, key, def string) string {
+const (
+	// DefaultConfigMapName is the default name of the ConfigMap containing autoscaler configuration
+	DefaultConfigMapName = "wva-variantautoscaling-config"
+	// DefaultSaturationConfigMapName is the default name of the ConfigMap for saturation scaling
+	DefaultSaturationConfigMapName = "wva-saturation-scaling-config"
+	// DefaultNamespace is the default namespace for the controller
+	DefaultNamespace = "workload-variant-autoscaler-system"
+)
+
+// ConfigValue retrieves a value from a ConfigMap with a default fallback
+func ConfigValue(data map[string]string, key, def string) string {
 	if v, ok := data[key]; ok {
 		return v
 	}
@@ -18,7 +28,7 @@ func GetConfigValue(data map[string]string, key, def string) string {
 // ParseDurationFromConfig parses a duration string from ConfigMap with default fallback
 // Returns the parsed duration or the default value if parsing fails or key is missing
 func ParseDurationFromConfig(data map[string]string, key string, defaultValue time.Duration) time.Duration {
-	if valStr := GetConfigValue(data, key, ""); valStr != "" {
+	if valStr := ConfigValue(data, key, ""); valStr != "" {
 		if val, err := time.ParseDuration(valStr); err == nil {
 			return val
 		}
@@ -30,7 +40,7 @@ func ParseDurationFromConfig(data map[string]string, key string, defaultValue ti
 // ParseIntFromConfig parses an integer from ConfigMap with default fallback and minimum value validation
 // Returns the parsed integer or the default value if parsing fails, is less than minValue, or key is missing
 func ParseIntFromConfig(data map[string]string, key string, defaultValue int, minValue int) int {
-	if valStr := GetConfigValue(data, key, ""); valStr != "" {
+	if valStr := ConfigValue(data, key, ""); valStr != "" {
 		if val, err := strconv.Atoi(valStr); err == nil && val >= minValue {
 			return val
 		}
@@ -43,9 +53,45 @@ func ParseIntFromConfig(data map[string]string, key string, defaultValue int, mi
 // Accepts "true", "1", or "yes" as true values (case-sensitive)
 // Returns the parsed boolean or the default value if key is missing or value is not recognized
 func ParseBoolFromConfig(data map[string]string, key string, defaultValue bool) bool {
-	if valStr := GetConfigValue(data, key, ""); valStr != "" {
+	if valStr := ConfigValue(data, key, ""); valStr != "" {
 		// Accept "true", "1", "yes" as true
 		return valStr == "true" || valStr == "1" || valStr == "yes"
 	}
 	return defaultValue
+}
+
+// SystemNamespace returns the controller's system namespace where WVA is deployed.
+// This is the namespace containing global ConfigMaps and the controller deployment.
+//
+// Returns: POD_NAMESPACE environment variable if set, otherwise "workload-variant-autoscaler-system"
+func SystemNamespace() string {
+	if ns := os.Getenv("POD_NAMESPACE"); ns != "" {
+		return ns
+	}
+	return DefaultNamespace
+}
+
+// ConfigMapName returns the main ConfigMap name from environment variable or default.
+// The CONFIG_MAP_NAME environment variable is set by the Helm chart during deployment
+// (see charts/workload-variant-autoscaler/templates/manager/wva-deployment-controller-manager.yaml).
+// Each WVA deployment gets its own uniquely-named ConfigMap based on the Helm release name,
+// allowing multiple WVA instances to coexist in the same cluster without conflicts.
+// The Helm template sets this to: {{ include "workload-variant-autoscaler.fullname" . }}-variantautoscaling-config
+//
+// Default value: "wva-variantautoscaling-config"
+// For kustomize deployments using a different ConfigMap name, set the CONFIG_MAP_NAME
+// environment variable in the deployment manifest.
+func ConfigMapName() string {
+	if name := os.Getenv("CONFIG_MAP_NAME"); name != "" {
+		return name
+	}
+	return DefaultConfigMapName
+}
+
+// SaturationConfigMapName returns the saturation scaling ConfigMap name from environment variable or default.
+func SaturationConfigMapName() string {
+	if name := os.Getenv("SATURATION_CONFIG_MAP_NAME"); name != "" {
+		return name
+	}
+	return DefaultSaturationConfigMapName
 }

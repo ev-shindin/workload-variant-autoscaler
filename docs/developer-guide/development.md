@@ -17,8 +17,8 @@ Guide for developers contributing to Workload-Variant-Autoscaler.
 1. **Clone the repository:**
 
    ```bash
-   git clone https://github.com/llm-d-incubation/workload-variant-autoscaler.git
-   cd workload-variant-autoscaler
+   git clone https://github.com/llm-d/llm-d-workload-variant-autoscaler.git 
+   cd llm-d-workload-variant-autoscaler
    ```
 
 2. **Install dependencies:**
@@ -49,24 +49,35 @@ workload-variant-autoscaler/
 ├── deploy/                # Deployment scripts
 │   ├── kubernetes/       # K8s deployment
 │   ├── openshift/        # OpenShift deployment
-│   └── kind/             # Local development
+│   └── kind-emulator/    # Local Kind cluster with GPU emulation
 ├── docs/                  # Documentation
 ├── internal/              # Private application code
-│   ├── controller/       # Controller implementation
-│   ├── collector/        # Metrics collection
-│   ├── optimizer/        # Optimization logic
 │   ├── actuator/         # Metric emission & scaling
-│   └── modelanalyzer/    # Model analysis
+│   ├── collector/        # Metrics collection
+│   ├── config/           # Internal configuration
+│   ├── constants/        # Application constants
+│   ├── controller/       # Controller implementation
+│   ├── datastore/        # Data storage abstractions
+│   ├── discovery/        # Resource discovery
+│   ├── engines/          # Scaling engines (saturation, scale-from-zero)
+│   ├── indexers/         # Kubernetes indexers
+│   ├── interfaces/       # Interface definitions
+│   ├── logging/          # Logging utilities
+│   ├── metrics/          # Metrics definitions
+│   ├── modelanalyzer/    # Model analysis
+│   ├── saturation/       # Saturation detection logic
+│   └── utils/            # Utility functions
 ├── pkg/                   # Public libraries
 │   ├── analyzer/         # Queue theory models
 │   ├── solver/           # Optimization algorithms
 │   ├── core/             # Core domain models
-│   └── config/           # Configuration structures
+│   ├── config/           # Configuration structures
+│   └── manager/          # Manager utilities
 ├── test/                  # Tests
-│   ├── e2e/              # End-to-end tests
-│   └── utils/            # Test utilities
-└── tools/                 # Development tools
-    └── vllm-emulator/    # Testing emulator
+│   ├── e2e/                  # E2E tests (consolidated suite: Kind, OpenShift)
+│   └── utils/                 # Test utilities
+└── charts/                # Helm charts
+    └── workload-variant-autoscaler/
 ```
 
 ## Development Workflow
@@ -90,7 +101,7 @@ make create-kind-cluster
 make deploy IMG=<your-image>
 
 # Or deploy with llm-d infrastructure
-make deploy-llm-d-wva-emulated-on-kind
+make deploy-wva-emulated-on-kind
 ```
 
 ### Making Changes
@@ -159,7 +170,7 @@ PLATFORMS=linux/arm64,linux/amd64 make docker-buildx IMG=<your-registry>/wva-con
 make test
 
 # Run specific package tests
-go test ./internal/optimizer/...
+go test ./internal/controller/...
 
 # With coverage
 go test -cover ./...
@@ -167,66 +178,34 @@ go test -cover ./...
 
 ### E2E Tests
 
-WVA has multiple E2E test suites for different environments and scenarios:
+WVA has a single consolidated E2E suite (`test/e2e/`) that runs on Kind (emulated) or OpenShift/kubernetes. Deploy infrastructure in infra-only mode first, then run tests.
 
-#### Saturation-Based E2E Tests (Kind)
-
-**Location**: `test/e2e-saturation-based/`
-
-Tests saturation-based scaling with emulated GPU infrastructure on Kind clusters. No physical GPUs required!
+**Location**: `test/e2e/`
 
 ```bash
-# Run all saturation-based E2E tests (default)
-make test-e2e
+# Smoke tests (Kind, ~5-10 min)
+make test-e2e-smoke
 
-# Run specific test suite
-make test-e2e FOCUS="Single VariantAutoscaling"
-make test-e2e FOCUS="Multiple VariantAutoscalings"
+# Full suite (Kind)
+make test-e2e-full
 
-# Skip specific tests
-make test-e2e SKIP="Multiple VariantAutoscalings"
+# OpenShift: set KUBECONFIG and ENVIRONMENT=openshift first
+export ENVIRONMENT=openshift
+make test-e2e-smoke
+# or make test-e2e-full
+
+# Run specific tests
+FOCUS="Basic VA lifecycle" make test-e2e-smoke
 ```
 
-**Features tested:**
-- KV cache utilization saturation detection
-- Queue depth saturation detection
-- Multi-variant scaling with cost optimization
-- HPA integration with external metrics
-
-See [Saturation-Based E2E Tests README](../../test/e2e-saturation-based/README.md) for comprehensive documentation.
-
-#### OpenShift E2E Tests
-
-**Location**: `test/e2e-openshift/`
-
-Tests with real vLLM deployments on OpenShift clusters with GPU hardware.
-
-```bash
-# Run E2E tests on OpenShift cluster
-make test-e2e-openshift
-
-# With custom image
-make test-e2e-openshift IMG=<your-registry>/wva-controller:tag
-
-# Run specific OpenShift tests
-make test-e2e-openshift FOCUS="ShareGPT Scale-Up Test"
-```
-
-**Prerequisites for OpenShift E2E:**
-- Access to an OpenShift cluster (OCP 4.12+)
-- `oc` CLI tool configured and authenticated
-- Cluster admin permissions
-- Prometheus operator installed
-- GPU nodes available
-
-See [OpenShift E2E Tests README](../../test/e2e-openshift/README.md) for detailed setup and usage.
+See [Testing Guide](testing.md) and [E2E Test Suite README](../../test/e2e/README.md) for infra-only setup and configuration. For OpenShift, set `ENVIRONMENT=openshift` and use the same targets.
 
 ### Manual Testing
 
 1. **Deploy to Kind cluster:**
 
    ```bash
-   make deploy-llm-d-wva-emulated-on-kind IMG=<your-image>
+   make deploy-wva-emulated-on-kind IMG=<your-image>
    ```
 
 2. **Create test resources:**
@@ -359,7 +338,13 @@ See [Agentic Workflows Guide](agentic-workflows.md) for detailed information on 
 
 ## Release Process
 
-See [Releasing Guide](releasing.md) (coming soon) for the release process.
+See the [Release Process](release-process.md) guide for how to cut a release. It covers:
+
+- Pre-release checklist (changelog, optional version bumps, upstream pins)
+- Creating the tag and GitHub Release (which triggers image build and Helm chart publish)
+- What runs automatically: Docker image push, Helm chart version bump and publish to GHCR, and commit-back of chart files
+- Post-release (required): update the llm-d [workload-autoscaling](https://github.com/llm-d/llm-d/tree/main/guides/workload-autoscaling) guide to the new WVA version
+- Enabling other team members to perform releases (permissions, secrets, documentation)
 
 ## Getting Help
 
@@ -394,4 +379,4 @@ make create-kind-cluster
 ## Next Steps
 
 - Review [Code Style Guidelines](../../CONTRIBUTING.md#coding-guidelines)
-- Check out [Good First Issues](https://github.com/llm-d-incubation/workload-variant-autoscaler/labels/good%20first%20issue)
+- Check out [Good First Issues](https://github.com/llm-d/llm-d-workload-variant-autoscaler/labels/good%20first%20issue)

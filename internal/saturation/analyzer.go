@@ -7,11 +7,14 @@ import (
 
 	ctrl "sigs.k8s.io/controller-runtime"
 
-	"github.com/llm-d-incubation/workload-variant-autoscaler/internal/interfaces"
-	"github.com/llm-d-incubation/workload-variant-autoscaler/internal/logging"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/interfaces"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/logging"
 )
 
-// Analyzer implements the SaturationAnalyzer interface
+// Analyzer implements the V1 percentage-based saturation analyzer.
+// It uses KV cache utilization and queue length thresholds to determine saturation.
+// The V2 token-based analyzer (saturation_v2 package) replaces this when
+// analyzerName is set to "saturation" in config.
 type Analyzer struct{}
 
 // NewAnalyzer creates a new saturation analyzer instance

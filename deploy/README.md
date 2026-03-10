@@ -117,7 +117,7 @@ The script accepts both command-line flags and environment variables:
 bash install.sh [OPTIONS]
 
 Options:
-  -i, --wva-image IMAGE    WVA container image (default: ghcr.io/llm-d-incubation/workload-variant-autoscaler:latest)
+  -i, --wva-image IMAGE    WVA container image (default: ghcr.io/llm-d/llm-d-workload-variant-autoscaler:latest)
   -m, --model MODEL        Model ID (default: unsloth/Meta-Llama-3.1-8B)
   -a, --accelerator TYPE   GPU type: A100, H100, L40S (auto-detected by default)
   -u, --undeploy          Undeploy all components
@@ -148,7 +148,6 @@ export HPA_STABILIZATION_SECONDS=240        # HPA stabilization window (default:
 # Gateway Configuration
 export GATEWAY_PROVIDER="istio"             # Gateway provider: istio, kgateway
 export INSTALL_GATEWAY_CTRLPLANE="true"     # Install gateway control plane
-export BENCHMARK_MODE="true"                # Use benchmark configuration (for Istio only)
 
 # SLO Targets
 export SLO_TPOT=10                         # Time per output token (ms) SLO
@@ -239,6 +238,34 @@ export VLLM_MAX_NUM_SEQS=64         # Match desired max batch size
 export MODEL_ID="unsloth/Meta-Llama-3.1-8B"
 make deploy-wva-on-k8s
 ```
+
+##### Example 7: Infra-only mode for e2e testing
+
+Deploy only the llm-d infrastructure and WVA controller without creating VariantAutoscaling or HPA resources. This is useful for e2e testing where tests dynamically create their own VA/HPA resources.
+
+```bash
+# Using command-line flag
+export HF_TOKEN="hf_xxxxx"
+./deploy/install.sh --infra-only
+
+# Using environment variable
+export HF_TOKEN="hf_xxxxx"
+export INFRA_ONLY=true
+make deploy-wva-emulated-on-kind
+
+# Verify: Only WVA controller + llm-d infrastructure should exist
+kubectl get variantautoscaling --all-namespaces  # Should be empty
+kubectl get hpa --all-namespaces | grep -v kube-system  # Should be empty (except system HPAs)
+```
+
+**What gets deployed in infra-only mode:**
+- ✅ Prometheus stack (metrics collection)
+- ✅ WVA controller
+- ✅ llm-d infrastructure (Gateway, CRDs, RBAC, EPP)
+- ✅ Prometheus Adapter (external metrics API)
+- ❌ VariantAutoscaling CRs (tests create these)
+- ❌ HPA resources (tests create these)
+- ❌ Model services (tests create these)
 ```
 
 ### Method 2: Helm Chart
@@ -287,7 +314,7 @@ wva:
 
   # Image configuration
   image:
-    repository: ghcr.io/llm-d-incubation/workload-variant-autoscaler
+    repository: ghcr.io/llm-d/llm-d-workload-variant-autoscaler
     tag: latest
   imagePullPolicy: Always
 
@@ -590,7 +617,7 @@ Each guide includes platform-specific examples, troubleshooting, and quick start
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `WVA_IMAGE_REPO` | WVA image repository | `ghcr.io/llm-d-incubation/workload-variant-autoscaler` |
+| `WVA_IMAGE_REPO` | WVA image repository | `ghcr.io/llm-d/llm-d-workload-variant-autoscaler` |
 | `WVA_IMAGE_TAG` | WVA image tag | `latest` |
 | `WVA_IMAGE_PULL_POLICY` | Image pull policy | `Always` |
 
@@ -608,7 +635,6 @@ Each guide includes platform-specific examples, troubleshooting, and quick start
 |----------|-------------|---------|
 | `GATEWAY_PROVIDER` | Gateway implementation | `istio` |
 | `INSTALL_GATEWAY_CTRLPLANE` | Install gateway control plane | `false` (prompts user) |
-| `BENCHMARK_MODE` | Use benchmark Istio config | `true` |
 
 #### Deployment Flags
 
@@ -620,6 +646,7 @@ Each guide includes platform-specific examples, troubleshooting, and quick start
 | `DEPLOY_PROMETHEUS_ADAPTER` | Deploy Prometheus Adapter | `true` |
 | `DEPLOY_VA` | Deploy VariantAutoscaling CR | `true` |
 | `DEPLOY_HPA` | Deploy HPA | `true` |
+| `INFRA_ONLY` | Deploy only infrastructure (skip VA/HPA) | `false` |
 | `SKIP_CHECKS` | Skip prerequisite checks | `false` |
 
 #### HPA Configuration
@@ -999,4 +1026,4 @@ kubectl get configmap model-accelerator-data -n workload-variant-autoscaler-syst
 - **OpenShift Guide**: [openshift/README.md](openshift/README.md)
 - **Helm Chart**: [charts/workload-variant-autoscaler](../charts/workload-variant-autoscaler/)
 - **API Reference**: [api/v1alpha1](../api/v1alpha1/)
-- **Architecture**: [docs/architecture.md](../docs/architecture.md)
+- **Architecture**: [docs/design/modeling-optimization.md](../docs/design/modeling-optimization.md)

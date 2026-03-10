@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/llm-d-incubation/workload-variant-autoscaler/internal/constants"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/constants"
 	promv1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/prometheus/common/model"
 	appsv1 "k8s.io/api/apps/v1"
@@ -61,30 +61,6 @@ func CreateITLQuery(modelID, namespace string) string {
 		constants.VLLMTimePerOutputTokenSecondsCount,
 		constants.LabelModelName, modelID,
 		constants.LabelNamespace, namespace)
-}
-
-// createAcceleratorUnitCostConfigMap creates the accelerator unitcost ConfigMap
-func CreateAcceleratorUnitCostConfigMap(controllerNamespace string) *corev1.ConfigMap {
-	return &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "accelerator-unit-costs",
-			Namespace: controllerNamespace,
-		},
-		Data: map[string]string{
-			"A100": `{
-"device": "NVIDIA-A100-PCIE-80GB",
-"cost": "40.00"
-}`,
-			"MI300X": `{
-"device": "AMD-MI300X-192GB",
-"cost": "65.00"
-}`,
-			"G2": `{
-"device": "Intel-Gaudi-2-96GB",
-"cost": "23.00"
-}`,
-		},
-	}
 }
 
 // createServiceClassConfigMap creates the serviceclass ConfigMap

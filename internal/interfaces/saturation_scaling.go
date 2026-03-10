@@ -28,10 +28,50 @@ type SaturationScalingConfig struct {
 	// to constrain scaling decisions based on available cluster resources.
 	// Default is false (limiter disabled).
 	EnableLimiter bool `yaml:"enableLimiter,omitempty"`
+
+	// AnalyzerName selects which analyzer to use.
+	// "saturation" uses the V2 token-based analyzer.
+	// Empty string (default) uses the V1 percentage-based analyzer.
+	AnalyzerName string `yaml:"analyzerName,omitempty"`
+
+	// ScaleUpThreshold is the utilization threshold above which scale-up is triggered.
+	// Used by V2 analyzer: requiredCapacity = totalDemand / ScaleUpThreshold - anticipatedSupply
+	// Default: 0.85 (85% utilization triggers scale-up)
+	ScaleUpThreshold float64 `yaml:"scaleUpThreshold,omitempty"`
+
+	// ScaleDownBoundary is the utilization boundary below which scale-down is safe.
+	// Used by V2 analyzer: spareCapacity = currentSupply - totalDemand / ScaleDownBoundary
+	// Default: 0.70 (70% utilization allows scale-down)
+	ScaleDownBoundary float64 `yaml:"scaleDownBoundary,omitempty"`
+}
+
+// GetAnalyzerName implements the AnalyzerConfig interface.
+func (c *SaturationScalingConfig) GetAnalyzerName() string {
+	return c.AnalyzerName
+}
+
+// V2 analyzer default thresholds, applied when fields are omitted from YAML config.
+const (
+	DefaultScaleUpThreshold  = 0.85
+	DefaultScaleDownBoundary = 0.70
+)
+
+// ApplyDefaults fills in zero-valued V2 fields with their defaults.
+// Must be called before Validate() to handle omitempty zero-values correctly.
+func (c *SaturationScalingConfig) ApplyDefaults() {
+	if c.AnalyzerName == "saturation" {
+		if c.ScaleUpThreshold == 0 {
+			c.ScaleUpThreshold = DefaultScaleUpThreshold
+		}
+		if c.ScaleDownBoundary == 0 {
+			c.ScaleDownBoundary = DefaultScaleDownBoundary
+		}
+	}
 }
 
 // Validate checks for invalid threshold values.
 // Returns error with descriptive message if validation fails.
+// Call ApplyDefaults() before Validate() to handle zero-valued omitempty fields.
 func (c *SaturationScalingConfig) Validate() error {
 	if c.KvCacheThreshold < 0 || c.KvCacheThreshold > 1 {
 		return fmt.Errorf("kvCacheThreshold must be between 0 and 1, got %.2f", c.KvCacheThreshold)
@@ -50,5 +90,19 @@ func (c *SaturationScalingConfig) Validate() error {
 		return fmt.Errorf("kvCacheThreshold (%.2f) should be >= kvSpareTrigger (%.2f)",
 			c.KvCacheThreshold, c.KvSpareTrigger)
 	}
+
+	// V2 analyzer threshold validation
+	if c.AnalyzerName == "saturation" {
+		if c.ScaleUpThreshold <= 0 || c.ScaleUpThreshold > 1 {
+			return fmt.Errorf("scaleUpThreshold must be in (0, 1], got %.2f", c.ScaleUpThreshold)
+		}
+		if c.ScaleDownBoundary <= 0 || c.ScaleDownBoundary > 1 {
+			return fmt.Errorf("scaleDownBoundary must be in (0, 1], got %.2f", c.ScaleDownBoundary)
+		}
+		if c.ScaleUpThreshold <= c.ScaleDownBoundary {
+			return fmt.Errorf("scaleUpThreshold (%.2f) must be > scaleDownBoundary (%.2f)", c.ScaleUpThreshold, c.ScaleDownBoundary)
+		}
+	}
+
 	return nil
 }

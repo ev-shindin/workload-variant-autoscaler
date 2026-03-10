@@ -4,7 +4,7 @@ import (
 	"sync"
 	"testing"
 
-	interfaces "github.com/llm-d-incubation/workload-variant-autoscaler/internal/interfaces"
+	interfaces "github.com/llm-d/llm-d-workload-variant-autoscaler/internal/interfaces"
 )
 
 func TestInternalDecisionCache(t *testing.T) {
@@ -49,37 +49,8 @@ func TestInternalDecisionCache(t *testing.T) {
 	wg.Wait()
 }
 
-func TestGlobalConfig(t *testing.T) {
-	config := &GlobalConfig{}
-
-	// Test Optimization Config
-	config.UpdateOptimizationConfig("60s")
-	if config.GetOptimizationInterval() != "60s" {
-		t.Errorf("Expected interval '60s', got '%s'", config.GetOptimizationInterval())
-	}
-
-	// Test Saturation Config
-	satConfig := map[string]interfaces.SaturationScalingConfig{
-		"default": {KvCacheThreshold: 0.8},
-	}
-	config.UpdateSaturationConfig(satConfig)
-	retrievedConfig := config.GetSaturationConfig()
-	if retrievedConfig["default"].KvCacheThreshold != 0.8 {
-		t.Errorf("Expected threshold 0.8, got %f", retrievedConfig["default"].KvCacheThreshold)
-	}
-
-	// Test Concurrency
-	var wg sync.WaitGroup
-	for i := 0; i < 100; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			config.UpdateOptimizationConfig("30s")
-			config.GetOptimizationInterval()
-		}()
-	}
-	wg.Wait()
-}
+// TestGlobalConfig removed - GlobalConfig has been removed in favor of unified Config
+// from internal/config package. Config functionality is now tested in internal/config/loader_test.go
 
 func TestDecisionToOptimizedAlloc(t *testing.T) {
 	d := interfaces.VariantDecision{

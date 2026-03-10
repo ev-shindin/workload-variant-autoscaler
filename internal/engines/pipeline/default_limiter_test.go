@@ -6,7 +6,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	"github.com/llm-d-incubation/workload-variant-autoscaler/internal/interfaces"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/interfaces"
 )
 
 // mockInventory implements Inventory for testing
@@ -66,6 +66,15 @@ func (m *mockInventory) TotalAvailable() int {
 	return m.TotalLimit() - m.TotalUsed()
 }
 
+func (m *mockInventory) GetResourcePools() map[string]ResourcePool {
+	pools := make(map[string]ResourcePool, len(m.limitByType))
+	for accType, limit := range m.limitByType {
+		used := m.usedByType[accType]
+		pools[accType] = ResourcePool{Limit: limit, Used: used}
+	}
+	return pools
+}
+
 // mockTypeAllocator implements ResourceAllocator for testing
 type mockTypeAllocator struct {
 	availableByType map[string]int
@@ -98,7 +107,7 @@ func (m *mockTypeAllocator) Remaining() int {
 
 // mockAlgorithm implements AllocationAlgorithm for testing
 type mockAlgorithm struct {
-	name       string
+	name         string
 	allocateFunc func(ctx context.Context, decisions []*interfaces.VariantDecision, allocator ResourceAllocator) error
 }
 

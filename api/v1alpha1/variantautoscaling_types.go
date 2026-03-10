@@ -5,6 +5,17 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// VariantAutoscalingConfigSpec holds the optional tuning fields for a VariantAutoscaling.
+// It is extracted as a standalone embeddable type so that higher-level controllers
+// (e.g. KServe) can inline it without duplicating field definitions.
+type VariantAutoscalingConfigSpec struct {
+	// VariantCost specifies the cost per replica for this variant (used in saturation analysis).
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Pattern=`^\d+(\.\d+)?$`
+	// +kubebuilder:default="10.0"
+	VariantCost string `json:"variantCost,omitempty"`
+}
+
 // VariantAutoscalingSpec defines the desired state for autoscaling a model variant.
 type VariantAutoscalingSpec struct {
 	// ScaleTargetRef references the scalable resource to manage.
@@ -17,11 +28,8 @@ type VariantAutoscalingSpec struct {
 	// +kubebuilder:validation:Required
 	ModelID string `json:"modelID"`
 
-	// VariantCost specifies the cost per replica for this variant (used in saturation analysis).
-	// +kubebuilder:validation:Optional
-	// +kubebuilder:validation:Pattern=`^\d+(\.\d+)?$`
-	// +kubebuilder:default="10.0"
-	VariantCost string `json:"variantCost,omitempty"`
+	// VariantAutoscalingConfigSpec holds optional tuning fields that integrators can embed.
+	VariantAutoscalingConfigSpec `json:",inline"`
 }
 
 // VariantAutoscalingStatus represents the current status of autoscaling for a variant,
@@ -119,6 +127,14 @@ const (
 	ReasonMetricsStale = "MetricsStale"
 	// ReasonPrometheusError indicates error querying Prometheus
 	ReasonPrometheusError = "PrometheusError"
+)
+
+// Condition messages for MetricsAvailable
+const (
+	// MessageMetricsAvailable indicates metrics are available for scaling decisions
+	MessageMetricsAvailable = "Saturation metrics data is available for scaling decisions"
+	// MessageMetricsUnavailable indicates metrics are not available
+	MessageMetricsUnavailable = "No saturation metrics available - pods may not be ready or metrics not yet scraped"
 )
 
 // Condition Reasons for OptimizationReady

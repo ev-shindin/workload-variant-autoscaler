@@ -28,7 +28,7 @@ This document covers **WVA-specific** development setup and workflows.
 
 2. **Add upstream remote:**
    ```bash
-   git remote add upstream https://github.com/llm-d-incubation/workload-variant-autoscaler.git
+   git remote add upstream https://github.com/llm-d/llm-d-workload-variant-autoscaler.git
    ```
 
 3. **Install dependencies:**
@@ -94,11 +94,9 @@ workload-variant-autoscaler/
 │   ├── config/          # Configuration structures
 │   └── manager/         # Optimization manager
 ├── test/                 # Tests
-│   ├── e2e/             # End-to-end tests (Kind)
-│   ├── e2e-openshift/   # OpenShift E2E tests
+│   ├── e2e/             # End-to-end tests
 │   └── utils/           # Test utilities
-├── tools/                # Development tools
-│   └── vllm-emulator/   # vLLM emulator for testing
+├── hack/                 # Dev scripts (e.g. hack/burst_load_generator.sh for manual load)
 └── charts/               # Helm charts
     └── workload-variant-autoscaler/
 ```
@@ -112,18 +110,21 @@ workload-variant-autoscaler/
 make test
 ```
 
-**Run E2E tests on Kind:**
+**Run E2E tests (Kind or OpenShift):**
 ```bash
-make test-e2e
+# Smoke tests (Kind)
+make test-e2e-smoke
+
+# Full suite (Kind)
+make test-e2e-full
+
+# OpenShift: set KUBECONFIG and ENVIRONMENT, then run
+export ENVIRONMENT=openshift
+make test-e2e-smoke
+# or make test-e2e-full
 
 # Run specific tests
-make test-e2e FOCUS="single VA"
-make test-e2e SKIP="multiple VA"
-```
-
-**Run E2E tests on OpenShift:**
-```bash
-make test-e2e-openshift
+FOCUS="Basic VA lifecycle" make test-e2e-smoke
 ```
 
 **Run linter:**
@@ -229,7 +230,7 @@ When modifying solvers in `pkg/solver/`:
 
 - Check [Developer Guide](docs/developer-guide/development.md)
 - Review existing code and tests
-- Search [GitHub Issues](https://github.com/llm-d-incubation/workload-variant-autoscaler/issues)
+- Search [GitHub Issues](https://github.com/llm-d/llm-d-workload-variant-autoscaler/issues)
 - Ask in GitHub Discussions
 - Attend llm-d community meetings
 
@@ -278,7 +279,7 @@ Before submitting your PR, ensure:
 
 - [ ] `make test` passes
 - [ ] `make lint` passes (fix issues with `make lint-fix`)
-- [ ] `make test-e2e` passes (if controller logic changed)
+- [ ] `make test-e2e-smoke` passes (if controller logic changed; use `make test-e2e-full` for full suite)
 - [ ] Documentation updated (if user-facing changes)
 - [ ] CRD docs regenerated (if CRD changed): `make crd-docs`
 - [ ] Commit messages follow [conventional commits](https://www.conventionalcommits.org/)

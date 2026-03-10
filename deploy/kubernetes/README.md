@@ -64,7 +64,7 @@ export HF_TOKEN="your-hf-token-here"
 # Optional: Customize deployment
 export WELL_LIT_PATH_NAME="inference-scheduler"                           # Default
 export MODEL_ID="unsloth/Meta-Llama-3.1-8B"                               # Default
-export WVA_IMAGE_REPO="ghcr.io/llm-d-incubation/workload-variant-autoscaler"         # Default
+export WVA_IMAGE_REPO="ghcr.io/llm-d/llm-d-workload-variant-autoscaler"         # Default
 export WVA_IMAGE_TAG="latest"                                             # Default
 export ACCELERATOR_TYPE="H100"                                            # Auto-detected or default
 ```
@@ -109,7 +109,6 @@ export VLLM_MAX_NUM_SEQS=64                 # vLLM max concurrent sequences (bat
 For a complete list of all configuration options, see the [Configuration Reference](../README.md#configuration-reference) in the main deployment guide.
 export ACCELERATOR_TYPE="A100"              # GPU type (auto-detected)
 export GATEWAY_PROVIDER="istio"             # Gateway: istio or kgateway
-export BENCHMARK_MODE="true"                # Use Istio benchmark config
 ```
 
 **Deployment flags** - Control which components to deploy:
@@ -183,7 +182,7 @@ make deploy-wva-on-k8s
 
 ```bash
 export HF_TOKEN="hf_xxxxx"
-export IMG="ghcr.io/yourorg/workload-variant-autoscaler:latest"
+export IMG="ghcr.io/yourorg/llm-d-workload-variant-autoscaler:latest"
 make deploy-wva-on-k8s
 ```
 
@@ -657,7 +656,7 @@ kubectl set env deployment/workload-variant-autoscaler-controller-manager \
 ### Update WVA Image
 
 ```bash
-export WVA_IMAGE="ghcr.io/yourorg/workload-variant-autoscaler:custom-tag"
+export WVA_IMAGE="ghcr.io/yourorg/llm-d-workload-variant-autoscaler:custom-tag"
 export DEPLOY_LLM_D=false  # Don't redeploy llm-d
 export DEPLOY_PROMETHEUS=false  # Don't redeploy Prometheus
 make deploy-wva-on-k8s

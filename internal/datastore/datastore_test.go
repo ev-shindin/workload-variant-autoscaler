@@ -22,8 +22,8 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
-	poolutil "github.com/llm-d-incubation/workload-variant-autoscaler/internal/utils/pool"
-	unittestutil "github.com/llm-d-incubation/workload-variant-autoscaler/test/utils"
+	poolutil "github.com/llm-d/llm-d-workload-variant-autoscaler/internal/utils/pool"
+	unittestutil "github.com/llm-d/llm-d-workload-variant-autoscaler/test/utils"
 	"github.com/stretchr/testify/assert"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -85,7 +85,7 @@ func TestDatastore(t *testing.T) {
 				WithObjects(eppSvc).
 				Build()
 
-			ds := NewDatastore()
+			ds := NewDatastore(nil)
 			ctx := context.Background()
 
 			ep, err := poolutil.InferencePoolToEndpointPool(ctx, fakeClient, tt.inferencePool)

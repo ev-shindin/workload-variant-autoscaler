@@ -32,6 +32,9 @@ import (
 
 const (
 	MetricsPortNameSubstring = "metric"
+	// Valid InferencePool API groups
+	PoolGroupV1       = v1.GroupName
+	PoolGroupV1Alpha2 = v1alpha2.GroupName
 )
 
 type EndpointPool struct {
@@ -144,20 +147,29 @@ func IsSubset(subsetLabels, supersetLabels map[string]string) bool {
 	return true
 }
 
-// DefaultPoolGKNN initializes a GKNN object with default values for the InferencePool.
-func DefaultPoolGKNN() common.GKNN {
+// GetPoolGKNN initializes a GKNN object for an inferencePool.
+func GetPoolGKNN(poolGroup string) (common.GKNN, error) {
 	var (
-		PoolGroup     = "inference.networking.x-k8s.io"
-		PoolName      = "defaultPool"
-		PoolNamespace = "default"
+		poolName      = "defaultPool"
+		poolNamespace = "default"
 	)
 
+	// Default to v1alpha2 group if empty
+	if poolGroup == "" {
+		poolGroup = PoolGroupV1Alpha2
+	}
+
+	// Validate poolGroup against valid values
+	if poolGroup != PoolGroupV1 && poolGroup != PoolGroupV1Alpha2 {
+		return common.GKNN{}, errors.New("invalid poolGroup: must be either 'inference.networking.k8s.io' or 'inference.networking.x-k8s.io'")
+	}
+
 	gknn := common.GKNN{
-		NamespacedName: types.NamespacedName{Name: PoolName, Namespace: PoolNamespace},
+		NamespacedName: types.NamespacedName{Name: poolName, Namespace: poolNamespace},
 		GroupKind: schema.GroupKind{
-			Group: PoolGroup,
+			Group: poolGroup,
 			Kind:  "InferencePool",
 		},
 	}
-	return gknn
+	return gknn, nil
 }

@@ -20,13 +20,14 @@ import (
 	"context"
 
 	appsv1 "k8s.io/api/apps/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	wvav1alpha1 "github.com/llm-d-incubation/workload-variant-autoscaler/api/v1alpha1"
-	"github.com/llm-d-incubation/workload-variant-autoscaler/internal/constants"
-	"github.com/llm-d-incubation/workload-variant-autoscaler/internal/logging"
-	"github.com/llm-d-incubation/workload-variant-autoscaler/internal/metrics"
+	wvav1alpha1 "github.com/llm-d/llm-d-workload-variant-autoscaler/api/v1alpha1"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/constants"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/logging"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/metrics"
 )
 
 // VariantFilter is a function that determines if a VA should be included.
@@ -132,7 +133,19 @@ func filterVariantsByDeployment(ctx context.Context, client client.Client, filte
 		deployName := va.Spec.ScaleTargetRef.Name
 		var deploy appsv1.Deployment
 		if err := GetDeploymentWithBackoff(ctx, client, deployName, va.Namespace, &deploy); err != nil {
-			ctrl.LoggerFrom(ctx).Error(err, "Failed to get deployment", "namespace", va.Namespace, "deploymentName", deployName, "vaName", va.Name)
+			if apierrors.IsNotFound(err) {
+				// Deployment doesn't exist yet, this is expected for VAs without corresponding deployments
+				ctrl.LoggerFrom(ctx).V(logging.DEBUG).Info("Deployment not found for VariantAutoscaling, skipping",
+					"namespace", va.Namespace,
+					"deploymentName", deployName,
+					"vaName", va.Name)
+			} else {
+				// Unexpected error (permissions, network issues, etc.)
+				ctrl.LoggerFrom(ctx).Error(err, "Failed to get deployment",
+					"namespace", va.Namespace,
+					"deploymentName", deployName,
+					"vaName", va.Name)
+			}
 			continue
 		}
 
@@ -210,4 +223,9 @@ func GetDesiredReplicas(deploy *appsv1.Deployment) int32 {
 		return 1 // Kubernetes default
 	}
 	return *deploy.Spec.Replicas
+}
+
+// GetNamespacedKey is a helper for building namespaced resource keys.
+func GetNamespacedKey(namespace, name string) string {
+	return namespace + "/" + name
 }

@@ -39,7 +39,7 @@ spec:
         name: wva_desired_replicas
         selector:
           matchLabels:
-            variant_name: {{ printf "%s-decode" .Values.llmd.modelName }}
+            variant_name: {{ include "workload-variant-autoscaler.fullname" . }}-va
             exported_namespace: {{ .Values.llmd.namespace }}
             {{- if .Values.wva.controllerInstance }}
             controller_instance: {{ .Values.wva.controllerInstance | quote }}

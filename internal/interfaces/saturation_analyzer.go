@@ -20,6 +20,44 @@ type ReplicaMetrics struct {
 	Cost            float64 // Cost per replica (from CRD spec, default 10)
 	// Metadata contains freshness information (optional)
 	Metadata *ReplicaMetricsMetadata `json:"metadata,omitempty"`
+
+	// --- New fields for Saturation Analyzer V2 ---
+
+	// NumGpuBlocks is the total number of KV cache blocks allocated on GPU.
+	// Sourced from vllm:cache_config_info label "num_gpu_blocks".
+	// Zero value means cache_config_info metric is not available.
+	NumGpuBlocks int64
+
+	// BlockSize is the number of tokens per KV cache block.
+	// Sourced from vllm:cache_config_info label "block_size".
+	// Zero value means cache_config_info metric is not available.
+	BlockSize int64
+
+	// TotalKvCapacityTokens is NumGpuBlocks × BlockSize (total token slots).
+	// Computed by the collector after parsing cache_config_info labels.
+	// Zero value means capacity data is unavailable.
+	TotalKvCapacityTokens int64
+
+	// TokensInUse is the derived current token demand on this replica.
+	// Computed as KvCacheUsage × TotalKvCapacityTokens.
+	// Zero when TotalKvCapacityTokens is unavailable.
+	TokensInUse int64
+
+	// AvgOutputTokens is the average generation tokens per request on this replica.
+	// Derived from rate(generation_tokens_sum) / rate(generation_tokens_count).
+	// Zero when metrics are unavailable.
+	AvgOutputTokens float64
+
+	// AvgInputTokens is the average prompt tokens per request on this replica.
+	// Derived from rate(prompt_tokens_sum) / rate(prompt_tokens_count).
+	// Zero when metrics are unavailable.
+	AvgInputTokens float64
+
+	// PrefixCacheHitRate is the fraction of prefix cache queries that were hits (0.0-1.0).
+	// Derived from rate(vllm:prefix_cache_hits[5m]) / rate(vllm:prefix_cache_queries[5m]).
+	// Used to reduce estimated input token demand for scheduler-queued requests.
+	// Zero when prefix caching is disabled or metrics are unavailable.
+	PrefixCacheHitRate float64
 }
 
 // ReplicaMetricsMetadata contains freshness information for replica metrics

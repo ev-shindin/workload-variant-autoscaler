@@ -20,7 +20,7 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: model-scale-to-zero-config
+  name: wva-model-scale-to-zero-config
   namespace: workload-variant-autoscaler-system
 data:
   # Global defaults applied to all models unless overridden

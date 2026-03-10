@@ -20,6 +20,8 @@ import (
 	"context"
 	"crypto/tls"
 	goflag "flag"
+	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"time"
@@ -42,18 +44,19 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
-	llmdVariantAutoscalingV1alpha1 "github.com/llm-d-incubation/workload-variant-autoscaler/api/v1alpha1"
-	"github.com/llm-d-incubation/workload-variant-autoscaler/internal/collector/source"
-	"github.com/llm-d-incubation/workload-variant-autoscaler/internal/collector/source/prometheus"
-	"github.com/llm-d-incubation/workload-variant-autoscaler/internal/config"
-	"github.com/llm-d-incubation/workload-variant-autoscaler/internal/controller"
-	"github.com/llm-d-incubation/workload-variant-autoscaler/internal/datastore"
-	"github.com/llm-d-incubation/workload-variant-autoscaler/internal/engines/saturation"
-	"github.com/llm-d-incubation/workload-variant-autoscaler/internal/engines/scalefromzero"
-	"github.com/llm-d-incubation/workload-variant-autoscaler/internal/logging"
-	"github.com/llm-d-incubation/workload-variant-autoscaler/internal/metrics"
-	"github.com/llm-d-incubation/workload-variant-autoscaler/internal/utils"
-	poolutil "github.com/llm-d-incubation/workload-variant-autoscaler/internal/utils/pool"
+	llmdVariantAutoscalingV1alpha1 "github.com/llm-d/llm-d-workload-variant-autoscaler/api/v1alpha1"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/collector/source"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/collector/source/prometheus"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/config"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/controller"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/controller/indexers"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/datastore"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/engines/saturation"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/engines/scalefromzero"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/logging"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/metrics"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/utils"
+	poolutil "github.com/llm-d/llm-d-workload-variant-autoscaler/internal/utils/pool"
 	promoperator "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	"github.com/prometheus/client_golang/api"
 	promv1 "github.com/prometheus/client_golang/api/prometheus/v1"
@@ -78,66 +81,46 @@ func init() {
 
 // nolint:gocyclo
 func main() {
-	// Server and certificate configuration
-	var (
-		metricsAddr                                      string
-		probeAddr                                        string
-		metricsCertPath, metricsCertName, metricsCertKey string
+	// Command-line flags
 
-		webhookCertPath, webhookCertName, webhookCertKey string
-		watchNamespace                                   string
-	)
-	// Leader election configuration
-	var (
-		enableLeaderElection bool
-		leaseDuration        time.Duration
-		renewDeadline        time.Duration
-		retryPeriod          time.Duration
-		restTimeout          time.Duration
-	)
-	// Feature flags
-	var (
-		secureMetrics bool
-		enableHTTP2   bool
-	)
-	// Other
-	var tlsOpts []func(*tls.Config)
-	var loggerVerbosity int
+	loggerVerbosity := flag.Int("v", logging.DEFAULT, "number for the log level verbosity")
 
-	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
+	configFilePath := flag.String("config-file", "", "Path to the YAML configuration file. "+
+		"When set, the main configuration is read from this file instead of a Kubernetes ConfigMap.")
+
+	flag.String("metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
-	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
-	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
+	flag.String("health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
+	flag.Bool("leader-elect", false,
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
-	flag.BoolVar(&secureMetrics, "metrics-secure", true,
+	flag.Bool("metrics-secure", true,
 		"If set, the metrics endpoint is served securely via HTTPS. Use --metrics-secure=false to use HTTP instead.")
-	flag.StringVar(&webhookCertPath, "webhook-cert-path", "", "The directory that contains the webhook certificate.")
-	flag.StringVar(&webhookCertName, "webhook-cert-name", "tls.crt", "The name of the webhook certificate file.")
-	flag.StringVar(&webhookCertKey, "webhook-cert-key", "tls.key", "The name of the webhook key file.")
-	flag.StringVar(&metricsCertPath, "metrics-cert-path", "",
+	flag.String("webhook-cert-path", "", "The directory that contains the webhook certificate.")
+	flag.String("webhook-cert-name", "tls.crt", "The name of the webhook certificate file.")
+	flag.String("webhook-cert-key", "tls.key", "The name of the webhook key file.")
+	flag.String("metrics-cert-path", "",
 		"The directory that contains the metrics server certificate.")
-	flag.StringVar(&metricsCertName, "metrics-cert-name", "tls.crt", "The name of the metrics server certificate file.")
-	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics key file.")
-	flag.BoolVar(&enableHTTP2, "enable-http2", false,
+	flag.String("metrics-cert-name", "tls.crt", "The name of the metrics server certificate file.")
+	flag.String("metrics-cert-key", "tls.key", "The name of the metrics key file.")
+	flag.Bool("enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
-	flag.StringVar(&watchNamespace, "watch-namespace", "",
+	flag.String("watch-namespace", "",
 		"Namespace to watch for updates. If unspecified, all namespaces are watched.")
-	flag.IntVar(&loggerVerbosity, "v", logging.DEFAULT, "number for the log level verbosity")
 
 	// Leader election timeout configuration flags
 	// These can be overridden in manager.yaml to tune for different environments
 	// (e.g., higher values for environments with network latency or API server slowness)
-	flag.DurationVar(&leaseDuration, "leader-election-lease-duration", 60*time.Second,
+	flag.Duration("leader-election-lease-duration", 60*time.Second,
 		"The duration that non-leader candidates will wait to force acquire leadership. "+
 			"Increased from default 15s to 60s to prevent lease renewal failures in environments with network latency.")
-	flag.DurationVar(&renewDeadline, "leader-election-renew-deadline", 50*time.Second,
+	flag.Duration("leader-election-renew-deadline", 50*time.Second,
 		"The duration that the acting master will retry refreshing leadership before giving up. "+
 			"Increased from default 10s to 50s to provide more tolerance for network latency and API server delays.")
-	flag.DurationVar(&retryPeriod, "leader-election-retry-period", 10*time.Second,
+	flag.Duration("leader-election-retry-period", 10*time.Second,
 		"The duration the clients should wait between tries of actions. "+
 			"Increased from default 2s to 10s to reduce API server load and provide more time between renewal attempts.")
-	flag.DurationVar(&restTimeout, "rest-client-timeout", 60*time.Second,
+	flag.Duration("rest-client-timeout", 60*time.Second,
 		"The timeout for REST API calls to the Kubernetes API server. "+
 			"Increased from default ~30s to 60s for better resilience against network latency.")
 
@@ -150,11 +133,25 @@ func main() {
 
 	flag.Parse()
 
-	logging.InitLogging(&opts, &loggerVerbosity)
+	logging.InitLogging(&opts, loggerVerbosity)
 	defer logging.Sync() // nolint:errcheck
 
 	setupLog := ctrl.Log.WithName("setup")
 	setupLog.Info("Logger initialized")
+
+	// Get REST config early (needed for config loading)
+	restConfig := ctrl.GetConfigOrDie()
+
+	// Load unified configuration (fail-fast if invalid)
+	// Viper resolves precedence: flags > env > config file > defaults
+	// For more information see:
+	// https://github.com/llm-d/llm-d-workload-variant-autoscaler/blob/main/docs/user-guide/configuration.md
+	cfg, err := config.Load(flag.CommandLine, *configFilePath)
+	if err != nil {
+		setupLog.Error(err, "failed to load configuration - this is a fatal error")
+		os.Exit(1)
+	}
+	setupLog.Info("Configuration loaded successfully")
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
@@ -167,7 +164,8 @@ func main() {
 		c.NextProtos = []string{"http/1.1"}
 	}
 
-	if !enableHTTP2 {
+	var tlsOpts []func(*tls.Config)
+	if !cfg.EnableHTTP2() {
 		tlsOpts = append(tlsOpts, disableHTTP2)
 	}
 
@@ -177,16 +175,16 @@ func main() {
 	// Initial webhook TLS options
 	webhookTLSOpts := tlsOpts
 
-	if len(webhookCertPath) > 0 {
+	if len(cfg.WebhookCertPath()) > 0 {
 		setupLog.Info("Initializing webhook certificate watcher using provided certificates",
-			"webhookCertPath", webhookCertPath,
-			"webhookCertName", webhookCertName,
-			"webhookCertKey", webhookCertKey)
+			"webhookCertPath", cfg.WebhookCertPath(),
+			"webhookCertName", cfg.WebhookCertName(),
+			"webhookCertKey", cfg.WebhookCertKey())
 
 		var err error
 		webhookCertWatcher, err = certwatcher.New(
-			filepath.Join(webhookCertPath, webhookCertName),
-			filepath.Join(webhookCertPath, webhookCertKey),
+			filepath.Join(cfg.WebhookCertPath(), cfg.WebhookCertName()),
+			filepath.Join(cfg.WebhookCertPath(), cfg.WebhookCertKey()),
 		)
 		if err != nil {
 			setupLog.Error(err, "Failed to initialize webhook certificate watcher")
@@ -207,12 +205,12 @@ func main() {
 	// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.20.4/pkg/metrics/server
 	// - https://book.kubebuilder.io/reference/metrics.html
 	metricsServerOptions := metricsserver.Options{
-		BindAddress:   metricsAddr,
-		SecureServing: secureMetrics,
+		BindAddress:   cfg.MetricsAddr(),
+		SecureServing: cfg.SecureMetrics(),
 		TLSOpts:       tlsOpts,
 	}
 
-	if secureMetrics {
+	if cfg.SecureMetrics() {
 		// FilterProvider is used to protect the metrics endpoint with authn/authz.
 		// These configurations ensure that only authorized users and service accounts
 		// can access the metrics endpoint. The RBAC are configured in 'config/rbac/kustomization.yaml'. More info:
@@ -228,17 +226,17 @@ func main() {
 	// - [METRICS-WITH-CERTS] at config/default/kustomization.yaml to generate and use certificates
 	// managed by cert-manager for the metrics server.
 	// - [PROMETHEUS-WITH-CERTS] at config/prometheus/kustomization.yaml for TLS certification.
-	if len(metricsCertPath) > 0 {
+	if len(cfg.MetricsCertPath()) > 0 {
 		setupLog.Info("Initializing metrics certificate watcher using provided certificates",
-			"metricsCertPath", metricsCertPath,
-			"metricsCertName", metricsCertName,
-			"metricsCertKey", metricsCertKey,
+			"metricsCertPath", cfg.MetricsCertPath(),
+			"metricsCertName", cfg.MetricsCertName(),
+			"metricsCertKey", cfg.MetricsCertKey(),
 		)
 
 		var err error
 		metricsCertWatcher, err = certwatcher.New(
-			filepath.Join(metricsCertPath, metricsCertName),
-			filepath.Join(metricsCertPath, metricsCertKey),
+			filepath.Join(cfg.MetricsCertPath(), cfg.MetricsCertName()),
+			filepath.Join(cfg.MetricsCertPath(), cfg.MetricsCertKey()),
 		)
 		if err != nil {
 			setupLog.Error(err, "Failed to initialize metrics certificate watcher")
@@ -251,14 +249,10 @@ func main() {
 	}
 
 	// --- Setup Datastore ---
-	ds := datastore.NewDatastore()
+	ds := datastore.NewDatastore(cfg)
 
-	// Get REST config and configure timeouts to handle network latency
-	// This addresses issues with leader election lease renewal failures in environments
-	// with higher network latency or API server slowness.
-	restConfig := ctrl.GetConfigOrDie()
-	// Use configurable REST client timeout (default 60s, can be overridden via --rest-client-timeout flag)
-	restConfig.Timeout = restTimeout
+	// Use configurable REST client timeout from Config (default 60s, can be overridden via --rest-client-timeout flag)
+	restConfig.Timeout = cfg.RestTimeout()
 
 	// Configure leader election with configurable timeouts to prevent lease renewal failures
 	// Default values are: LeaseDuration=60s, RenewDeadline=50s, RetryPeriod=10s
@@ -266,17 +260,20 @@ func main() {
 	// Increased from controller-runtime defaults (15s, 10s, 2s) to provide more tolerance
 	// for network latency and API server delays
 
+	leaseDurationVal := cfg.LeaseDuration()
+	renewDeadlineVal := cfg.RenewDeadline()
+	retryPeriodVal := cfg.RetryPeriod()
 	mgrOptions := ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsServerOptions,
 		WebhookServer:          webhookServer,
-		HealthProbeBindAddress: probeAddr,
-		LeaderElection:         enableLeaderElection,
-		LeaderElectionID:       "72dd1cf1.llm-d.ai",
-		// Leader election timeout configuration (configurable via flags)
-		LeaseDuration: &leaseDuration,
-		RenewDeadline: &renewDeadline,
-		RetryPeriod:   &retryPeriod,
+		HealthProbeBindAddress: cfg.ProbeAddr(),
+		LeaderElection:         cfg.EnableLeaderElection(),
+		LeaderElectionID:       cfg.LeaderElectionID(),
+		// Leader election timeout configuration (from Config, can be overridden via flags/env/ConfigMap)
+		LeaseDuration: &leaseDurationVal,
+		RenewDeadline: &renewDeadlineVal,
+		RetryPeriod:   &retryPeriodVal,
 		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
 		// when the Manager ends. This requires the binary to immediately end when the
 		// Manager is stopped, otherwise, this setting is unsafe. Setting this significantly
@@ -289,11 +286,12 @@ func main() {
 		LeaderElectionReleaseOnCancel: true,
 	}
 
-	if watchNamespace != "" {
-		setupLog.Info("Watching single namespace", "namespace", watchNamespace)
+	watchNS := cfg.WatchNamespace()
+	if watchNS != "" {
+		setupLog.Info("Watching single namespace", "namespace", watchNS)
 		mgrOptions.Cache = cache.Options{
 			DefaultNamespaces: map[string]cache.Config{
-				watchNamespace: {},
+				watchNS: {},
 			},
 		}
 	}
@@ -304,38 +302,58 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Setup custom indexes for lookups on VariantAutoscalings
+	setupLog.Info("Setting up indexes")
+	if err := indexers.SetupIndexes(context.Background(), mgr); err != nil {
+		setupLog.Error(err, "unable to setup indexes")
+		os.Exit(1)
+	}
+	setupLog.Info("Indexes setup completed")
+
 	// Initialize metrics
 	setupLog.Info("Creating metrics emitter instance")
 	// Force initialization of metrics by creating a metrics emitter
 	_ = metrics.NewMetricsEmitter()
 	setupLog.Info("Metrics emitter created successfully")
 
-	// Configure Prometheus client using flexible configuration with TLS support
-	promConfig, err := config.GetPrometheusConfig(context.Background(), mgr.GetClient())
-	if err != nil {
-		setupLog.Error(err, "failed to get Prometheus configuration")
-		os.Exit(1)
+	// Create ConfigMap reconciler for configuration management.
+	// Bootstrap uses the temporary uncached client so ConfigMap-backed settings
+	// are loaded before any manager runnables start.
+	configMapReconciler := &controller.ConfigMapReconciler{
+		Reader:    mgr.GetAPIReader(),
+		Scheme:    mgr.GetScheme(),
+		Config:    cfg,
+		Datastore: ds,
+		Recorder:  mgr.GetEventRecorderFor("workload-variant-autoscaler-configmap-reconciler"),
 	}
 
-	// ensure we have a valid configuration
-	if promConfig == nil {
-		setupLog.Error(nil, "no Prometheus configuration found - this should not happen")
+	ctx := context.Background()
+	ctx = ctrl.LoggerInto(ctx, setupLog)
+	if err = configMapReconciler.BootstrapInitialConfigMaps(ctx); err != nil {
+		setupLog.Error(err, "unable to bootstrap initial ConfigMaps")
+		os.Exit(1)
+	}
+	setupLog.Info("Initial ConfigMap bootstrap completed")
+
+	// Use Prometheus configuration from unified Config (already validated during Load())
+	if cfg.PrometheusBaseURL() == "" {
+		setupLog.Error(nil, "no Prometheus configuration found - this should not happen after validation")
 		os.Exit(1)
 	}
 
 	// Always validate TLS configuration since HTTPS is required
-	if err := utils.ValidateTLSConfig(promConfig); err != nil {
+	if err := utils.ValidateTLSConfig(cfg); err != nil {
 		setupLog.Error(err, "TLS configuration validation failed - HTTPS is required")
 		os.Exit(1)
 	}
 
 	setupLog.Info("Initializing Prometheus client",
-		"address", promConfig.BaseURL,
+		"address", cfg.PrometheusBaseURL(),
 		"tlsEnabled", true,
 	)
 
 	// Create Prometheus client with TLS support
-	promClientConfig, err := utils.CreatePrometheusClientConfig(promConfig)
+	promClientConfig, err := utils.CreatePrometheusClientConfig(cfg)
 	if err != nil {
 		setupLog.Error(err, "failed to create prometheus client config")
 		os.Exit(1)
@@ -361,13 +379,10 @@ func main() {
 		sourceRegistry := source.NewSourceRegistry()
 		setupLog.Info("Initializing metrics source registry")
 
-		// Read Prometheus cache configuration from ConfigMap
-		// TODO(LV): Uncomment and implement cache configuration reading
-		// cacheConfig, err := config.ReadPrometheusCacheConfig(context.Background(), mgr.GetClient())
-		// if err != nil {
-		// 	setupLog.Error(err, "Failed to read Prometheus cache config from ConfigMap, using defaults")
-		// 	cacheConfig = nil // Use defaults
-		// }
+		// Prometheus cache configuration is loaded via unified Config during startup.
+		// The cache config is available in cfg.Dynamic.PrometheusCache and is updated
+		// automatically when the ConfigMap changes. We use the default config here
+		// as the unified Config system handles cache configuration loading.
 
 		// Register PrometheusSource with default config
 		promSource := prometheus.NewPrometheusSource(ctx, promAPI, prometheus.DefaultPrometheusSourceConfig())
@@ -383,6 +398,7 @@ func main() {
 			mgr.GetScheme(),
 			mgr.GetEventRecorderFor("workload-variant-autoscaler-saturation-engine"),
 			sourceRegistry,
+			cfg, // Pass unified Config to engine
 		)
 		go engine.StartOptimizeLoop(ctx)
 		return nil
@@ -395,7 +411,7 @@ func main() {
 
 	// Register scale from zero engine loop with the manager. Only start when leader.
 	err = mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
-		engine, err := scalefromzero.NewEngine(mgr.GetClient(), mgr.GetRESTMapper(), restConfig, ds)
+		engine, err := scalefromzero.NewEngine(mgr.GetClient(), mgr.GetRESTMapper(), restConfig, ds, cfg)
 		if err != nil {
 			return err
 		}
@@ -408,11 +424,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Create the reconciler
+	// Create the reconciler with unified Config and datastore
 	reconciler := &controller.VariantAutoscalingReconciler{
-		Client:   mgr.GetClient(),
-		Scheme:   mgr.GetScheme(),
-		Recorder: mgr.GetEventRecorderFor("workload-variant-autoscaler-controller-manager"),
+		Client:    mgr.GetClient(),
+		Scheme:    mgr.GetScheme(),
+		Recorder:  mgr.GetEventRecorderFor("workload-variant-autoscaler-controller-manager"),
+		Config:    cfg, // Pass unified Config to reconciler
+		Datastore: ds,  // Pass datastore for namespace tracking
 	}
 
 	// Setup the controller with the manager
@@ -423,14 +441,25 @@ func main() {
 	// +kubebuilder:scaffold:builder
 
 	// Create InferencePool reconciler
+	poolGroupEnv := os.Getenv("POOL_GROUP")
+	poolGKNN, err := poolutil.GetPoolGKNN(poolGroupEnv)
+	if err != nil {
+		setupLog.Error(err, "unable to create default pool GKNN from POOL_GROUP", "poolGroup", poolGroupEnv)
+		os.Exit(1)
+	}
 	inferencePoolReconciler := &controller.InferencePoolReconciler{
 		Datastore: ds,
 		Client:    mgr.GetClient(),
-		PoolGKNN:  poolutil.DefaultPoolGKNN(),
+		PoolGKNN:  poolGKNN,
 	}
 
 	if err = inferencePoolReconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create inferencePool controller")
+		os.Exit(1)
+	}
+
+	if err = configMapReconciler.SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create configmap controller")
 		os.Exit(1)
 	}
 
@@ -454,7 +483,16 @@ func main() {
 		setupLog.Error(err, "unable to set up health check")
 		os.Exit(1)
 	}
-	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
+	if err := mgr.AddReadyzCheck("readyz", func(_ *http.Request) error {
+		if cfg.ConfigMapsBootstrapComplete() {
+			return nil
+		}
+		_, _, syncErr := cfg.ConfigMapsBootstrapSyncStatus()
+		if syncErr != "" {
+			return fmt.Errorf("initial ConfigMap bootstrap not complete: %s", syncErr)
+		}
+		return fmt.Errorf("initial ConfigMap bootstrap not complete")
+	}); err != nil {
 		setupLog.Error(err, "unable to set up ready check")
 		os.Exit(1)
 	}

@@ -50,7 +50,7 @@ package pipeline
 import (
 	"context"
 
-	"github.com/llm-d-incubation/workload-variant-autoscaler/internal/interfaces"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/interfaces"
 )
 
 // Limiter constrains scaling decisions based on resource availability.
@@ -138,6 +138,47 @@ type ResourceAllocator interface {
 	Remaining() int
 }
 
+// ResourcePool represents available resources for one accelerator type.
+type ResourcePool struct {
+	Limit int // total capacity (from cluster discovery)
+	Used  int // currently in use
+}
+
+// Available returns the number of allocatable resources (Limit - Used),
+// clamped to a minimum of 0.
+func (p ResourcePool) Available() int {
+	avail := p.Limit - p.Used
+	if avail < 0 {
+		return 0
+	}
+	return avail
+}
+
+// ResourceConstraints represents hard resource constraints from a single provider.
+// Multiple providers can each contribute constraints; the optimizer respects all of them.
+type ResourceConstraints struct {
+	ProviderName string                  // e.g., "gpu-limiter", "quota-limiter"
+	Pools        map[string]ResourcePool // accelerator type → pool
+	TotalLimit   int
+	TotalUsed    int
+	TotalAvail   int
+}
+
+// ConstraintProvider exposes hard constraints for the optimizer.
+// Implementations discover resource availability without making allocation decisions.
+//
+// This separates constraint discovery from decision-making:
+//   - ConstraintProvider: "Here are the limits" (hard facts)
+//   - ScalingOptimizer: "Here's what to do given those limits" (decision logic)
+type ConstraintProvider interface {
+	// Name returns provider identifier, used as ProviderName in ResourceConstraints.
+	Name() string
+
+	// ComputeConstraints refreshes resource data and returns hard constraints.
+	// currentUsage maps accelerator type → GPUs currently in use.
+	ComputeConstraints(ctx context.Context, currentUsage map[string]int) (*ResourceConstraints, error)
+}
+
 // Inventory provides resource availability and creates allocators.
 //
 // Implementations define the granularity of resource tracking:
@@ -183,4 +224,8 @@ type Inventory interface {
 
 	// TotalAvailable returns total available GPUs (Limit - Used).
 	TotalAvailable() int
+
+	// GetResourcePools returns per-type resource availability.
+	// Each key is an accelerator type (e.g., "A100", "H100").
+	GetResourcePools() map[string]ResourcePool
 }

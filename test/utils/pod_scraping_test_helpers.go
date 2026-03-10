@@ -62,8 +62,8 @@ import (
 	"net/http"
 	"time"
 
-	sourcepkg "github.com/llm-d-incubation/workload-variant-autoscaler/internal/collector/source"
-	"github.com/llm-d-incubation/workload-variant-autoscaler/internal/collector/source/pod"
+	sourcepkg "github.com/llm-d/llm-d-workload-variant-autoscaler/internal/collector/source"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/collector/source/pod"
 	"github.com/onsi/ginkgo/v2"
 	gom "github.com/onsi/gomega"
 	promoperator "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
@@ -184,7 +184,7 @@ func TestPodScrapingPodDiscovery(ctx context.Context, config PodScrapingTestConf
 
 // TestPodScrapingMetricsCollection tests that PodScrapingSource can scrape metrics from pods.
 func TestPodScrapingMetricsCollection(ctx context.Context, config PodScrapingTestConfig, g gom.Gomega) {
-	if config.Environment == "kind" {
+	if config.Environment == "kind" || config.Environment == "kind-emulator" {
 		ginkgo.Skip("Skipping metrics collection test on Kind - tests run from outside cluster where pod IPs are not accessible. Use in-cluster scraping tests instead.")
 	}
 
@@ -373,7 +373,7 @@ func TestPodScrapingAuthentication(ctx context.Context, config PodScrapingTestCo
 
 // TestPodScrapingCaching tests that PodScrapingSource caches results
 func TestPodScrapingCaching(ctx context.Context, config PodScrapingTestConfig, g gom.Gomega) {
-	if config.Environment == "kind" {
+	if config.Environment == "kind" || config.Environment == "kind-emulator" {
 		ginkgo.Skip("Skipping caching test on Kind - tests run from outside cluster where pod IPs are not accessible. Use in-cluster scraping tests instead.")
 	}
 
@@ -413,7 +413,7 @@ func TestPodScrapingCaching(ctx context.Context, config PodScrapingTestConfig, g
 
 // TestPodScrapingFromController verifies that PodScrapingSource can scrape metrics when running inside the cluster.
 func TestPodScrapingFromController(ctx context.Context, config PodScrapingTestConfig, g gom.Gomega) {
-	if config.Environment != "kind" {
+	if config.Environment != "kind" && config.Environment != "kind-emulator" {
 		ginkgo.Skip("Skipping controller verification test - only needed for Kind")
 	}
 
@@ -532,12 +532,14 @@ func TestInClusterScraping(ctx context.Context, config PodScrapingTestConfig, g 
 	}()
 
 	// Wait for job to complete
+	// Timeout must account for image pull time (curlimages/curl may need to be pulled from Docker Hub,
+	// which can be slow in CI due to rate limiting on shared GitHub Actions runner IPs)
 	_, _ = fmt.Fprintf(ginkgo.GinkgoWriter, "Waiting for in-cluster scraping test job to complete...\n")
 	gom.Eventually(func(g gom.Gomega) {
 		currentJob, err := config.K8sClient.BatchV1().Jobs(config.ServiceNamespace).Get(ctx, jobName, metav1.GetOptions{})
 		g.Expect(err).NotTo(gom.HaveOccurred(), "Should be able to get job")
 		g.Expect(currentJob.Status.Succeeded+currentJob.Status.Failed).To(gom.BeNumerically(">", 0), "Job should complete")
-	}, 2*time.Minute, 5*time.Second).Should(gom.Succeed())
+	}, 5*time.Minute, 5*time.Second).Should(gom.Succeed())
 
 	// Verify job succeeded
 	finalJob, err := config.K8sClient.BatchV1().Jobs(config.ServiceNamespace).Get(ctx, jobName, metav1.GetOptions{})

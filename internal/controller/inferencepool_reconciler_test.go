@@ -21,9 +21,9 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
-	"github.com/llm-d-incubation/workload-variant-autoscaler/internal/datastore"
-	poolutil "github.com/llm-d-incubation/workload-variant-autoscaler/internal/utils/pool"
-	unittestutil "github.com/llm-d-incubation/workload-variant-autoscaler/test/utils"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/datastore"
+	poolutil "github.com/llm-d/llm-d-workload-variant-autoscaler/internal/utils/pool"
+	unittestutil "github.com/llm-d/llm-d-workload-variant-autoscaler/test/utils"
 	"github.com/stretchr/testify/assert"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -100,7 +100,7 @@ func TestInferencePoolReconcile(t *testing.T) {
 			req := ctrl.Request{NamespacedName: namespacedName}
 			ctx := context.Background()
 
-			ds := datastore.NewDatastore()
+			ds := datastore.NewDatastore(nil)
 			inferencePoolReconciler := &InferencePoolReconciler{Client: fakeClient, Datastore: ds, PoolGKNN: gknn}
 
 			if _, err := inferencePoolReconciler.Reconcile(ctx, req); err != nil {
@@ -221,7 +221,7 @@ func TestAlphaInferencePoolReconcile(t *testing.T) {
 			req := ctrl.Request{NamespacedName: namespacedName}
 			ctx := context.Background()
 
-			ds := datastore.NewDatastore()
+			ds := datastore.NewDatastore(nil)
 			inferencePoolReconciler := &InferencePoolReconciler{Client: fakeClient, Datastore: ds, PoolGKNN: gknn}
 
 			if _, err := inferencePoolReconciler.Reconcile(ctx, req); err != nil {

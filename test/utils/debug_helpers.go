@@ -11,7 +11,7 @@ import (
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	v1alpha1 "github.com/llm-d-incubation/workload-variant-autoscaler/api/v1alpha1"
+	v1alpha1 "github.com/llm-d/llm-d-workload-variant-autoscaler/api/v1alpha1"
 )
 
 // DumpControllerLogs fetches and prints the controller manager logs for debugging.
@@ -65,7 +65,7 @@ func DumpVAStatus(ctx context.Context, crClient client.Client, w io.Writer) {
 		_, _ = fmt.Fprintf(w, "    LastRunTime: %v\n", va.Status.DesiredOptimizedAlloc.LastRunTime)
 		_, _ = fmt.Fprintf(w, "  Conditions:\n")
 		for _, cond := range va.Status.Conditions {
-			_, _ = fmt.Fprintf(w, "    - Type: %s, Status: %s, Reason: %s\n", cond.Type, cond.Status, cond.Reason)
+			_, _ = fmt.Fprintf(w, "    - Type: %s, Status: %s, Reason: %s, Message: %q\n", cond.Type, cond.Status, cond.Reason, cond.Message)
 		}
 	}
 }

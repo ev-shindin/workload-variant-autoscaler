@@ -6,7 +6,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	"github.com/llm-d-incubation/workload-variant-autoscaler/internal/interfaces"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/interfaces"
 )
 
 // simpleAllocator implements ResourceAllocator with a single pool
@@ -162,7 +162,7 @@ var _ = Describe("GreedyBySaturation", func() {
 				Expect(err).NotTo(HaveOccurred())
 
 				// Only 3 GPUs available, 2 GPUs per replica = 1 replica can be added
-				Expect(decisions[0].GPUsAllocated).To(Equal(2)) // Only full replicas count
+				Expect(decisions[0].GPUsAllocated).To(Equal(2))  // Only full replicas count
 				Expect(decisions[0].TargetReplicas).To(Equal(2)) // 1 + 1 replica
 				Expect(decisions[0].WasLimited).To(BeTrue())
 			})

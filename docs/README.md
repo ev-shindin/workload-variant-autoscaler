@@ -36,7 +36,6 @@ Understanding how WVA works:
 
 - **[Modeling & Optimization](design/modeling-optimization.md)** - Queue theory models and optimization algorithms
 - **[Controller Behavior](design/controller-behavior.md)** - Event handling and reconciliation behavior
-- **[Architecture Limitations](design/architecture-limitations.md)** - **Important:** Model architecture assumptions and limitations (READ THIS if using HSSM, MoE, or non-standard architectures)
 - **[Architecture Diagrams](design/diagrams/)** - System architecture and workflows
 
 ### Developer Guide
@@ -59,13 +58,13 @@ Contributing to WVA:
 ## Additional Resources
 
 - [Community Proposal](https://docs.google.com/document/d/1n6SAhloQaoSyF2k3EveIOerT-f97HuWXTLFm07xcvqk/edit)
-- [llm-d Infrastructure](https://github.com/llm-d-incubation/llm-d-infra)
+- [llm-d Infrastructure](https://github.com/llm-d/llm-d-infra)
 - [API Proposal](https://docs.google.com/document/d/1j2KRAT68_FYxq1iVzG0xVL-DHQhGVUZBqiM22Hd_0hc/edit)
 
 ## Need Help?
 
-- Check the [FAQ](user-guide/faq.md) (coming soon)
-- Open a [GitHub Issue](https://github.com/llm-d-incubation/workload-variant-autoscaler/issues)
+- Check the [Troubleshooting Guide](user-guide/troubleshooting.md)
+- Open a [GitHub Issue](https://github.com/llm-d/llm-d-workload-variant-autoscaler/issues)
 - Join community meetings
 
 ---

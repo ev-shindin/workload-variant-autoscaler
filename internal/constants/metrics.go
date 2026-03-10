@@ -1,4 +1,5 @@
 // Package constants provides centralized constant definitions for the autoscaler.
+// This file contains metric-related constants (VLLM input metrics, WVA output metrics, and metric label names).
 package constants
 
 // VLLM Input Metrics
@@ -52,6 +53,40 @@ const (
 	// VLLMNumRequestsWaiting tracks the number of requests waiting in the queue.
 	// Used by saturation analyzer to detect request queue saturation.
 	VLLMNumRequestsWaiting = "vllm:num_requests_waiting"
+
+	// VLLMCacheConfigInfo is an info-style gauge that exposes KV cache configuration as labels.
+	// Labels include num_gpu_blocks, block_size, cache_dtype, etc.
+	// Value is always 1.0. Used by Saturation Analyzer V2 for token capacity computation.
+	VLLMCacheConfigInfo = "vllm:cache_config_info"
+
+	// VLLMPrefixCacheHits is a counter of prefix cache block hits.
+	// Used with VLLMPrefixCacheQueries to compute prefix cache hit rate.
+	VLLMPrefixCacheHits = "vllm:prefix_cache_hits"
+
+	// VLLMPrefixCacheQueries is a counter of prefix cache block queries.
+	// Used with VLLMPrefixCacheHits to compute prefix cache hit rate.
+	VLLMPrefixCacheQueries = "vllm:prefix_cache_queries"
+)
+
+// llm-d Inference Scheduler Flow Control Metrics
+// These metrics come from the Gateway API Inference Extension EPP (Endpoint Picker)
+// flow control layer, not from vLLM pods. They are model-scoped (not per-pod).
+//
+// TODO(#2309): These metrics currently lack a namespace label upstream.
+// If the same model and inference pool names exist in different namespaces,
+// the metrics will collide. See gateway-api-inference-extension issue #2309.
+const (
+	// SchedulerFlowControlQueueSize is the number of requests queued in the
+	// inference scheduler's flow control layer.
+	// Labels: fairness_id, priority, inference_pool, model_name, target_model_name
+	// Note: no namespace label — see TODO(#2309) above.
+	SchedulerFlowControlQueueSize = "inference_extension_flow_control_queue_size"
+
+	// SchedulerFlowControlQueueBytes is the total bytes of request bodies queued
+	// in the inference scheduler's flow control layer.
+	// Labels: fairness_id, priority, inference_pool, model_name, target_model_name
+	// Note: no namespace label — see TODO(#2309) above.
+	SchedulerFlowControlQueueBytes = "inference_extension_flow_control_queue_bytes"
 )
 
 // WVA Output Metrics
@@ -85,12 +120,4 @@ const (
 	LabelReason             = "reason"
 	LabelAcceleratorType    = "accelerator_type"
 	LabelControllerInstance = "controller_instance"
-)
-
-// Kubernetes Label Keys
-// Label keys used on Kubernetes resources for filtering and identification.
-const (
-	// ControllerInstanceLabelKey is the label key used to associate VAs with specific controller instances.
-	// Used for multi-controller isolation where each controller only manages VAs with matching labels.
-	ControllerInstanceLabelKey = "wva.llmd.ai/controller-instance"
 )

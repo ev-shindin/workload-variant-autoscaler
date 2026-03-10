@@ -34,3 +34,4 @@ llmd/
 llmd-infra/
 
 *.tgz
+actionlint

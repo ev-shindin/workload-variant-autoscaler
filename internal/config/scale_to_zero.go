@@ -10,7 +10,7 @@ import (
 	"gopkg.in/yaml.v3"
 	ctrl "sigs.k8s.io/controller-runtime"
 
-	"github.com/llm-d-incubation/workload-variant-autoscaler/internal/logging"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/logging"
 )
 
 // Scale-to-zero configuration constants
@@ -22,11 +22,11 @@ const (
 
 	// DefaultScaleToZeroConfigMapName is the default name of the ConfigMap that stores
 	// per-model scale-to-zero configuration.
-	DefaultScaleToZeroConfigMapName = "model-scale-to-zero-config"
+	DefaultScaleToZeroConfigMapName = "wva-model-scale-to-zero-config"
 
 	// GlobalDefaultsKey is the key in the ConfigMap used to specify global defaults
 	// for all models. Models can override these defaults with their specific configuration.
-	// This follows the same pattern as saturation-scaling-config.
+	// This follows the same pattern as wva-saturation-scaling-config.
 	GlobalDefaultsKey = "default"
 )
 
@@ -34,7 +34,7 @@ const (
 // Uses pointer for EnableScaleToZero to distinguish between "not set" (nil) and explicitly set to false.
 // This allows partial overrides where a model can inherit enableScaleToZero from global defaults
 // while overriding only the retentionPeriod.
-// Field naming follows saturation-scaling-config convention (snake_case for YAML).
+// Field naming follows wva-saturation-scaling-config convention (snake_case for YAML).
 type ModelScaleToZeroConfig struct {
 	// ModelID is the unique identifier for the model (only used in override entries)
 	ModelID string `yaml:"model_id,omitempty" json:"model_id,omitempty"`
@@ -111,12 +111,12 @@ func ValidateRetentionPeriod(retentionPeriod string) (time.Duration, error) {
 	return duration, nil
 }
 
-// GetScaleToZeroRetentionPeriod returns the retention period for scale-to-zero for a specific model.
+// ScaleToZeroRetentionPeriod returns the retention period for scale-to-zero for a specific model.
 // Configuration priority (highest to lowest):
 // 1. Per-model retention period in ConfigMap
 // 2. Global defaults retention period in ConfigMap (under "__defaults__" key)
 // 3. System default (10 minutes)
-func GetScaleToZeroRetentionPeriod(configData ScaleToZeroConfigData, modelID string) time.Duration {
+func ScaleToZeroRetentionPeriod(configData ScaleToZeroConfigData, modelID string) time.Duration {
 	// Check per-model retention period first (highest priority)
 	if config, exists := configData[modelID]; exists && config.RetentionPeriod != "" {
 		duration, err := ValidateRetentionPeriod(config.RetentionPeriod)
@@ -147,9 +147,9 @@ func GetScaleToZeroRetentionPeriod(configData ScaleToZeroConfigData, modelID str
 	return DefaultScaleToZeroRetentionPeriod
 }
 
-// GetMinNumReplicas returns the minimum number of replicas for a specific model based on
+// MinNumReplicas returns the minimum number of replicas for a specific model based on
 // scale-to-zero configuration. Returns 0 if scale-to-zero is enabled, otherwise returns 1.
-func GetMinNumReplicas(configData ScaleToZeroConfigData, modelID string) int {
+func MinNumReplicas(configData ScaleToZeroConfigData, modelID string) int {
 	if IsScaleToZeroEnabled(configData, modelID) {
 		return 0
 	}
@@ -157,7 +157,7 @@ func GetMinNumReplicas(configData ScaleToZeroConfigData, modelID string) int {
 }
 
 // ParseScaleToZeroConfigMap parses scale-to-zero configuration from a ConfigMap's data.
-// The ConfigMap follows the same format as saturation-scaling-config:
+// The ConfigMap follows the same format as wva-saturation-scaling-config:
 //   - "default": global defaults for all models
 //   - "<override-name>": per-model configuration with model_id field
 //

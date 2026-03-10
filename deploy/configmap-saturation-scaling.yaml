@@ -15,7 +15,7 @@ kind: ConfigMap
 # - queueSpareTrigger: Scale-up signal if avg spare queue capacity < trigger (integer)
 #
 metadata:
-  name: saturation-scaling-config
+  name: wva-saturation-scaling-config
   namespace: workload-variant-autoscaler-system
 data:
   # Global defaults applied to all variants unless overridden

@@ -19,10 +19,8 @@ package controller
 import (
 	"context"
 	"fmt"
-	"os"
 
 	promoperator "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
-	yaml "gopkg.in/yaml.v3"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -37,12 +35,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
-	llmdVariantAutoscalingV1alpha1 "github.com/llm-d-incubation/workload-variant-autoscaler/api/v1alpha1"
-	"github.com/llm-d-incubation/workload-variant-autoscaler/internal/config"
-	"github.com/llm-d-incubation/workload-variant-autoscaler/internal/engines/common"
-	"github.com/llm-d-incubation/workload-variant-autoscaler/internal/interfaces"
-	"github.com/llm-d-incubation/workload-variant-autoscaler/internal/logging"
-	"github.com/llm-d-incubation/workload-variant-autoscaler/internal/utils"
+	llmdVariantAutoscalingV1alpha1 "github.com/llm-d/llm-d-workload-variant-autoscaler/api/v1alpha1"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/config"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/controller/indexers"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/datastore"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/engines/common"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/logging"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/utils"
 )
 
 // VariantAutoscalingReconciler reconciles a variantAutoscaling object
@@ -50,7 +49,9 @@ type VariantAutoscalingReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 
-	Recorder record.EventRecorder
+	Recorder  record.EventRecorder
+	Config    *config.Config      // Unified configuration (injected from main.go)
+	Datastore datastore.Datastore // Datastore for namespace tracking and InferencePool data
 }
 
 // +kubebuilder:rbac:groups=llmd.ai,resources=variantautoscalings,verbs=get;list;watch;create;update;patch;delete
@@ -59,41 +60,23 @@ type VariantAutoscalingReconciler struct {
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups="",resources=nodes/status,verbs=get;list;update;patch;watch
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups="apps",resources=replicasets,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;update;list;watch
+// Note: The broad ConfigMap permission above is required for namespace-local ConfigMap overrides.
+// The controller filters by well-known names (wva-saturation-scaling-config, wva-model-scale-to-zero-config)
+// in its predicate logic, providing effective access control.
+// +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch
+// Note: Namespace watch permission is required for label-based namespace opt-in for namespace-local ConfigMaps.
 // +kubebuilder:rbac:groups=monitoring.coreos.com,resources=servicemonitors,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 const (
-	defaultConfigMapName = "workload-variant-autoscaler-variantautoscaling-config"
 	// ServiceMonitor constants for watching controller's own metrics ServiceMonitor
 	defaultServiceMonitorName = "workload-variant-autoscaler-controller-manager-metrics-monitor"
-
-	defaultSaturationConfigMapName = "saturation-scaling-config"
 )
-
-func getNamespace() string {
-	if ns := os.Getenv("POD_NAMESPACE"); ns != "" {
-		return ns
-	}
-	return "workload-variant-autoscaler-system"
-}
-
-func getConfigMapName() string {
-	if name := os.Getenv("CONFIG_MAP_NAME"); name != "" {
-		return name
-	}
-	return defaultConfigMapName
-}
-
-func getSaturationConfigMapName() string {
-	if name := os.Getenv("SATURATION_CONFIG_MAP_NAME"); name != "" {
-		return name
-	}
-	return defaultSaturationConfigMapName
-}
 
 var (
 	// ServiceMonitor GVK for watching controller's own metrics ServiceMonitor
@@ -102,7 +85,6 @@ var (
 		Version: "v1",
 		Kind:    "ServiceMonitor",
 	}
-	configMapNamespace = getNamespace()
 )
 
 func (r *VariantAutoscalingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -136,8 +118,15 @@ func (r *VariantAutoscalingReconciler) Reconcile(ctx context.Context, req ctrl.R
 		logger.Info("VariantAutoscaling is being deleted, skipping reconciliation",
 			"name", va.Name,
 			"namespace", va.Namespace)
+		// Untrack namespace when VA is deleted
+		r.Datastore.NamespaceUntrack("VariantAutoscaling", va.Name, va.Namespace)
 		return ctrl.Result{}, nil
 	}
+
+	// Track namespace for namespace-local ConfigMap watching
+	// Moved after deletion check to avoid tracking deleted VAs
+	// Idempotent: tracking the same VA multiple times (e.g., on retry) has no effect
+	r.Datastore.NamespaceTrack("VariantAutoscaling", va.Name, va.Namespace)
 	logger.Info("Reconciling VariantAutoscaling",
 		"name", va.Name,
 		"namespace", va.Namespace,
@@ -147,6 +136,7 @@ func (r *VariantAutoscalingReconciler) Reconcile(ctx context.Context, req ctrl.R
 
 	// Fetch scale target Deployment
 	scaleTargetName := va.GetScaleTargetName()
+
 	var deployment appsv1.Deployment
 	if err := utils.GetDeploymentWithBackoff(ctx, r.Client, scaleTargetName, va.Namespace, &deployment); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -161,7 +151,7 @@ func (r *VariantAutoscalingReconciler) Reconcile(ctx context.Context, req ctrl.R
 				llmdVariantAutoscalingV1alpha1.ReasonTargetNotFound,
 				fmt.Sprintf("Scale target Deployment %s not found", scaleTargetName))
 
-			if err := r.Status().Patch(ctx, &va, client.MergeFrom(originalVA)); err != nil {
+			if err := r.Status().Patch(ctx, &va, client.MergeFrom(fullDesiredAllocPatchBase(originalVA, &va))); err != nil {
 				logger.Error(err, "Failed to update VariantAutoscaling status")
 				return ctrl.Result{}, err
 			}
@@ -190,7 +180,15 @@ func (r *VariantAutoscalingReconciler) Reconcile(ctx context.Context, req ctrl.R
 	// Process Engine Decisions from Shared Cache
 	// This mechanism allows the Engine to trigger updates without touching the API server directly.
 	if decision, ok := common.DecisionCache.Get(va.Name, va.Namespace); ok {
-		logger.Info("Found decision in cache", "va", va.Name, "namespace", va.Namespace, "metricsAvailable", decision.MetricsAvailable)
+		// Log scaling outcome and reason for E2E and operator debugging (why did/didn't scaling happen).
+		logger.Info("Applying scaling decision from cache",
+			"va", va.Name,
+			"namespace", va.Namespace,
+			"desiredReplicas", decision.TargetReplicas,
+			"metricsAvailable", decision.MetricsAvailable,
+			"metricsReason", decision.MetricsReason,
+			"metricsMessage", decision.MetricsMessage,
+			"reason", decision.Reason)
 		// Only apply if the decision is fresher than the last one applied or if we haven't applied it
 		// Note: We blindly apply for now, assuming the Engine acts as the source of truth for "Desired" state
 		numReplicas, accelerator, lastRunTime := common.DecisionToOptimizedAlloc(decision)
@@ -204,6 +202,11 @@ func (r *VariantAutoscalingReconciler) Reconcile(ctx context.Context, req ctrl.R
 				Accelerator: accelerator,
 				LastRunTime: lastRunTime,
 			}
+		} else {
+			// When we have a partial decision (no accelerator yet), explicitly preserve
+			// the existing DesiredOptimizedAlloc from the fetched object to avoid
+			// sending zero-valued struct in the patch which would fail CRD validation.
+			va.Status.DesiredOptimizedAlloc = originalVA.Status.DesiredOptimizedAlloc
 		}
 
 		// Always apply MetricsAvailable condition from cache
@@ -223,9 +226,12 @@ func (r *VariantAutoscalingReconciler) Reconcile(ctx context.Context, req ctrl.R
 		logger.Info("No decision found in cache for VA", "va", va.Name, "namespace", va.Namespace)
 	}
 
-	// Update Status if we have changes (Conditions or OptimizedAlloc)
-	// We use Patch to only send changed fields, avoiding validation errors on unchanged fields
-	if err := r.Status().Patch(ctx, &va, client.MergeFrom(originalVA)); err != nil {
+	// Patch status — use fullDesiredAllocPatchBase to ensure the complete
+	// desiredOptimizedAlloc object is always included in the merge patch.
+	// Without this, MergeFrom only includes changed fields within the struct,
+	// and the CRD validates the partial patch — rejecting it when required
+	// fields (numReplicas, accelerator) are absent. See: #731
+	if err := r.Status().Patch(ctx, &va, client.MergeFrom(fullDesiredAllocPatchBase(originalVA, &va))); err != nil {
 		logger.Error(err, "Failed to update VariantAutoscaling status",
 			"name", va.Name)
 		return ctrl.Result{}, err
@@ -236,9 +242,27 @@ func (r *VariantAutoscalingReconciler) Reconcile(ctx context.Context, req ctrl.R
 	return ctrl.Result{}, nil
 }
 
+// fullDesiredAllocPatchBase returns a patch base that forces the full
+// desiredOptimizedAlloc object into the JSON merge patch. Without this,
+// MergeFrom only includes changed fields within nested structs, and the
+// CRD validates the partial patch — rejecting it when required fields
+// (numReplicas, accelerator) are absent from the partial object.
+// When desiredOptimizedAlloc hasn't been set yet (accelerator is empty),
+// the base is left unchanged so the zero-valued struct is not included.
+func fullDesiredAllocPatchBase(originalVA *llmdVariantAutoscalingV1alpha1.VariantAutoscaling, va *llmdVariantAutoscalingV1alpha1.VariantAutoscaling) *llmdVariantAutoscalingV1alpha1.VariantAutoscaling {
+	base := originalVA.DeepCopy()
+	if va.Status.DesiredOptimizedAlloc.Accelerator != "" {
+		// Zero out the base so the entire modified desiredOptimizedAlloc
+		// appears as a change and is fully included in the merge patch.
+		base.Status.DesiredOptimizedAlloc = llmdVariantAutoscalingV1alpha1.OptimizedAlloc{}
+	}
+	return base
+}
+
 // handleDeploymentEvent maps Deployment events to VA reconcile requests.
 // When a Deployment is created, this finds any VAs that reference it and triggers reconciliation.
 // This handles the race condition where VA is created before its target deployment.
+// Uses custom indexes for efficient VA lookup instead of listing all VAs.
 func (r *VariantAutoscalingReconciler) handleDeploymentEvent(ctx context.Context, obj client.Object) []reconcile.Request {
 	deploy, ok := obj.(*appsv1.Deployment)
 	if !ok {
@@ -247,108 +271,38 @@ func (r *VariantAutoscalingReconciler) handleDeploymentEvent(ctx context.Context
 
 	logger := ctrl.LoggerFrom(ctx)
 
-	// List all VAs in the same namespace
-	var vaList llmdVariantAutoscalingV1alpha1.VariantAutoscalingList
-	if err := r.List(ctx, &vaList, client.InNamespace(deploy.Namespace)); err != nil {
-		logger.Error(err, "Failed to list VAs for deployment event")
+	// Use indexed lookup for VA targeting this Deployment
+	va, err := indexers.FindVAForDeployment(ctx, r.Client, deploy.Name, deploy.Namespace)
+	if err != nil {
+		logger.Error(err, "Failed to find VA for deployment event using index")
 		return nil
 	}
 
-	// Find VAs that reference this deployment
-	var requests []reconcile.Request
-	for _, va := range vaList.Items {
-		if va.GetScaleTargetName() == deploy.Name {
-			logger.V(logging.DEBUG).Info("Deployment created, triggering VA reconciliation",
-				"deployment", deploy.Name,
-				"va", va.Name,
-				"namespace", deploy.Namespace)
-			requests = append(requests, reconcile.Request{
-				NamespacedName: client.ObjectKey{
-					Namespace: va.Namespace,
-					Name:      va.Name,
-				},
-			})
-		}
+	if va == nil {
+		return nil
 	}
 
-	return requests
+	logger.V(logging.DEBUG).Info("Deployment created, triggering VA reconciliation",
+		"deployment", deploy.Name,
+		"va", va.Name,
+		"namespace", deploy.Namespace)
+
+	return []reconcile.Request{{
+		NamespacedName: client.ObjectKey{
+			Namespace: deploy.Namespace,
+			Name:      va.Name,
+		},
+	}}
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *VariantAutoscalingReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&llmdVariantAutoscalingV1alpha1.VariantAutoscaling{},
-			// Filter VAs by controller-instance label for multi-controller isolation
-			builder.WithPredicates(VariantAutoscalingPredicate()),
+			// Filter VAs by controller-instance label and namespace exclusion
+			builder.WithPredicates(VariantAutoscalingPredicate(mgr.GetClient(), r.Config)),
 		).
-		// Watch the specific ConfigMap to trigger global reconcile and update shared config
-		Watches(
-			&corev1.ConfigMap{},
-			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
-				// We expect a ConfigMap but check to be safe
-				cm, ok := obj.(*corev1.ConfigMap)
-				if !ok {
-					return nil
-				}
-
-				logger := ctrl.LoggerFrom(ctx)
-				name := cm.GetName()
-				namespace := cm.GetNamespace()
-
-				// Only interested in config maps in the configured namespace
-				if namespace != configMapNamespace {
-					return nil
-				}
-
-				if name == getConfigMapName() {
-					// Optimization Config (Global Interval)
-					if interval, ok := cm.Data["GLOBAL_OPT_INTERVAL"]; ok {
-						common.Config.UpdateOptimizationConfig(interval)
-						logger.Info("Updated global optimization config from ConfigMap", "interval", interval)
-					}
-					// Global config update is handled by the Engine loop which reads the new configuration.
-					// No need to trigger immediate reconciliation for individual VAs.
-					return nil
-				} else if name == getSaturationConfigMapName() {
-					// Saturation Scaling Config
-					configs := make(map[string]interfaces.SaturationScalingConfig)
-					count := 0
-					for key, yamlStr := range cm.Data {
-						var satConfig interfaces.SaturationScalingConfig
-						if err := yaml.Unmarshal([]byte(yamlStr), &satConfig); err != nil {
-							logger.Error(err, "Failed to parse saturation scaling config entry", "key", key)
-							continue
-						}
-						// Validate
-						if err := satConfig.Validate(); err != nil {
-							logger.Error(err, "Invalid saturation scaling config entry", "key", key)
-							continue
-						}
-						configs[key] = satConfig
-						count++
-					}
-					common.Config.UpdateSaturationConfig(configs)
-					logger.Info("Updated global saturation config from ConfigMap", "entries", count)
-
-					// Global saturation config update is handled by the Engine loop.
-					// No need to trigger immediate reconciliation for individual VAs.
-					return nil
-				} else if name == config.DefaultScaleToZeroConfigMapName {
-					// Scale-to-Zero Config
-					scaleToZeroConfig := config.ParseScaleToZeroConfigMap(cm.Data)
-					common.Config.UpdateScaleToZeroConfig(scaleToZeroConfig)
-					logger.Info("Updated global scale-to-zero config from ConfigMap", "modelCount", len(scaleToZeroConfig))
-
-					// Global config update is handled by the Engine loop.
-					// No need to trigger immediate reconciliation for individual VAs.
-					return nil
-				}
-
-				return nil
-			}),
-			// Predicate to filter only the target configmap
-			builder.WithPredicates(ConfigMapPredicate()),
-		).
+		// Note: ConfigMap watching is now handled by ConfigMapReconciler
 		// Watch ServiceMonitor for controller's own metrics
 		Watches(
 			&promoperator.ServiceMonitor{},

@@ -23,18 +23,21 @@ package collector
 import (
 	"context"
 	"fmt"
+	"math"
+	"strconv"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	llmdVariantAutoscalingV1alpha1 "github.com/llm-d-incubation/workload-variant-autoscaler/api/v1alpha1"
-	"github.com/llm-d-incubation/workload-variant-autoscaler/internal/collector/registration"
-	"github.com/llm-d-incubation/workload-variant-autoscaler/internal/collector/source"
-	"github.com/llm-d-incubation/workload-variant-autoscaler/internal/interfaces"
-	"github.com/llm-d-incubation/workload-variant-autoscaler/internal/logging"
-	"github.com/llm-d-incubation/workload-variant-autoscaler/internal/saturation"
+	llmdVariantAutoscalingV1alpha1 "github.com/llm-d/llm-d-workload-variant-autoscaler/api/v1alpha1"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/collector/registration"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/collector/source"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/interfaces"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/logging"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/saturation"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/utils"
 )
 
 // ReplicaMetricsCollector collects replica-level metrics for saturation analysis
@@ -65,9 +68,9 @@ func NewReplicaMetricsCollector(metricsSource source.MetricsSource, k8sClient cl
 //   - ctx: Context for the operation
 //   - modelID: The model identifier to collect metrics for
 //   - namespace: The namespace where the model is deployed
-//   - deployments: Map of deployment name to deployment object
-//   - variantAutoscalings: Map of deployment name to VA object
-//   - variantCosts: Map of deployment name to cost value
+//   - deployments: Map of Deployment namespace/name to Deployment
+//   - variantAutoscalings: Map of VariantAutoscaling namespace/name to VariantAutoscaling object
+//   - variantCosts: Map of VariantAutoscaling namespace/name to cost value
 //
 // Returns:
 //   - []interfaces.ReplicaMetrics: Per-pod metrics for saturation analysis
@@ -87,10 +90,14 @@ func (c *ReplicaMetricsCollector) CollectReplicaMetrics(
 		source.ParamNamespace: namespace,
 	}
 
-	// Refresh saturation queries (KV cache and queue length)
+	// Refresh saturation queries (KV cache, queue length, and V2 token capacity queries)
 	queries := []string{
 		registration.QueryKvCacheUsage,
 		registration.QueryQueueLength,
+		registration.QueryCacheConfigInfo,
+		registration.QueryAvgOutputTokens,
+		registration.QueryAvgInputTokens,
+		registration.QueryPrefixCacheHitRate,
 	}
 
 	results, err := c.source.Refresh(ctx, source.RefreshSpec{
@@ -109,6 +116,13 @@ func (c *ReplicaMetricsCollector) CollectReplicaMetrics(
 		queueLen       int
 		queueTimestamp time.Time
 		hasQueue       bool
+		// V2 fields for token-based capacity analysis
+		numGpuBlocks       int64
+		blockSize          int64
+		avgOutputTokens    float64
+		avgInputTokens     float64
+		prefixCacheHitRate float64
+		hasCacheConfig     bool
 	}
 
 	// Extract per-pod metrics from results
@@ -169,6 +183,114 @@ func (c *ReplicaMetricsCollector) CollectReplicaMetrics(
 		}
 	}
 
+	// Process cache config info results (V2)
+	if result := results[registration.QueryCacheConfigInfo]; result != nil {
+		if !result.HasError() {
+			for _, value := range result.Values {
+				podName := value.Labels["pod"]
+				if podName == "" {
+					podName = value.Labels["pod_name"]
+				}
+				if podName == "" {
+					continue
+				}
+
+				if podData[podName] == nil {
+					podData[podName] = &podMetricData{}
+				}
+
+				// Parse num_gpu_blocks and block_size from string labels
+				if blocksStr, ok := value.Labels["num_gpu_blocks"]; ok && blocksStr != "" {
+					if blocks, err := strconv.ParseInt(blocksStr, 10, 64); err == nil {
+						podData[podName].numGpuBlocks = blocks
+					}
+				}
+				if sizeStr, ok := value.Labels["block_size"]; ok && sizeStr != "" {
+					if size, err := strconv.ParseInt(sizeStr, 10, 64); err == nil {
+						podData[podName].blockSize = size
+					}
+				}
+				if podData[podName].numGpuBlocks > 0 && podData[podName].blockSize > 0 {
+					podData[podName].hasCacheConfig = true
+				}
+
+				logger.V(logging.DEBUG).Info("Cache config info metric",
+					"pod", podName,
+					"numGpuBlocks", podData[podName].numGpuBlocks,
+					"blockSize", podData[podName].blockSize)
+			}
+		}
+	}
+
+	// Process average output tokens results (V2)
+	if result := results[registration.QueryAvgOutputTokens]; result != nil {
+		if !result.HasError() {
+			for _, value := range result.Values {
+				podName := value.Labels["pod"]
+				if podName == "" {
+					podName = value.Labels["pod_name"]
+				}
+				if podName == "" {
+					continue
+				}
+
+				if podData[podName] == nil {
+					podData[podName] = &podMetricData{}
+				}
+				// NaN check: rate division by zero produces NaN
+				if !math.IsNaN(value.Value) && !math.IsInf(value.Value, 0) {
+					podData[podName].avgOutputTokens = value.Value
+				}
+			}
+		}
+	}
+
+	// Process average input tokens results (V2)
+	if result := results[registration.QueryAvgInputTokens]; result != nil {
+		if !result.HasError() {
+			for _, value := range result.Values {
+				podName := value.Labels["pod"]
+				if podName == "" {
+					podName = value.Labels["pod_name"]
+				}
+				if podName == "" {
+					continue
+				}
+
+				if podData[podName] == nil {
+					podData[podName] = &podMetricData{}
+				}
+				// NaN check: rate division by zero produces NaN
+				if !math.IsNaN(value.Value) && !math.IsInf(value.Value, 0) {
+					podData[podName].avgInputTokens = value.Value
+				}
+			}
+		}
+	}
+
+	// Process prefix cache hit rate results (V2)
+	if result := results[registration.QueryPrefixCacheHitRate]; result != nil {
+		if !result.HasError() {
+			for _, value := range result.Values {
+				podName := value.Labels["pod"]
+				if podName == "" {
+					podName = value.Labels["pod_name"]
+				}
+				if podName == "" {
+					continue
+				}
+
+				if podData[podName] == nil {
+					podData[podName] = &podMetricData{}
+				}
+				// NaN check: rate division by zero produces NaN when no prefix cache queries
+				if !math.IsNaN(value.Value) && !math.IsInf(value.Value, 0) && value.Value >= 0 && value.Value <= 1 {
+					podData[podName].prefixCacheHitRate = value.Value
+				}
+			}
+		}
+	}
+
 	// Build replica metrics from pod data
 	replicaMetrics := make([]interfaces.ReplicaMetrics, 0, len(podData))
 	collectedAt := time.Now()
@@ -197,43 +319,71 @@ func (c *ReplicaMetricsCollector) CollectReplicaMetrics(
 			queueLen = 0
 		}
 
-		// Match pod to variant using deployment label selectors
-		variantName := c.podVAMapper.FindVAForPod(ctx, podName, namespace, deployments, variantAutoscalings)
+		// Match Pod to VariantAutoscaling using indexed lookup
+		vaName := c.podVAMapper.FindVAForPod(ctx, podName, namespace, deployments)
 
-		if variantName == "" {
+		if vaName == "" {
 			logger.Info("Skipping pod that doesn't match any deployment",
 				"pod", podName,
 				"deployments", getDeploymentNames(deployments))
 			continue
 		}
+		variantKey := utils.GetNamespacedKey(namespace, vaName)
 
 		// Get accelerator name from VariantAutoscaling label
 		acceleratorName := ""
-		if va, ok := variantAutoscalings[variantName]; ok && va != nil {
+		if va, ok := variantAutoscalings[variantKey]; ok && va != nil {
 			if va.Labels != nil {
-				if accName, exists := va.Labels["inference.optimization/acceleratorName"]; exists {
+				if accName, exists := va.Labels[utils.AcceleratorNameLabel]; exists {
 					acceleratorName = accName
 				}
 			}
 		}
 
-		// Look up cost by variant name
+		// Look up cost by VariantAutoscaling namespace/name
 		cost := saturation.DefaultVariantCost
 		if variantCosts != nil {
-			if c, ok := variantCosts[variantName]; ok {
+			if c, ok := variantCosts[variantKey]; ok {
 				cost = c
 			}
 		}
 
+		// Compute V2 derived fields (zero-valued when unavailable, backward compatible)
+		var totalKvCapacityTokens int64
+		var tokensInUse int64
+		if data.hasCacheConfig {
+			// Overflow-safe multiplication: check before computing
+			if data.numGpuBlocks > 0 && data.blockSize > math.MaxInt64/data.numGpuBlocks {
+				totalKvCapacityTokens = math.MaxInt64
+			} else {
+				totalKvCapacityTokens = data.numGpuBlocks * data.blockSize
+			}
+			// Use math.Round for accurate float-to-int conversion and clamp to valid range
+			rounded := math.Round(kvUsage * float64(totalKvCapacityTokens))
+			if rounded < 0 {
+				rounded = 0
+			} else if rounded > float64(totalKvCapacityTokens) {
+				rounded = float64(totalKvCapacityTokens)
+			}
+			tokensInUse = int64(rounded)
+		}
+
 		metric := interfaces.ReplicaMetrics{
-			PodName:         podName,
-			ModelID:         modelID,
-			Namespace:       namespace,
-			VariantName:     variantName,
-			AcceleratorName: acceleratorName,
-			KvCacheUsage:    kvUsage,
-			QueueLength:     queueLen,
-			Cost:            cost,
+			PodName:               podName,
+			ModelID:               modelID,
+			Namespace:             namespace,
+			VariantName:           vaName,
+			AcceleratorName:       acceleratorName,
+			KvCacheUsage:          kvUsage,
+			QueueLength:           queueLen,
+			Cost:                  cost,
+			NumGpuBlocks:          data.numGpuBlocks,
+			BlockSize:             data.blockSize,
+			TotalKvCapacityTokens: totalKvCapacityTokens,
+			TokensInUse:           tokensInUse,
+			AvgOutputTokens:       data.avgOutputTokens,
+			AvgInputTokens:        data.avgInputTokens,
+			PrefixCacheHitRate:    data.prefixCacheHitRate,
 			Metadata: &interfaces.ReplicaMetricsMetadata{
 				CollectedAt:     collectedAt,
 				Age:             0, // Fresh
@@ -252,11 +402,76 @@ func (c *ReplicaMetricsCollector) CollectReplicaMetrics(
 	return replicaMetrics, nil
 }
 
+// CollectSchedulerQueueMetrics collects model-level queue metrics from the
+// llm-d inference scheduler flow control layer. These metrics are not per-pod
+// but per-model, representing requests queued upstream before reaching vLLM.
+// Returns nil (not an error) when flow control metrics are unavailable.
+func (c *ReplicaMetricsCollector) CollectSchedulerQueueMetrics(
+	ctx context.Context,
+	modelID string,
+) *interfaces.SchedulerQueueMetrics {
+	logger := ctrl.LoggerFrom(ctx)
+
+	params := map[string]string{
+		source.ParamModelID: modelID,
+	}
+
+	queries := []string{
+		registration.QuerySchedulerQueueSize,
+		registration.QuerySchedulerQueueBytes,
+	}
+
+	results, err := c.source.Refresh(ctx, source.RefreshSpec{
+		Queries: queries,
+		Params:  params,
+	})
+	if err != nil {
+		logger.V(logging.DEBUG).Info("Scheduler queue metrics unavailable",
+			"modelID", modelID, "error", err)
+		return nil
+	}
+
+	var queueSize, queueBytes int64
+	hasData := false
+
+	if result := results[registration.QuerySchedulerQueueSize]; result != nil && !result.HasError() {
+		for _, value := range result.Values {
+			if !math.IsNaN(value.Value) && !math.IsInf(value.Value, 0) {
+				queueSize += int64(value.Value)
+				hasData = true
+			}
+		}
+	}
+
+	if result := results[registration.QuerySchedulerQueueBytes]; result != nil && !result.HasError() {
+		for _, value := range result.Values {
+			if !math.IsNaN(value.Value) && !math.IsInf(value.Value, 0) {
+				queueBytes += int64(value.Value)
+				hasData = true
+			}
+		}
+	}
+
+	if !hasData {
+		return nil
+	}
+
+	logger.V(logging.DEBUG).Info("Collected scheduler queue metrics",
+		"modelID", modelID,
+		"queueSize", queueSize,
+		"queueBytes", queueBytes)
+
+	return &interfaces.SchedulerQueueMetrics{
+		QueueSize:  queueSize,
+		QueueBytes: queueBytes,
+	}
+}
+
 // getDeploymentNames extracts deployment names from the deployments map.
 func getDeploymentNames(deployments map[string]*appsv1.Deployment) []string {
 	names := make([]string, 0, len(deployments))
-	for name := range deployments {
-		names = append(names, name)
+	for _, deploy := range deployments {
+		names = append(names, deploy.Name)
 	}
 	return names
 }

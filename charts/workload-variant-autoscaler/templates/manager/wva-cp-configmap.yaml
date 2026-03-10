@@ -16,7 +16,7 @@ kind: ConfigMap
 # - queueSpareTrigger: Scale-up signal if avg spare queue capacity < trigger (integer)
 #
 metadata:
-  name: {{ include "workload-variant-autoscaler.fullname" . }}-saturation-scaling-config
+  name: {{ include "workload-variant-autoscaler.fullname" . }}-wva-saturation-scaling-config
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "workload-variant-autoscaler.labels" . | nindent 4 }}
