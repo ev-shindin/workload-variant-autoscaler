@@ -355,33 +355,20 @@ func (e *Engine) optimizeV1(
 
 		var finalDecisions []interfaces.VariantDecision
 		if saturationAnalysis != nil {
-			// Apply scale-to-zero enforcement after saturation analysis
-			// Get namespace-aware scale-to-zero config (namespace-local > global)
+			// Convert saturation targets to decisions first, then apply enforcer
+			finalDecisions = e.convertSaturationTargetsToDecisions(ctx, saturationTargets, saturationAnalysis, variantStates)
+
+			// Apply scale-to-zero enforcement on decisions
 			scaleToZeroConfig := e.Config.ScaleToZeroConfigForNamespace(namespace)
-
-			// Copy original targets for logging (enforcer modifies map in place)
-			originalTargets := make(map[string]int, len(saturationTargets))
-			for k, v := range saturationTargets {
-				originalTargets[k] = v
-			}
-
-			enforcedTargets, scaledToZero := e.ScaleToZeroEnforcer.EnforcePolicy(
-				ctx,
-				modelID,
-				modelVAs[0].Namespace,
-				saturationTargets,
-				saturationAnalysis.VariantAnalyses,
-				scaleToZeroConfig,
+			scaledToZero := e.ScaleToZeroEnforcer.EnforcePolicyOnDecisions(
+				ctx, modelID, namespace,
+				finalDecisions, scaleToZeroConfig, "v1-saturation",
 			)
 			if scaledToZero {
 				logger.Info("Scale-to-zero enforcement applied",
-					"modelID", modelID,
-					"originalTargets", originalTargets,
-					"enforcedTargets", enforcedTargets)
+					"modelID", modelID)
 			}
-			saturationTargets = enforcedTargets
 
-			finalDecisions = e.convertSaturationTargetsToDecisions(ctx, saturationTargets, saturationAnalysis, variantStates)
 			logger.Info("Saturation-only decisions made for model",
 				"modelID", modelID,
 				"decisionCount", len(finalDecisions))
