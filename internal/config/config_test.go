@@ -9,7 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	interfaces "github.com/llm-d/llm-d-workload-variant-autoscaler/internal/interfaces"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/interfaces"
 )
 
 // TestConfig_ThreadSafeUpdates tests that concurrent reads and writes to DynamicConfig
@@ -71,8 +71,8 @@ func TestConfig_ThreadSafeUpdates(t *testing.T) {
 			for j := 0; j < iterations; j++ {
 
 				// Update saturation config
-				newSatConfig := make(map[string]interfaces.SaturationScalingConfig)
-				newSatConfig["test-accelerator"] = interfaces.SaturationScalingConfig{
+				newSatConfig := make(map[string]SaturationScalingConfig)
+				newSatConfig["test-accelerator"] = SaturationScalingConfig{
 					KvCacheThreshold:     0.8,
 					QueueLengthThreshold: 5,
 					KvSpareTrigger:       0.1,
@@ -303,7 +303,7 @@ func TestConfig_NamespaceAwareResolutionPrecedence(t *testing.T) {
 	cfg := NewTestConfig()
 
 	// Set up global saturation config
-	globalSatConfig := map[string]interfaces.SaturationScalingConfig{
+	globalSatConfig := map[string]SaturationScalingConfig{
 		"default": {
 			KvCacheThreshold:     0.80,
 			QueueLengthThreshold: 5,
@@ -339,7 +339,7 @@ func TestConfig_NamespaceAwareResolutionPrecedence(t *testing.T) {
 	// Test 2: Namespace-local config takes precedence
 	t.Run("Namespace-local config takes precedence", func(t *testing.T) {
 		// Set namespace-local saturation config
-		nsSatConfig := map[string]interfaces.SaturationScalingConfig{
+		nsSatConfig := map[string]SaturationScalingConfig{
 			"default": {
 				KvCacheThreshold:     0.70, // Different from global (0.80)
 				QueueLengthThreshold: 3,    // Different from global (5)
@@ -388,7 +388,7 @@ func TestConfig_NamespaceConfigDeletion(t *testing.T) {
 	cfg := NewTestConfig()
 
 	// Set up global saturation config
-	globalSatConfig := map[string]interfaces.SaturationScalingConfig{
+	globalSatConfig := map[string]SaturationScalingConfig{
 		"default": {
 			KvCacheThreshold:     0.80,
 			QueueLengthThreshold: 5,
@@ -411,7 +411,7 @@ func TestConfig_NamespaceConfigDeletion(t *testing.T) {
 	namespace := "test-namespace"
 
 	// Set namespace-local config
-	nsSatConfig := map[string]interfaces.SaturationScalingConfig{
+	nsSatConfig := map[string]SaturationScalingConfig{
 		"default": {
 			KvCacheThreshold:     0.70,
 			QueueLengthThreshold: 3,
@@ -451,7 +451,7 @@ func TestConfig_MultipleNamespaces(t *testing.T) {
 	cfg := NewTestConfig()
 
 	// Set up global config
-	globalSatConfig := map[string]interfaces.SaturationScalingConfig{
+	globalSatConfig := map[string]SaturationScalingConfig{
 		"default": {
 			KvCacheThreshold:     0.80,
 			QueueLengthThreshold: 5,
@@ -463,7 +463,7 @@ func TestConfig_MultipleNamespaces(t *testing.T) {
 	namespace2 := "namespace2"
 
 	// Set namespace1 config
-	ns1SatConfig := map[string]interfaces.SaturationScalingConfig{
+	ns1SatConfig := map[string]SaturationScalingConfig{
 		"default": {
 			KvCacheThreshold:     0.70,
 			QueueLengthThreshold: 3,
@@ -472,7 +472,7 @@ func TestConfig_MultipleNamespaces(t *testing.T) {
 	cfg.UpdateSaturationConfigForNamespace(namespace1, ns1SatConfig)
 
 	// Set namespace2 config
-	ns2SatConfig := map[string]interfaces.SaturationScalingConfig{
+	ns2SatConfig := map[string]SaturationScalingConfig{
 		"default": {
 			KvCacheThreshold:     0.90,
 			QueueLengthThreshold: 7,

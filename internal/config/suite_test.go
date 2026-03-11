@@ -1,4 +1,4 @@
-package interfaces
+package config
 
 import (
 	"testing"
@@ -7,7 +7,7 @@ import (
 	. "github.com/onsi/gomega"
 )
 
-func TestInterfaces(t *testing.T) {
+func TestConfigSuite(t *testing.T) {
 	RegisterFailHandler(Fail)
-	RunSpecs(t, "Interfaces Suite")
+	RunSpecs(t, "Config Suite")
 }

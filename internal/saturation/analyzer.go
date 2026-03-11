@@ -7,6 +7,7 @@ import (
 
 	ctrl "sigs.k8s.io/controller-runtime"
 
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/config"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/interfaces"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/logging"
 )
@@ -33,7 +34,7 @@ func (a *Analyzer) AnalyzeModelSaturation(
 	modelID string,
 	namespace string,
 	replicaMetrics []interfaces.ReplicaMetrics,
-	config interfaces.SaturationScalingConfig,
+	config config.SaturationScalingConfig,
 ) (*interfaces.ModelSaturationAnalysis, error) {
 
 	if len(replicaMetrics) == 0 {
@@ -135,7 +136,7 @@ func (a *Analyzer) analyzeVariant(
 	ctx context.Context,
 	variantName string,
 	metrics []interfaces.ReplicaMetrics,
-	config interfaces.SaturationScalingConfig,
+	config config.SaturationScalingConfig,
 ) interfaces.VariantSaturationAnalysis {
 
 	analysis := interfaces.VariantSaturationAnalysis{
@@ -199,7 +200,7 @@ func (a *Analyzer) analyzeVariant(
 func (a *Analyzer) shouldScaleUp(
 	avgSpareKv float64,
 	avgSpareQueue float64,
-	config interfaces.SaturationScalingConfig,
+	config config.SaturationScalingConfig,
 ) (bool, string) {
 
 	kvTriggered := avgSpareKv < config.KvSpareTrigger
@@ -235,7 +236,7 @@ func (a *Analyzer) isScaleDownSafe(
 	nonSaturatedCount int,
 	avgSpareKv float64,
 	avgSpareQueue float64,
-	config interfaces.SaturationScalingConfig,
+	config config.SaturationScalingConfig,
 ) bool {
 
 	// Require minimum non-saturated replicas for scale-down safety

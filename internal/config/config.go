@@ -7,7 +7,7 @@ import (
 
 	ctrl "sigs.k8s.io/controller-runtime"
 
-	interfaces "github.com/llm-d/llm-d-workload-variant-autoscaler/internal/interfaces"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/interfaces"
 )
 
 // Config is the unified configuration structure for the WVA controller.
@@ -75,7 +75,7 @@ type featureFlagsConfig struct {
 
 // SaturationScalingConfigPerModel represents saturation scaling configuration
 // for all models. Maps model ID (or "default" key) to its configuration.
-type SaturationScalingConfigPerModel map[string]interfaces.SaturationScalingConfig
+type SaturationScalingConfigPerModel map[string]SaturationScalingConfig
 
 // QMAnalyzerConfigPerModel represents queueing model scaling configuration
 // for all models. Maps model ID (or "default" key) to its configuration.
@@ -310,13 +310,13 @@ func (c *Config) ScaleFromZeroMaxConcurrency() int {
 // SaturationConfig returns the current global saturation scaling configuration.
 // Thread-safe. Returns a copy to prevent external modifications.
 // For namespace-aware lookups, use SaturationConfigForNamespace instead.
-func (c *Config) SaturationConfig() map[string]interfaces.SaturationScalingConfig {
+func (c *Config) SaturationConfig() map[string]SaturationScalingConfig {
 	return c.SaturationConfigForNamespace("")
 }
 
 // resolveSaturationConfig resolves saturation config for a namespace (namespace-local > global).
 // Must be called while holding at least a read lock.
-func (c *Config) resolveSaturationConfig(namespace string) map[string]interfaces.SaturationScalingConfig {
+func (c *Config) resolveSaturationConfig(namespace string) map[string]SaturationScalingConfig {
 	// Check namespace-local first (if namespace is provided)
 	if namespace != "" {
 		if nsConfig, exists := c.saturation.namespaceConfigs[namespace]; exists {
@@ -358,7 +358,7 @@ func (c *Config) resolveScaleToZeroConfig(namespace string) ScaleToZeroConfigDat
 // Resolution order: namespace-local > global
 // Thread-safe. Returns a copy to prevent external modifications.
 // If namespace is empty, returns global config.
-func (c *Config) SaturationConfigForNamespace(namespace string) map[string]interfaces.SaturationScalingConfig {
+func (c *Config) SaturationConfigForNamespace(namespace string) map[string]SaturationScalingConfig {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	sourceConfig := c.resolveSaturationConfig(namespace)
@@ -366,11 +366,11 @@ func (c *Config) SaturationConfigForNamespace(namespace string) map[string]inter
 }
 
 // copySaturationConfig creates a deep copy of the saturation config map.
-func copySaturationConfig(src map[string]interfaces.SaturationScalingConfig) map[string]interfaces.SaturationScalingConfig {
+func copySaturationConfig(src map[string]SaturationScalingConfig) map[string]SaturationScalingConfig {
 	if src == nil {
-		return make(map[string]interfaces.SaturationScalingConfig)
+		return make(map[string]SaturationScalingConfig)
 	}
-	result := make(map[string]interfaces.SaturationScalingConfig, len(src))
+	result := make(map[string]SaturationScalingConfig, len(src))
 	for k, v := range src {
 		result[k] = v
 	}
@@ -410,19 +410,19 @@ func copyScaleToZeroConfig(src ScaleToZeroConfigData) ScaleToZeroConfigData {
 // UpdateSaturationConfig updates the global saturation scaling configuration.
 // Thread-safe. Takes a copy of the provided map to prevent external modifications.
 // For namespace-local updates, use UpdateSaturationConfigForNamespace instead.
-func (c *Config) UpdateSaturationConfig(config map[string]interfaces.SaturationScalingConfig) {
+func (c *Config) UpdateSaturationConfig(config map[string]SaturationScalingConfig) {
 	c.UpdateSaturationConfigForNamespace("", config)
 }
 
 // UpdateSaturationConfigForNamespace updates the saturation scaling configuration for the given namespace.
 // If namespace is empty, updates global config.
 // Thread-safe. Takes a copy of the provided map to prevent external modifications.
-func (c *Config) UpdateSaturationConfigForNamespace(namespace string, config map[string]interfaces.SaturationScalingConfig) {
+func (c *Config) UpdateSaturationConfigForNamespace(namespace string, config map[string]SaturationScalingConfig) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	// Make a copy to prevent external modifications
-	newConfig := make(map[string]interfaces.SaturationScalingConfig, len(config))
+	newConfig := make(map[string]SaturationScalingConfig, len(config))
 	maps.Copy(newConfig, config)
 
 	var oldCount int

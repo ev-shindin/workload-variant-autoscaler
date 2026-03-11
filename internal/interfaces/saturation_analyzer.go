@@ -286,7 +286,7 @@ type SaturationAnalyzer interface {
 		modelID string,
 		namespace string,
 		replicaMetrics []ReplicaMetrics,
-		config SaturationScalingConfig,
+		config AnalyzerConfig,
 	) (*ModelSaturationAnalysis, error)
 
 	// CalculateSaturationTargets determines target replicas per variant based on saturation analysis.

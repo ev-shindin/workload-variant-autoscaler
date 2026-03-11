@@ -215,7 +215,7 @@ data:
 			sourceRegistry.Register("prometheus", promSource) // nolint:errcheck
 			// Create minimal test config with saturation config
 			testConfig := config.NewTestConfig()
-			testConfig.UpdateSaturationConfig(map[string]interfaces.SaturationScalingConfig{
+			testConfig.UpdateSaturationConfig(map[string]config.SaturationScalingConfig{
 				"default": {},
 			})
 			engine := NewEngine(k8sClient, k8sClient.Scheme(), nil, sourceRegistry, testConfig)
@@ -445,7 +445,7 @@ data:
 			// Initialize legacy MetricsCollector for non-saturation metrics
 			// Create minimal test config with saturation config
 			testConfig := config.NewTestConfig()
-			testConfig.UpdateSaturationConfig(map[string]interfaces.SaturationScalingConfig{
+			testConfig.UpdateSaturationConfig(map[string]config.SaturationScalingConfig{
 				"default": {},
 			})
 			engine := NewEngine(k8sClient, k8sClient.Scheme(), nil, sourceRegistry, testConfig)

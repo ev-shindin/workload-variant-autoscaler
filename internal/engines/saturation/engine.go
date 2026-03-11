@@ -52,9 +52,9 @@ import (
 // resolveSaturationConfig resolves config for a model.
 // Lookup: "{modelID}#{namespace}" → "default" → zero-value with defaults.
 func resolveSaturationConfig(
-	configMap map[string]interfaces.SaturationScalingConfig,
+	configMap map[string]config.SaturationScalingConfig,
 	modelID, namespace string,
-) interfaces.SaturationScalingConfig {
+) config.SaturationScalingConfig {
 	if cfg, ok := configMap[modelID+"#"+namespace]; ok {
 		cfg.ApplyDefaults()
 		return cfg
@@ -63,7 +63,7 @@ func resolveSaturationConfig(
 		cfg.ApplyDefaults()
 		return cfg
 	}
-	cfg := interfaces.SaturationScalingConfig{}
+	cfg := config.SaturationScalingConfig{}
 	cfg.ApplyDefaults()
 	return cfg
 }
@@ -382,7 +382,7 @@ func (e *Engine) optimizeV1(
 	// Apply GPU limiter if enabled
 	// Note: Limiter uses global saturation config since it's applied globally to all decisions
 	globalSaturationConfigMap := e.Config.SaturationConfig()
-	var globalSaturationConfig interfaces.SaturationScalingConfig
+	var globalSaturationConfig config.SaturationScalingConfig
 	if len(globalSaturationConfigMap) > 0 {
 		if cfg, ok := globalSaturationConfigMap["default"]; ok {
 			globalSaturationConfig = cfg
@@ -811,7 +811,7 @@ func (e *Engine) RunSaturationAnalysis(
 	ctx context.Context,
 	modelID string,
 	modelVAs []llmdVariantAutoscalingV1alpha1.VariantAutoscaling,
-	SaturationConfig interfaces.SaturationScalingConfig,
+	SaturationConfig config.SaturationScalingConfig,
 	k8sClient client.Client,
 ) (map[string]int, *interfaces.ModelSaturationAnalysis, []interfaces.VariantReplicaState, error) {
 	logger := ctrl.LoggerFrom(ctx)

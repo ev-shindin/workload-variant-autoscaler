@@ -26,7 +26,7 @@ import (
 
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/config"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/constants"
-	interfaces "github.com/llm-d/llm-d-workload-variant-autoscaler/internal/interfaces"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/interfaces"
 )
 
 // parseSaturationConfig parses saturation scaling configuration from ConfigMap data.
@@ -35,7 +35,7 @@ func parseSaturationConfig(cmData map[string]string, logger logr.Logger) (config
 	configs := make(config.SaturationScalingConfigPerModel)
 	count := 0
 	for key, yamlStr := range cmData {
-		var satConfig interfaces.SaturationScalingConfig
+		var satConfig config.SaturationScalingConfig
 		if err := yaml.Unmarshal([]byte(yamlStr), &satConfig); err != nil {
 			logger.Error(err, "Failed to parse saturation scaling config entry", "key", key)
 			continue

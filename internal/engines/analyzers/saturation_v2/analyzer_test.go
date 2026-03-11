@@ -6,6 +6,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/config"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/interfaces"
 )
 
@@ -770,7 +771,7 @@ var _ = Describe("SaturationAnalyzer", func() {
 					{VariantName: "prefill-v", CurrentReplicas: 1, GPUsPerReplica: 1, Role: "prefill"},
 					{VariantName: "decode-v", CurrentReplicas: 1, GPUsPerReplica: 1, Role: "decode"},
 				},
-				Config: &interfaces.SaturationScalingConfig{
+				Config: &config.SaturationScalingConfig{
 					KvCacheThreshold:     0.8,
 					QueueLengthThreshold: 5,
 					AnalyzerName:         "saturation",
@@ -833,7 +834,7 @@ func makeAnalyzerInput(
 	metrics []interfaces.ReplicaMetrics,
 	states []interfaces.VariantReplicaState,
 ) interfaces.AnalyzerInput {
-	config := &interfaces.SaturationScalingConfig{
+	config := &config.SaturationScalingConfig{
 		KvCacheThreshold:     0.8,
 		QueueLengthThreshold: 5,
 		KvSpareTrigger:       0.1,
@@ -897,7 +898,7 @@ var _ = Describe("aggregateByRole", func() {
 			{VariantName: "v1", Role: "both", TotalCapacity: 10000, TotalDemand: 5000, ReplicaCount: 1, PerReplicaCapacity: 10000},
 			{VariantName: "v2", Role: "", TotalCapacity: 20000, TotalDemand: 10000, ReplicaCount: 1, PerReplicaCapacity: 20000},
 		}
-		config := &interfaces.SaturationScalingConfig{
+		config := &config.SaturationScalingConfig{
 			ScaleUpThreshold:  0.85,
 			ScaleDownBoundary: 0.70,
 		}
@@ -910,7 +911,7 @@ var _ = Describe("aggregateByRole", func() {
 			{VariantName: "prefill-v1", Role: "prefill", TotalCapacity: 10000, TotalDemand: 9000, ReplicaCount: 1, PendingReplicas: 0, PerReplicaCapacity: 10000},
 			{VariantName: "decode-v1", Role: "decode", TotalCapacity: 20000, TotalDemand: 5000, ReplicaCount: 2, PendingReplicas: 0, PerReplicaCapacity: 10000},
 		}
-		config := &interfaces.SaturationScalingConfig{
+		config := &config.SaturationScalingConfig{
 			ScaleUpThreshold:  0.85,
 			ScaleDownBoundary: 0.70,
 		}
@@ -939,7 +940,7 @@ var _ = Describe("aggregateByRole", func() {
 			{VariantName: "prefill-v1", Role: "prefill", TotalCapacity: 10000, TotalDemand: 9000, ReplicaCount: 1, PerReplicaCapacity: 10000},
 			{VariantName: "both-v1", Role: "both", TotalCapacity: 10000, TotalDemand: 5000, ReplicaCount: 1, PerReplicaCapacity: 10000},
 		}
-		config := &interfaces.SaturationScalingConfig{
+		config := &config.SaturationScalingConfig{
 			ScaleUpThreshold:  0.85,
 			ScaleDownBoundary: 0.70,
 		}
@@ -955,7 +956,7 @@ var _ = Describe("aggregateByRole", func() {
 			{VariantName: "prefill-v1", Role: "prefill", TotalCapacity: 10000, TotalDemand: 2000, ReplicaCount: 1, PendingReplicas: 0, PerReplicaCapacity: 10000},
 			{VariantName: "decode-v1", Role: "decode", TotalCapacity: 20000, TotalDemand: 3000, ReplicaCount: 2, PendingReplicas: 0, PerReplicaCapacity: 10000},
 		}
-		config := &interfaces.SaturationScalingConfig{
+		config := &config.SaturationScalingConfig{
 			ScaleUpThreshold:  0.85,
 			ScaleDownBoundary: 0.70,
 		}
@@ -979,7 +980,7 @@ var _ = Describe("aggregateByRole", func() {
 		vcs := []interfaces.VariantCapacity{
 			{VariantName: "prefill-v1", Role: "prefill", TotalCapacity: 10000, TotalDemand: 5000, ReplicaCount: 1, PendingReplicas: 0, PerReplicaCapacity: 10000},
 		}
-		config := &interfaces.SaturationScalingConfig{
+		config := &config.SaturationScalingConfig{
 			ScaleUpThreshold:  0.85,
 			ScaleDownBoundary: 0.70,
 		}

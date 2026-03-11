@@ -8,6 +8,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	llmdVariantAutoscalingV1alpha1 "github.com/llm-d/llm-d-workload-variant-autoscaler/api/v1alpha1"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/config"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/engines/pipeline"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/interfaces"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/logging"
@@ -21,7 +22,7 @@ func (e *Engine) runV2AnalysisOnly(
 	ctx context.Context,
 	modelID, namespace string,
 	replicaMetrics []interfaces.ReplicaMetrics,
-	config interfaces.SaturationScalingConfig,
+	config config.SaturationScalingConfig,
 	variantStates []interfaces.VariantReplicaState,
 	deployments map[string]*appsv1.Deployment,
 	variantAutoscalings map[string]*llmdVariantAutoscalingV1alpha1.VariantAutoscaling,
@@ -77,7 +78,7 @@ func (e *Engine) runAnalyzersAndScore(
 	ctx context.Context,
 	modelID, namespace string,
 	replicaMetrics []interfaces.ReplicaMetrics,
-	config interfaces.SaturationScalingConfig,
+	config config.SaturationScalingConfig,
 	variantStates []interfaces.VariantReplicaState,
 	deployments map[string]*appsv1.Deployment,
 	variantAutoscalings map[string]*llmdVariantAutoscalingV1alpha1.VariantAutoscaling,
@@ -153,7 +154,7 @@ func (e *Engine) collectV2ModelRequest(
 	ctx context.Context,
 	modelID, namespace string,
 	replicaMetrics []interfaces.ReplicaMetrics,
-	config interfaces.SaturationScalingConfig,
+	config config.SaturationScalingConfig,
 	variantStates []interfaces.VariantReplicaState,
 	deployments map[string]*appsv1.Deployment,
 	variantAutoscalings map[string]*llmdVariantAutoscalingV1alpha1.VariantAutoscaling,

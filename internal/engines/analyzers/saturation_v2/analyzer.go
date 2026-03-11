@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/config"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/interfaces"
 )
 
@@ -57,7 +58,7 @@ func (a *SaturationAnalyzer) EvictStaleHistory(timeout time.Duration) int {
 
 // Analyze computes capacity signals for a model across all its variants.
 func (a *SaturationAnalyzer) Analyze(ctx context.Context, input interfaces.AnalyzerInput) (*interfaces.AnalyzerResult, error) {
-	satConfig, ok := input.Config.(*interfaces.SaturationScalingConfig)
+	satConfig, ok := input.Config.(*config.SaturationScalingConfig)
 	if !ok {
 		return nil, fmt.Errorf("expected *SaturationScalingConfig, got %T", input.Config)
 	}
@@ -153,7 +154,7 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input interfaces.Analy
 // Returns nil if the replica has no V2 capacity data (TotalKvCapacityTokens == 0).
 func (a *SaturationAnalyzer) computeReplicaCapacity(
 	rm interfaces.ReplicaMetrics,
-	config *interfaces.SaturationScalingConfig,
+	config *config.SaturationScalingConfig,
 	modelID, namespace string,
 	gpuCount int,
 ) *ReplicaCapacity {
@@ -367,7 +368,7 @@ func (a *SaturationAnalyzer) aggregateByVariant(
 // demand attributed to each role (nil when there's no queue demand).
 func (a *SaturationAnalyzer) aggregateByRole(
 	variantCapacities []interfaces.VariantCapacity,
-	config *interfaces.SaturationScalingConfig,
+	config *config.SaturationScalingConfig,
 	queueDemandByRole map[string]float64,
 ) map[string]interfaces.RoleCapacity {
 	// Check if any variant has a non-"both" role

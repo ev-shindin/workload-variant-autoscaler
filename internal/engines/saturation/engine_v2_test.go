@@ -8,6 +8,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/config"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/engines/pipeline"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/interfaces"
 )
@@ -184,7 +185,7 @@ var _ = Describe("getRoleFromDeployment", func() {
 var _ = Describe("resolveSaturationConfig", func() {
 
 	It("should return model-specific config when present", func() {
-		configMap := map[string]interfaces.SaturationScalingConfig{
+		configMap := map[string]config.SaturationScalingConfig{
 			"default": {
 				KvCacheThreshold: 0.80,
 				AnalyzerName:     "saturation",
@@ -201,7 +202,7 @@ var _ = Describe("resolveSaturationConfig", func() {
 	})
 
 	It("should fall back to default config when model-specific not found", func() {
-		configMap := map[string]interfaces.SaturationScalingConfig{
+		configMap := map[string]config.SaturationScalingConfig{
 			"default": {
 				KvCacheThreshold: 0.80,
 				AnalyzerName:     "saturation",
@@ -209,26 +210,26 @@ var _ = Describe("resolveSaturationConfig", func() {
 		}
 		cfg := resolveSaturationConfig(configMap, "unknown-model", "default")
 		Expect(cfg.KvCacheThreshold).To(Equal(0.80))
-		Expect(cfg.Priority).To(Equal(interfaces.DefaultPriority))
+		Expect(cfg.Priority).To(Equal(config.DefaultPriority))
 	})
 
 	It("should return zero-value with defaults when map is empty", func() {
-		configMap := map[string]interfaces.SaturationScalingConfig{}
+		configMap := map[string]config.SaturationScalingConfig{}
 		cfg := resolveSaturationConfig(configMap, "model-1", "ns-1")
-		Expect(cfg.Priority).To(Equal(interfaces.DefaultPriority))
+		Expect(cfg.Priority).To(Equal(config.DefaultPriority))
 		Expect(cfg.KvCacheThreshold).To(Equal(0.0))
 	})
 
 	It("should apply defaults on model-specific config", func() {
-		configMap := map[string]interfaces.SaturationScalingConfig{
+		configMap := map[string]config.SaturationScalingConfig{
 			"model-1#ns-1": {
 				AnalyzerName: "saturation",
 			},
 		}
 		cfg := resolveSaturationConfig(configMap, "model-1", "ns-1")
-		Expect(cfg.ScaleUpThreshold).To(Equal(interfaces.DefaultScaleUpThreshold))
-		Expect(cfg.ScaleDownBoundary).To(Equal(interfaces.DefaultScaleDownBoundary))
-		Expect(cfg.Priority).To(Equal(interfaces.DefaultPriority))
+		Expect(cfg.ScaleUpThreshold).To(Equal(config.DefaultScaleUpThreshold))
+		Expect(cfg.ScaleDownBoundary).To(Equal(config.DefaultScaleDownBoundary))
+		Expect(cfg.Priority).To(Equal(config.DefaultPriority))
 	})
 })
 
