@@ -8,10 +8,28 @@ import (
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	variantautoscalingv1alpha1 "github.com/llm-d/llm-d-workload-variant-autoscaler/api/v1alpha1"
 )
+
+// VAOption is a functional option for configuring VariantAutoscaling resources.
+type VAOption func(*variantautoscalingv1alpha1.VariantAutoscaling)
+
+// WithMinReplicas sets the MinReplicas field on the VA spec.
+func WithMinReplicas(min int32) VAOption {
+	return func(va *variantautoscalingv1alpha1.VariantAutoscaling) {
+		va.Spec.MinReplicas = ptr.To(min)
+	}
+}
+
+// WithMaxReplicas sets the MaxReplicas field on the VA spec.
+func WithMaxReplicas(max int32) VAOption {
+	return func(va *variantautoscalingv1alpha1.VariantAutoscaling) {
+		va.Spec.MaxReplicas = max
+	}
+}
 
 // CreateVariantAutoscaling creates a VariantAutoscaling resource. Fails if it already exists.
 func CreateVariantAutoscaling(
@@ -20,8 +38,9 @@ func CreateVariantAutoscaling(
 	namespace, name, deploymentName, modelID, accelerator string,
 	cost float64,
 	controllerInstance string,
+	opts ...VAOption,
 ) error {
-	va := buildVariantAutoscaling(namespace, name, deploymentName, modelID, accelerator, cost, controllerInstance)
+	va := buildVariantAutoscaling(namespace, name, deploymentName, modelID, accelerator, cost, controllerInstance, opts...)
 	return crClient.Create(ctx, va)
 }
 
@@ -44,6 +63,7 @@ func EnsureVariantAutoscaling(
 	namespace, name, deploymentName, modelID, accelerator string,
 	cost float64,
 	controllerInstance string,
+	opts ...VAOption,
 ) error {
 	existingVA := &variantautoscalingv1alpha1.VariantAutoscaling{}
 	err := crClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, existingVA)
@@ -67,7 +87,7 @@ func EnsureVariantAutoscaling(
 	} else if !errors.IsNotFound(err) {
 		return fmt.Errorf("check existing VA %s: %w", name, err)
 	}
-	va := buildVariantAutoscaling(namespace, name, deploymentName, modelID, accelerator, cost, controllerInstance)
+	va := buildVariantAutoscaling(namespace, name, deploymentName, modelID, accelerator, cost, controllerInstance, opts...)
 	return crClient.Create(ctx, va)
 }
 
@@ -91,7 +111,7 @@ func EnsureVariantAutoscalingWithDefaults(
 	return EnsureVariantAutoscaling(ctx, crClient, namespace, name, deploymentName, modelID, accelerator, 30.0, controllerInstance)
 }
 
-func buildVariantAutoscaling(namespace, name, deploymentName, modelID, accelerator string, cost float64, controllerInstance string) *variantautoscalingv1alpha1.VariantAutoscaling {
+func buildVariantAutoscaling(namespace, name, deploymentName, modelID, accelerator string, cost float64, controllerInstance string, opts ...VAOption) *variantautoscalingv1alpha1.VariantAutoscaling {
 	labels := map[string]string{
 		"test-resource":                          "true",
 		"inference.optimization/acceleratorName": accelerator,
@@ -99,7 +119,7 @@ func buildVariantAutoscaling(namespace, name, deploymentName, modelID, accelerat
 	if controllerInstance != "" {
 		labels["wva.llmd.ai/controller-instance"] = controllerInstance
 	}
-	return &variantautoscalingv1alpha1.VariantAutoscaling{
+	va := &variantautoscalingv1alpha1.VariantAutoscaling{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: namespace,
@@ -112,10 +132,15 @@ func buildVariantAutoscaling(namespace, name, deploymentName, modelID, accelerat
 				Name:       deploymentName,
 			},
 			ModelID:     modelID,
-			MaxReplicas: 2,
+			MinReplicas: ptr.To(int32(1)),
+			MaxReplicas: 10,
 			VariantAutoscalingConfigSpec: variantautoscalingv1alpha1.VariantAutoscalingConfigSpec{
 				VariantCost: fmt.Sprintf("%.1f", cost),
 			},
 		},
 	}
+	for _, opt := range opts {
+		opt(va)
+	}
+	return va
 }

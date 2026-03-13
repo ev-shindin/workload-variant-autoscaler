@@ -137,11 +137,12 @@ var _ = Describe("Scale-From-Zero Feature", Label("smoke", "full"), Ordered, fun
 			g.Expect(deploy.Status.Replicas).To(Equal(int32(0)), "Deployment should be scaled to 0")
 		}, 1*time.Minute, 5*time.Second).Should(Succeed())
 
-		By("Creating VariantAutoscaling resource")
+		By("Creating VariantAutoscaling resource with minReplicas=0 to allow scale-from-zero")
 		err = fixtures.EnsureVariantAutoscaling(
 			ctx, crClient, cfg.LLMDNamespace, vaName,
 			modelServiceName+"-decode", cfg.ModelID, cfg.AcceleratorType, 30.0,
 			cfg.ControllerInstance,
+			fixtures.WithMinReplicas(0),
 		)
 		Expect(err).NotTo(HaveOccurred(), "Failed to create VariantAutoscaling")
 
