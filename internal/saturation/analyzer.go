@@ -436,7 +436,7 @@ func (a *Analyzer) CalculateSaturationTargets(
 			"avgSpareQueueLength", saturationAnalysis.AvgSpareQueueLength)
 	}
 
-	// Apply min/max replica bounds from VA annotations
+	// Apply min/max replica bounds from VA spec fields
 	for _, state := range variantStates {
 		if target, ok := targets[state.VariantName]; ok {
 			if state.MinReplicas != nil && target < *state.MinReplicas {

@@ -92,7 +92,7 @@ func (o *GreedyByScoreOptimizer) Optimize(
 		targets := initTargets(req.VariantStates)
 
 		if req.Result.SpareCapacity > 0 {
-			costAwareScaleDown(ctx, req.Result, targets)
+			costAwareScaleDown(ctx, req.Result, targets, stateMap)
 		}
 
 		decisions := buildDecisionsWithOptimizer(req, stateMap, vcMap, targets, "greedy-by-score")

@@ -434,6 +434,34 @@ var _ = Describe("CostAwareOptimizer", func() {
 			Expect(dm["cheap"].TargetReplicas).To(Equal(0))
 		})
 
+		It("should scale minReplicas=0 variant to zero while keeping minReplicas>0 sibling", func() {
+			requests := []ModelScalingRequest{
+				{
+					ModelID:   "model-1",
+					Namespace: "default",
+					Result: &interfaces.AnalyzerResult{
+						SpareCapacity: 80000, // enough to remove all
+						VariantCapacities: []interfaces.VariantCapacity{
+							{VariantName: "keep-alive", Cost: 15.0, ReplicaCount: 2, PerReplicaCapacity: 20000},
+							{VariantName: "expendable", Cost: 5.0, ReplicaCount: 3, PerReplicaCapacity: 10000},
+						},
+					},
+					VariantStates: []interfaces.VariantReplicaState{
+						{VariantName: "keep-alive", CurrentReplicas: 2, MinReplicas: intPtr(1)},
+						{VariantName: "expendable", CurrentReplicas: 3, MinReplicas: intPtr(0)},
+					},
+				},
+			}
+
+			decisions := optimizer.Optimize(ctx, requests, nil)
+			dm := decisionMap(decisions)
+
+			// keep-alive: minReplicas=1, so floor at 1
+			Expect(dm["keep-alive"].TargetReplicas).To(Equal(1))
+			// expendable: minReplicas=0 and other variant has replicas, so can go to 0
+			Expect(dm["expendable"].TargetReplicas).To(Equal(0))
+		})
+
 		It("should propagate MinReplicas/MaxReplicas to VariantDecision", func() {
 			requests := []ModelScalingRequest{
 				{

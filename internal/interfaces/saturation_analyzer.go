@@ -218,10 +218,10 @@ type VariantDecision struct {
 	LimitedBy string
 
 	// --- Replica bounds ---
-	// MinReplicas is the minimum number of replicas for this variant (from VA annotation).
+	// MinReplicas is the minimum number of replicas for this variant (from VA spec field).
 	// nil means not set (default: 0).
 	MinReplicas *int
-	// MaxReplicas is the maximum number of replicas for this variant (from VA annotation).
+	// MaxReplicas is the maximum number of replicas for this variant (from VA spec field).
 	// nil means not set (no cap).
 	MaxReplicas *int
 
@@ -283,10 +283,10 @@ type VariantReplicaState struct {
 	GPUsPerReplica int
 	// Role is the P/D disaggregation role: "prefill", "decode", or "both" (default).
 	Role string
-	// MinReplicas is the minimum number of replicas for this variant (from VA annotation).
+	// MinReplicas is the minimum number of replicas for this variant (from VA spec field).
 	// nil means not set (default: 0, allows scale to zero).
 	MinReplicas *int
-	// MaxReplicas is the maximum number of replicas for this variant (from VA annotation).
+	// MaxReplicas is the maximum number of replicas for this variant (from VA spec field).
 	// nil means not set (default: 0, no cap).
 	MaxReplicas *int
 }
