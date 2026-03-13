@@ -25,14 +25,4 @@ const (
 	// even if the namespace has VAs or opt-in labels.
 	// This provides explicit control to exclude namespaces from WVA management.
 	NamespaceExcludeAnnotationKey = "wva.llmd.ai/exclude"
-
-	// MinReplicasAnnotationKey is the annotation key for the minimum number of replicas for a VA.
-	// When set, the autoscaler will not scale below this value.
-	// Default: 0 (allows scale to zero).
-	MinReplicasAnnotationKey = "wva.llmd.ai/min-replicas"
-
-	// MaxReplicasAnnotationKey is the annotation key for the maximum number of replicas for a VA.
-	// When set, the autoscaler will not scale above this value.
-	// Default: 0 (no cap).
-	MaxReplicasAnnotationKey = "wva.llmd.ai/max-replicas"
 )

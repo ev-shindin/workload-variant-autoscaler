@@ -37,7 +37,6 @@ import (
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/collector/registration"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/collector/source"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/config"
-	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/constants"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/discovery"
 	queueingmodel "github.com/llm-d/llm-d-workload-variant-autoscaler/internal/engines/analyzers/queueingmodel"
 	saturation_v2 "github.com/llm-d/llm-d-workload-variant-autoscaler/internal/engines/analyzers/saturation_v2"
@@ -580,11 +579,16 @@ func (e *Engine) BuildVariantStates(
 		// Extract P/D role from deployment labels
 		role := getRoleFromDeployment(deploy)
 
-		// Parse min/max replica bounds from VA annotations
-		minReplicas, maxReplicas, boundsErr := constants.ParseReplicaBounds(va.Annotations)
-		if boundsErr != nil {
-			ctrl.LoggerFrom(ctx).Info("Warning: invalid replica bounds annotation, using defaults",
-				"variant", va.Name, "error", boundsErr)
+		// Read min/max replica bounds from VA spec fields
+		var minReplicas *int
+		if va.Spec.MinReplicas != nil {
+			v := int(*va.Spec.MinReplicas)
+			minReplicas = &v
+		}
+		var maxReplicas *int
+		if va.Spec.MaxReplicas > 0 {
+			v := int(va.Spec.MaxReplicas)
+			maxReplicas = &v
 		}
 
 		ctrl.LoggerFrom(ctx).V(logging.DEBUG).Info("BuildVariantStates result", "variant", va.Name, "currentReplicas", currentReplicas, "readyReplicas", readyReplicas, "pendingReplicas", pendingReplicas, "gpusPerReplica", gpusPerReplica, "role", role, "minReplicas", minReplicas, "maxReplicas", maxReplicas)
