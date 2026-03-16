@@ -40,7 +40,8 @@ func parseSaturationConfig(cmData map[string]string, logger logr.Logger) (config
 			logger.Error(err, "Failed to parse saturation scaling config entry", "key", key)
 			continue
 		}
-		// Validate
+		// Apply defaults before validation (handles omitempty zero-values like scaleUpThreshold)
+		satConfig.ApplyDefaults()
 		if err := satConfig.Validate(); err != nil {
 			logger.Error(err, "Invalid saturation scaling config entry", "key", key)
 			continue
