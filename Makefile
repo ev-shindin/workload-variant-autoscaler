@@ -190,6 +190,7 @@ deploy-e2e-infra: ## Deploy e2e test infrastructure (infra-only: WVA + llm-d, no
 		USE_SIMULATOR=$(USE_SIMULATOR) \
 		SCALE_TO_ZERO_ENABLED=$(SCALE_TO_ZERO_ENABLED) \
 		SCALER_BACKEND=$(SCALER_BACKEND) \
+		ANALYZER_NAME=$(ANALYZER_NAME) \
 		INSTALL_GATEWAY_CTRLPLANE=true \
 		NAMESPACE_SCOPED=false \
 		WVA_IMAGE_REPO=$$IMAGE_REPO \
@@ -203,6 +204,7 @@ deploy-e2e-infra: ## Deploy e2e test infrastructure (infra-only: WVA + llm-d, no
 		USE_SIMULATOR=$(USE_SIMULATOR) \
 		SCALE_TO_ZERO_ENABLED=$(SCALE_TO_ZERO_ENABLED) \
 		SCALER_BACKEND=$(SCALER_BACKEND) \
+		ANALYZER_NAME=$(ANALYZER_NAME) \
 		INSTALL_GATEWAY_CTRLPLANE=true \
 		NAMESPACE_SCOPED=false \
 		./deploy/install.sh; \
