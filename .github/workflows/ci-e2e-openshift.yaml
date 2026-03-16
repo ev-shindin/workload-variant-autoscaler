@@ -12,11 +12,11 @@ permissions:
 # Regular comments get a unique group (run_id) so they don't cancel in-progress test runs
 #
 # Logic:
-# - Regular comments (not /ok-to-test or /retest): unique group prevents cancellation of real tests
-# - Valid triggers: group 'e2e-openshift-{pr_number}' (can cancel previous runs for same PR)
+# - Regular comments (not /ok-to-test, /retest, /ok-to-test-v2, /retest-v2): unique group prevents cancellation of real tests
+# - Valid triggers: group 'e2e-openshift-{pr_number}' or 'e2e-openshift-v2-{pr_number}' (can cancel previous runs for same PR)
 # - Fallback chain for ID: pull_request.number -> issue.number -> run_id
 #
-# NOTE: Valid command list (/ok-to-test, /retest) must stay in sync with gate job validation (line ~125)
+# NOTE: Valid command list must stay in sync with gate job validation (line ~125)
 concurrency:
   group: >-
     ${{
@@ -24,6 +24,11 @@ concurrency:
       !contains(github.event.comment.body, '/ok-to-test') &&
       !contains(github.event.comment.body, '/retest')
       && format('comment-isolated-{0}', github.run_id)
+      || contains(github.event.comment.body, '-v2')
+      && format('e2e-openshift-v2-{0}',
+           github.event.pull_request.number
+           || github.event.issue.number
+           || github.run_id)
       || format('e2e-openshift-{0}',
            github.event.pull_request.number
            || github.event.issue.number
@@ -57,6 +62,10 @@ on:
         description: 'Number of prompts'
         required: false
         default: '3000'
+      analyzer_name:
+        description: 'Scaling analyzer: empty for V1 (default), "saturation" for V2'
+        required: false
+        default: ''
       skip_cleanup:
         description: 'Skip cleanup after tests'
         required: false
@@ -124,6 +133,7 @@ jobs:
       pr_number: ${{ steps.check.outputs.pr_number }}
       pr_head_sha: ${{ steps.check.outputs.pr_head_sha }}
       is_fork_pr: ${{ steps.check.outputs.is_fork_pr }}
+      analyzer_name: ${{ steps.check.outputs.analyzer_name }}
     steps:
       - name: Check permissions and OpenShift E2E triggers (/ok-to-test, /retest)
         id: check
@@ -148,10 +158,13 @@ jobs:
 
             // Always run for workflow_dispatch
             if (context.eventName === 'workflow_dispatch') {
+              const inputAnalyzer = '${{ github.event.inputs.analyzer_name }}' || '';
               core.setOutput('should_run', 'true');
               core.setOutput('pr_number', '');
               core.setOutput('pr_head_sha', context.sha);
               core.setOutput('is_fork_pr', 'false');
+              core.setOutput('analyzer_name', inputAnalyzer);
+              if (inputAnalyzer) console.log(`V2 engine mode: analyzerName=${inputAnalyzer}`);
               return;
             }
 
@@ -168,12 +181,16 @@ jobs:
               }
 
               // NOTE: This list must stay in sync with concurrency group logic (lines 23-25)
-              const validCommands = ['/ok-to-test', '/retest'];
+              const validCommands = ['/ok-to-test', '/retest', '/ok-to-test-v2', '/retest-v2'];
               if (!validCommands.includes(comment)) {
                 console.log(`Comment "${comment}" is not a valid trigger command, skipping`);
                 core.setOutput('should_run', 'false');
                 return;
               }
+
+              // Determine if this is a V2 trigger
+              const isV2 = comment.endsWith('-v2');
+              const analyzerName = isV2 ? 'saturation' : '';
 
               // Check if commenter has write access
               const commenter = context.payload.comment.user.login;
@@ -199,10 +216,12 @@ jobs:
               console.log(`${comment} approved by ${commenter} for PR #${issue.number}`);
               console.log(`PR head SHA: ${pr.head.sha}`);
               console.log(`Is fork PR: ${isFork} (head: ${headRepo}, base: ${baseRepo})`);
+              if (isV2) console.log(`V2 engine mode: analyzerName=saturation`);
               core.setOutput('should_run', 'true');
               core.setOutput('pr_number', issue.number.toString());
               core.setOutput('pr_head_sha', pr.head.sha);
               core.setOutput('is_fork_pr', isFork ? 'true' : 'false');
+              core.setOutput('analyzer_name', analyzerName);
 
               // Add reaction to acknowledge
               await github.rest.reactions.createForIssueComment({
@@ -214,12 +233,14 @@ jobs:
 
               // Post comment with link to the e2e workflow run
               const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
-              const cmdDesc = comment === '/ok-to-test' ? 'approve and run' : 're-run';
+              const baseCmd = comment.replace('-v2', '');
+              const cmdDesc = baseCmd === '/ok-to-test' ? 'approve and run' : 're-run';
+              const engineLabel = isV2 ? ' (V2 saturation engine)' : '';
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: issue.number,
-                body: `🚀 **OpenShift E2E** — ${cmdDesc} (\`${comment}\`)\n\n[View the OpenShift E2E workflow run](${runUrl})`
+                body: `🚀 **OpenShift E2E${engineLabel}** — ${cmdDesc} (\`${comment}\`)\n\n[View the OpenShift E2E workflow run](${runUrl})`
               });
               return;
             }
@@ -273,6 +294,9 @@ jobs:
               }
             }
 
+            // pull_request events always use V1 (default engine)
+            core.setOutput('analyzer_name', '');
+
             if (isPrivileged) {
               // For maintainer/admin fork PRs, we need to trigger via /ok-to-test
               // because fork PRs don't have access to secrets on pull_request event
@@ -303,7 +327,7 @@ jobs:
             core.setOutput('should_run', 'false');
 
             if (!botComment) {
-              const posted = await tryPostComment(`👋 Thanks for your contribution!\n\nThis PR is from a fork, so **OpenShift E2E** (GPU) tests require approval to run.\n\n**For maintainers/admins:** Comment \`/ok-to-test\` to approve and trigger **OpenShift E2E** on this PR, or \`/retest\` to re-run OpenShift E2E (e.g. after a failure or new commits).\n\n**For contributors:** Please wait for a maintainer or admin to approve running the tests.`);
+              const posted = await tryPostComment(`👋 Thanks for your contribution!\n\nThis PR is from a fork, so **OpenShift E2E** (GPU) tests require approval to run.\n\n**For maintainers/admins:** Comment \`/ok-to-test\` to approve and trigger **OpenShift E2E** on this PR, or \`/retest\` to re-run OpenShift E2E (e.g. after a failure or new commits).\n\nFor V2 engine testing, use \`/ok-to-test-v2\` or \`/retest-v2\`.\n\n**For contributors:** Please wait for a maintainer or admin to approve running the tests.`);
               if (!posted) {
                 console.log('Note: Could not post instructions comment on fork PR');
               }
@@ -692,6 +716,8 @@ jobs:
           # Pass PR-specific namespaces to install script
           LLMD_NS: ${{ env.LLMD_NAMESPACE }}
           WVA_NS: ${{ env.WVA_NAMESPACE }}
+          # V2 engine: set to "saturation" for V2 capacity-constraint analyzer
+          ANALYZER_NAME: ${{ needs.gate.outputs.analyzer_name }}
           # Controller instance label for multi-controller isolation in parallel e2e tests
           CONTROLLER_INSTANCE: ${{ env.WVA_NAMESPACE }}
           # Skip infra VA/HPA — the smoke test creates its own VA+HPA targeting
@@ -733,6 +759,7 @@ jobs:
           echo "  DECODE_REPLICAS: $DECODE_REPLICAS"
           echo "  KV_SPARE_TRIGGER: ${KV_SPARE_TRIGGER:-<default>}"
           echo "  QUEUE_SPARE_TRIGGER: ${QUEUE_SPARE_TRIGGER:-<default>}"
+          echo "  ANALYZER_NAME: ${ANALYZER_NAME:-<default V1>}"
           echo "  HF token configuration: ✓"
           ./deploy/install.sh --model "$MODEL_ID" --accelerator "$ACCELERATOR_TYPE" --release-name "$WVA_RELEASE_NAME" --environment openshift
 
@@ -1185,22 +1212,29 @@ jobs:
           script: |
             const prHeadSha = '${{ needs.gate.outputs.pr_head_sha }}';
             const e2eResult = '${{ needs.e2e-openshift.result }}';
+            const analyzerName = '${{ needs.gate.outputs.analyzer_name }}';
+            const isV2 = analyzerName === 'saturation';
 
             // Map job result to commit status
             let state, description;
+            const engineLabel = isV2 ? ' (V2)' : '';
             if (e2eResult === 'success') {
               state = 'success';
-              description = 'E2E tests passed';
+              description = `E2E tests passed${engineLabel}`;
             } else if (e2eResult === 'skipped') {
               state = 'pending';
-              description = 'E2E tests skipped';
+              description = `E2E tests skipped${engineLabel}`;
             } else if (e2eResult === 'cancelled') {
               state = 'failure';
-              description = 'E2E tests cancelled';
+              description = `E2E tests cancelled${engineLabel}`;
             } else {
               state = 'failure';
-              description = 'E2E tests failed';
+              description = `E2E tests failed${engineLabel}`;
             }
+
+            const statusContext = isV2
+              ? '${{ github.workflow }} / e2e-v2 (comment trigger)'
+              : '${{ github.workflow }} / e2e (comment trigger)';
 
             console.log(`Reporting status to PR commit ${prHeadSha}: ${state} - ${description}`);
 
@@ -1211,7 +1245,7 @@ jobs:
               state: state,
               target_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
               description: description,
-              context: '${{ github.workflow }} / e2e (comment trigger)'
+              context: statusContext
             });
 
             console.log('Status reported successfully');
