@@ -51,8 +51,10 @@ type BenchmarkConfig struct {
 	BenchmarkResultsFile string
 
 	// Grafana
-	GrafanaEnabled      bool   // Deploy ephemeral Grafana and capture snapshot
-	GrafanaSnapshotFile string // Path to write snapshot URL
+	GrafanaEnabled          bool   // Deploy ephemeral Grafana and capture snapshot
+	GrafanaSnapshotFile     string // Path to write snapshot URL
+	GrafanaSnapshotJSONFile string // Path to export full snapshot JSON (re-importable)
+	GrafanaPanelDir         string // Directory to write rendered panel PNGs
 
 	// Phase durations (seconds, overridable via env for tuning)
 	BaselineDurationSec  int
@@ -102,8 +104,10 @@ func LoadConfigFromEnv() BenchmarkConfig {
 
 		BenchmarkResultsFile: getEnv("BENCHMARK_RESULTS_FILE", "/tmp/benchmark-results.json"),
 
-		GrafanaEnabled:      getEnvBool("BENCHMARK_GRAFANA_ENABLED", true),
-		GrafanaSnapshotFile: getEnv("BENCHMARK_GRAFANA_SNAPSHOT_FILE", "/tmp/benchmark-grafana-snapshot.txt"),
+		GrafanaEnabled:          getEnvBool("BENCHMARK_GRAFANA_ENABLED", true),
+		GrafanaSnapshotFile:     getEnv("BENCHMARK_GRAFANA_SNAPSHOT_FILE", "/tmp/benchmark-grafana-snapshot.txt"),
+		GrafanaSnapshotJSONFile: getEnv("BENCHMARK_GRAFANA_SNAPSHOT_JSON", "/tmp/benchmark-grafana-snapshot.json"),
+		GrafanaPanelDir:         getEnv("BENCHMARK_GRAFANA_PANEL_DIR", "/tmp/benchmark-panels"),
 
 		BaselineDurationSec:  getEnvInt("BENCHMARK_BASELINE_DURATION", 120),
 		SpikeDurationSec:     getEnvInt("BENCHMARK_SPIKE_DURATION", 300),

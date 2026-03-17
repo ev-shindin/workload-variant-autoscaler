@@ -22,7 +22,8 @@ import (
 
 const (
 	grafanaLocalPort = 3000
-	grafanaSvcName   = "kube-prometheus-stack-grafana"
+	grafanaSvcName   = "benchmark-grafana"
+	grafanaSvcPort   = 3000
 	dashboardUID     = "wva-benchmark-scaleup"
 )
 
@@ -33,18 +34,18 @@ type GrafanaClient struct {
 	portForwardCmd *exec.Cmd
 }
 
-// DeployGrafana enables Grafana on the existing kube-prometheus-stack via helm upgrade,
-// creates the dashboard ConfigMap, and waits for Grafana to be ready.
+// DeployGrafana deploys a standalone Grafana pod via kubectl apply,
+// provisions the benchmark dashboard, and waits for readiness.
 func DeployGrafana(ctx context.Context, k8sClient *kubernetes.Clientset, monitoringNS string) error {
 	projectDir, err := utils.GetProjectDir()
 	if err != nil {
 		return fmt.Errorf("get project dir: %w", err)
 	}
 
-	valuesFile := filepath.Join(projectDir, "deploy", "grafana", "benchmark-grafana-values.yaml")
+	grafanaYAML := filepath.Join(projectDir, "deploy", "grafana", "benchmark-grafana.yaml")
 	dashboardFile := filepath.Join(projectDir, "deploy", "grafana", "benchmark-dashboard.json")
 
-	// Create the dashboard ConfigMap with the sidecar label so Grafana auto-imports it
+	// Create the dashboard ConfigMap (the Grafana deployment mounts it as a volume)
 	cmCmd := exec.CommandContext(ctx, "kubectl", "create", "configmap", "benchmark-dashboard",
 		"--from-file=benchmark-dashboard.json="+dashboardFile,
 		"-n", monitoringNS,
@@ -54,73 +55,119 @@ func DeployGrafana(ctx context.Context, k8sClient *kubernetes.Clientset, monitor
 		return fmt.Errorf("generate dashboard configmap yaml: %w", err)
 	}
 
-	// Pipe through kubectl apply with label
-	applyCmd := exec.CommandContext(ctx, "kubectl", "apply", "-f", "-")
+	applyCmd := exec.CommandContext(ctx, "kubectl", "apply", "-f", "-", "-n", monitoringNS)
 	applyCmd.Stdin = bytes.NewReader(cmYaml)
 	if out, err := applyCmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("apply dashboard configmap: %s: %w", string(out), err)
 	}
 
-	// Label the ConfigMap for the Grafana sidecar
-	labelCmd := exec.CommandContext(ctx, "kubectl", "label", "configmap", "benchmark-dashboard",
-		"grafana_dashboard=benchmark",
-		"-n", monitoringNS,
-		"--overwrite")
-	if out, err := labelCmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("label dashboard configmap: %s: %w", string(out), err)
-	}
-
-	// Helm upgrade to enable Grafana
-	helmCmd := exec.CommandContext(ctx, "helm", "upgrade", "kube-prometheus-stack",
-		"prometheus-community/kube-prometheus-stack",
-		"-n", monitoringNS,
-		"-f", valuesFile,
-		"--reuse-values",
-		"--timeout=5m",
-		"--wait",
-	)
-	if out, err := helmCmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("helm upgrade to enable grafana: %s: %w", string(out), err)
+	// Apply the standalone Grafana deployment + service + config
+	applyGrafana := exec.CommandContext(ctx, "kubectl", "apply", "-f", grafanaYAML, "-n", monitoringNS)
+	if out, err := applyGrafana.CombinedOutput(); err != nil {
+		return fmt.Errorf("apply grafana deployment: %s: %w", string(out), err)
 	}
 
 	// Wait for Grafana pod to be ready
-	err = wait.PollUntilContextTimeout(ctx, 5*time.Second, 3*time.Minute, true, func(ctx context.Context) (bool, error) {
-		pods, listErr := k8sClient.CoreV1().Pods(monitoringNS).List(ctx, labelSelector("app.kubernetes.io/name=grafana"))
+	err = wait.PollUntilContextTimeout(ctx, 5*time.Second, 5*time.Minute, true, func(ctx context.Context) (bool, error) {
+		pods, listErr := k8sClient.CoreV1().Pods(monitoringNS).List(ctx, labelSelector("app=benchmark-grafana"))
 		if listErr != nil || len(pods.Items) == 0 {
 			return false, nil
 		}
 		for _, pod := range pods.Items {
+			if len(pod.Status.ContainerStatuses) == 0 {
+				return false, nil
+			}
 			for _, cs := range pod.Status.ContainerStatuses {
-				if cs.Ready {
-					return true, nil
+				if !cs.Ready {
+					return false, nil
 				}
 			}
+			// Single container, and it's ready
+			return true, nil
 		}
 		return false, nil
 	})
 	if err != nil {
+		dumpGrafanaDiagnostics(ctx, k8sClient, monitoringNS)
 		return fmt.Errorf("waiting for grafana pod: %w", err)
 	}
 
 	return nil
 }
 
+// dumpGrafanaDiagnostics prints pod status, events, and service info to help debug failures.
+func dumpGrafanaDiagnostics(ctx context.Context, k8sClient *kubernetes.Clientset, ns string) {
+	fmt.Println("=== Grafana Diagnostics ===")
+
+	pods, err := k8sClient.CoreV1().Pods(ns).List(ctx, labelSelector("app=benchmark-grafana"))
+	if err != nil {
+		fmt.Printf("Could not list grafana pods: %v\n", err)
+	} else if len(pods.Items) == 0 {
+		fmt.Println("No grafana pods found")
+	} else {
+		for _, pod := range pods.Items {
+			fmt.Printf("Pod %s: phase=%s\n", pod.Name, pod.Status.Phase)
+			for _, cs := range pod.Status.ContainerStatuses {
+				fmt.Printf("  Container %s: ready=%v, restarts=%d, state=%+v\n",
+					cs.Name, cs.Ready, cs.RestartCount, cs.State)
+			}
+			for _, cs := range pod.Status.InitContainerStatuses {
+				fmt.Printf("  InitContainer %s: ready=%v, state=%+v\n",
+					cs.Name, cs.Ready, cs.State)
+			}
+		}
+	}
+
+	events, err := k8sClient.CoreV1().Events(ns).List(ctx, metav1.ListOptions{
+		FieldSelector: "involvedObject.kind=Pod",
+	})
+	if err == nil {
+		for _, ev := range events.Items {
+			if ev.InvolvedObject.Name != "" && ev.Reason != "" {
+				if ev.Count > 0 {
+					fmt.Printf("Event: %s %s: %s (x%d)\n", ev.InvolvedObject.Name, ev.Reason, ev.Message, ev.Count)
+				}
+			}
+		}
+	}
+
+	svc, err := k8sClient.CoreV1().Services(ns).Get(ctx, grafanaSvcName, metav1.GetOptions{})
+	if err != nil {
+		fmt.Printf("Could not get grafana service: %v\n", err)
+	} else {
+		fmt.Printf("Service %s: type=%s, ports=%v\n", svc.Name, svc.Spec.Type, svc.Spec.Ports)
+	}
+
+	fmt.Println("=== End Grafana Diagnostics ===")
+}
+
 // NewGrafanaClient sets up port-forward to Grafana and returns a client.
 func NewGrafanaClient(k8sClient *kubernetes.Clientset, ctx context.Context, monitoringNS string) (*GrafanaClient, error) {
-	pfCmd := utils.SetUpPortForward(k8sClient, ctx, grafanaSvcName, monitoringNS, grafanaLocalPort, 80)
+	pfCmd := utils.SetUpPortForward(k8sClient, ctx, grafanaSvcName, monitoringNS, grafanaLocalPort, grafanaSvcPort)
 
 	baseURL := fmt.Sprintf("http://localhost:%d", grafanaLocalPort)
 
-	// Wait for Grafana to respond
-	err := wait.PollUntilContextTimeout(ctx, 1*time.Second, 30*time.Second, true, func(ctx context.Context) (bool, error) {
-		resp, httpErr := http.Get(baseURL + "/api/health")
+	// Wait for Grafana to respond via port-forward
+	attempts := 0
+	err := wait.PollUntilContextTimeout(ctx, 2*time.Second, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
+		attempts++
+		resp, httpErr := http.Get(baseURL + "/api/health") //nolint:noctx // simple health check in poll loop
 		if httpErr != nil {
+			if attempts%5 == 1 {
+				fmt.Printf("Grafana health check attempt %d: %v\n", attempts, httpErr)
+			}
 			return false, nil
 		}
-		defer resp.Body.Close()
-		return resp.StatusCode == 200, nil
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != 200 {
+			fmt.Printf("Grafana health check attempt %d: status %d\n", attempts, resp.StatusCode)
+			return false, nil
+		}
+		return true, nil
 	})
 	if err != nil {
+		fmt.Printf("Grafana health check failed after %d attempts — dumping diagnostics\n", attempts)
+		dumpGrafanaDiagnostics(ctx, k8sClient, monitoringNS)
 		if pfCmd.Process != nil {
 			_ = pfCmd.Process.Kill()
 		}
@@ -155,40 +202,43 @@ type snapshotRequest struct {
 
 // snapshotResponse is the response from Grafana's POST /api/snapshots.
 type snapshotResponse struct {
-	Key     string `json:"key"`
-	URL     string `json:"url"`
+	Key       string `json:"key"`
+	URL       string `json:"url"`
 	DeleteKey string `json:"deleteKey"`
 	DeleteURL string `json:"deleteUrl"`
 }
 
+// SnapshotResult contains the key and URL from a created Grafana snapshot.
+type SnapshotResult struct {
+	Key string
+	URL string
+}
+
 // CreateSnapshot creates a Grafana snapshot of the benchmark dashboard
 // covering the time range from scenarioStart to now.
-// Returns the local snapshot URL.
-func (g *GrafanaClient) CreateSnapshot(scenarioStart time.Time) (string, error) {
-	// Fetch the dashboard model from Grafana
+func (g *GrafanaClient) CreateSnapshot(scenarioStart time.Time) (*SnapshotResult, error) {
 	dashURL := fmt.Sprintf("%s/api/dashboards/uid/%s", g.baseURL, dashboardUID)
 	resp, err := g.httpClient.Get(dashURL)
 	if err != nil {
-		return "", fmt.Errorf("fetch dashboard: %w", err)
+		return nil, fmt.Errorf("fetch dashboard: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != 200 {
 		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("fetch dashboard returned %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("fetch dashboard returned %d: %s", resp.StatusCode, string(body))
 	}
 
 	var dashResp struct {
 		Dashboard json.RawMessage `json:"dashboard"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&dashResp); err != nil {
-		return "", fmt.Errorf("decode dashboard: %w", err)
+		return nil, fmt.Errorf("decode dashboard: %w", err)
 	}
 
-	// Modify the time range in the dashboard to cover the benchmark period
 	var dashModel map[string]interface{}
 	if err := json.Unmarshal(dashResp.Dashboard, &dashModel); err != nil {
-		return "", fmt.Errorf("unmarshal dashboard model: %w", err)
+		return nil, fmt.Errorf("unmarshal dashboard model: %w", err)
 	}
 	dashModel["time"] = map[string]string{
 		"from": scenarioStart.UTC().Format(time.RFC3339),
@@ -196,42 +246,67 @@ func (g *GrafanaClient) CreateSnapshot(scenarioStart time.Time) (string, error) 
 	}
 	modifiedDash, err := json.Marshal(dashModel)
 	if err != nil {
-		return "", fmt.Errorf("marshal modified dashboard: %w", err)
+		return nil, fmt.Errorf("marshal modified dashboard: %w", err)
 	}
 
-	// Create snapshot
 	snapReq := snapshotRequest{
 		Dashboard: modifiedDash,
 		Name:      fmt.Sprintf("Benchmark %s", time.Now().UTC().Format("2006-01-02T15:04:05Z")),
-		Expires:   0, // ephemeral — dies with the cluster anyway
+		Expires:   0,
 	}
 	payload, err := json.Marshal(snapReq)
 	if err != nil {
-		return "", fmt.Errorf("marshal snapshot request: %w", err)
+		return nil, fmt.Errorf("marshal snapshot request: %w", err)
 	}
 
 	snapResp, err := g.httpClient.Post(g.baseURL+"/api/snapshots", "application/json", bytes.NewReader(payload))
 	if err != nil {
-		return "", fmt.Errorf("create snapshot: %w", err)
+		return nil, fmt.Errorf("create snapshot: %w", err)
 	}
-	defer snapResp.Body.Close()
+	defer func() { _ = snapResp.Body.Close() }()
 
 	if snapResp.StatusCode != 200 {
 		body, _ := io.ReadAll(snapResp.Body)
-		return "", fmt.Errorf("create snapshot returned %d: %s", snapResp.StatusCode, string(body))
+		return nil, fmt.Errorf("create snapshot returned %d: %s", snapResp.StatusCode, string(body))
 	}
 
 	var result snapshotResponse
 	if err := json.NewDecoder(snapResp.Body).Decode(&result); err != nil {
-		return "", fmt.Errorf("decode snapshot response: %w", err)
+		return nil, fmt.Errorf("decode snapshot response: %w", err)
 	}
 
-	return result.URL, nil
+	return &SnapshotResult{Key: result.Key, URL: result.URL}, nil
+}
+
+// ExportSnapshotJSON fetches the full snapshot data and writes it to outputPath.
+// The exported JSON can be re-imported into any Grafana via POST /api/snapshots.
+func (g *GrafanaClient) ExportSnapshotJSON(snapshotKey string, outputPath string) error {
+	url := fmt.Sprintf("%s/api/snapshots/%s", g.baseURL, snapshotKey)
+	resp, err := g.httpClient.Get(url)
+	if err != nil {
+		return fmt.Errorf("fetch snapshot: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("fetch snapshot returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("read snapshot body: %w", err)
+	}
+
+	var buf bytes.Buffer
+	if err := json.Indent(&buf, data, "", "  "); err != nil {
+		return os.WriteFile(outputPath, data, 0644)
+	}
+
+	return os.WriteFile(outputPath, buf.Bytes(), 0644)
 }
 
 // RenderPanel renders a single Grafana panel to PNG and saves it to outputPath.
-// panelID is the numeric panel ID from the dashboard JSON.
-// width and height are in pixels.
 func (g *GrafanaClient) RenderPanel(panelID int, from, to time.Time, width, height int, outputPath string) error {
 	url := fmt.Sprintf("%s/render/d-solo/%s/benchmark?orgId=1&panelId=%d&from=%d&to=%d&width=%d&height=%d",
 		g.baseURL, dashboardUID, panelID,
@@ -243,7 +318,7 @@ func (g *GrafanaClient) RenderPanel(panelID int, from, to time.Time, width, heig
 	if err != nil {
 		return fmt.Errorf("render panel %d: %w", panelID, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != 200 {
 		body, _ := io.ReadAll(resp.Body)
@@ -256,6 +331,49 @@ func (g *GrafanaClient) RenderPanel(panelID int, from, to time.Time, width, heig
 	}
 
 	return os.WriteFile(outputPath, data, 0644)
+}
+
+// benchmarkPanel describes a panel in the benchmark dashboard for rendering.
+type benchmarkPanel struct {
+	ID    int
+	Title string
+	File  string
+	Width int
+}
+
+// benchmarkPanels lists the panels to render from the benchmark dashboard.
+var benchmarkPanels = []benchmarkPanel{
+	{ID: 1, Title: "Deployment Replicas", File: "panel-replicas.png", Width: 1000},
+	{ID: 2, Title: "WVA Desired Replicas", File: "panel-desired-replicas.png", Width: 1000},
+	{ID: 3, Title: "KV Cache Usage", File: "panel-kv-cache.png", Width: 1000},
+	{ID: 4, Title: "Queue Depth", File: "panel-queue-depth.png", Width: 1000},
+	{ID: 5, Title: "Saturation Metrics", File: "panel-saturation.png", Width: 1400},
+}
+
+// RenderAllPanels renders all benchmark dashboard panels to PNG files in outputDir.
+// Returns the list of file paths written, and any errors encountered (best-effort).
+func (g *GrafanaClient) RenderAllPanels(from, to time.Time, outputDir string) ([]string, error) {
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		return nil, fmt.Errorf("create output dir: %w", err)
+	}
+
+	var rendered []string
+	var renderErrors []string
+
+	for _, p := range benchmarkPanels {
+		outPath := filepath.Join(outputDir, p.File)
+		if err := g.RenderPanel(p.ID, from, to, p.Width, 500, outPath); err != nil {
+			renderErrors = append(renderErrors, fmt.Sprintf("%s: %v", p.Title, err))
+			continue
+		}
+		rendered = append(rendered, outPath)
+	}
+
+	if len(renderErrors) > 0 && len(rendered) == 0 {
+		return nil, fmt.Errorf("all panel renders failed: %s", renderErrors[0])
+	}
+
+	return rendered, nil
 }
 
 // helper to build a ListOptions with a label selector

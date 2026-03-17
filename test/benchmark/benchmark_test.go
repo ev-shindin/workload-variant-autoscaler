@@ -129,12 +129,31 @@ var _ = Describe("Scale-Up Latency Benchmark", Label("benchmark"), Ordered, func
 				Name:      vaName,
 			}, currentVA)
 			g.Expect(err).NotTo(HaveOccurred())
-			optimized := int32(currentVA.Status.DesiredOptimizedAlloc.NumReplicas)
-			g.Expect(optimized).To(BeNumerically(">=", 1), "VA should have optimized >= 1")
+			g.Expect(currentVA.Status.DesiredOptimizedAlloc.NumReplicas).NotTo(BeNil(), "NumReplicas should be set")
+			g.Expect(*currentVA.Status.DesiredOptimizedAlloc.NumReplicas).To(BeNumerically(">=", 1), "VA should have optimized >= 1")
 		}, 5*time.Minute, 10*time.Second).Should(Succeed())
 
+		By("Verifying external metrics API serves wva_desired_replicas")
+		Eventually(func(g Gomega) {
+			result, err := k8sClient.RESTClient().
+				Get().
+				AbsPath("/apis/external.metrics.k8s.io/v1beta1/namespaces/" + benchCfg.LLMDNamespace + "/wva_desired_replicas").
+				DoRaw(ctx)
+			g.Expect(err).NotTo(HaveOccurred(), "External metrics API should be accessible")
+			g.Expect(string(result)).To(ContainSubstring("wva_desired_replicas"), "Metric should be available")
+			g.Expect(string(result)).To(ContainSubstring(vaName), "Metric should reference the benchmark VA")
+			GinkgoWriter.Printf("External metrics API confirmed: wva_desired_replicas available for %s\n", vaName)
+		}, 5*time.Minute, 10*time.Second).Should(Succeed())
+
+		By("Waiting for Prometheus to scrape simulator metrics")
+		Eventually(func(g Gomega) {
+			_, err := promClient.QueryWithRetry(ctx, `vllm:gpu_cache_usage_perc`)
+			g.Expect(err).NotTo(HaveOccurred(), "Prometheus should have KV cache metrics from simulator")
+			GinkgoWriter.Println("Prometheus confirmed: vllm:gpu_cache_usage_perc is available")
+		}, 5*time.Minute, 15*time.Second).Should(Succeed())
+
 		scenarioStart = time.Now()
-		GinkgoWriter.Println("BeforeAll completed — benchmark scenario starting")
+		GinkgoWriter.Println("BeforeAll completed — metrics pipeline verified, benchmark scenario starting")
 	})
 
 	AfterAll(func() {
@@ -142,17 +161,38 @@ var _ = Describe("Scale-Up Latency Benchmark", Label("benchmark"), Ordered, func
 
 		if grafanaClient != nil && benchCfg.GrafanaEnabled {
 			By("Capturing Grafana snapshot of benchmark dashboard")
-			snapshotURL, snapErr := grafanaClient.CreateSnapshot(scenarioStart)
+			snapResult, snapErr := grafanaClient.CreateSnapshot(scenarioStart)
 			if snapErr != nil {
 				GinkgoWriter.Printf("Warning: failed to create Grafana snapshot: %v\n", snapErr)
 			} else {
-				results.GrafanaSnapshotURL = snapshotURL
-				GinkgoWriter.Printf("Grafana snapshot: %s\n", snapshotURL)
+				results.GrafanaSnapshotURL = snapResult.URL
+				GinkgoWriter.Printf("Grafana snapshot: %s\n", snapResult.URL)
 
 				if benchCfg.GrafanaSnapshotFile != "" {
-					if writeErr := os.WriteFile(benchCfg.GrafanaSnapshotFile, []byte(snapshotURL+"\n"), 0644); writeErr != nil {
-						GinkgoWriter.Printf("Warning: failed to write snapshot file: %v\n", writeErr)
+					if writeErr := os.WriteFile(benchCfg.GrafanaSnapshotFile, []byte(snapResult.URL+"\n"), 0644); writeErr != nil {
+						GinkgoWriter.Printf("Warning: failed to write snapshot URL file: %v\n", writeErr)
 					}
+				}
+
+				// Export full snapshot JSON for offline re-import
+				if benchCfg.GrafanaSnapshotJSONFile != "" {
+					By("Exporting Grafana snapshot JSON")
+					if exportErr := grafanaClient.ExportSnapshotJSON(snapResult.Key, benchCfg.GrafanaSnapshotJSONFile); exportErr != nil {
+						GinkgoWriter.Printf("Warning: failed to export snapshot JSON: %v\n", exportErr)
+					} else {
+						GinkgoWriter.Printf("Snapshot JSON exported to %s\n", benchCfg.GrafanaSnapshotJSONFile)
+					}
+				}
+			}
+
+			// Render all panels to PNG
+			if benchCfg.GrafanaPanelDir != "" {
+				By("Rendering dashboard panels to PNG")
+				panelFiles, renderErr := grafanaClient.RenderAllPanels(scenarioStart, time.Now(), benchCfg.GrafanaPanelDir)
+				if renderErr != nil {
+					GinkgoWriter.Printf("Warning: panel rendering failed: %v\n", renderErr)
+				} else {
+					GinkgoWriter.Printf("Rendered %d panels to %s\n", len(panelFiles), benchCfg.GrafanaPanelDir)
 				}
 			}
 		}
@@ -234,7 +274,7 @@ var _ = Describe("Scale-Up Latency Benchmark", Label("benchmark"), Ordered, func
 				}
 			}
 			g.Expect(runningCount).To(BeNumerically(">=", benchLoadWorkers))
-		}, 3*time.Minute, 5*time.Second).Should(Succeed())
+		}, 5*time.Minute, 5*time.Second).Should(Succeed())
 
 		By("Polling replicas to detect scale-up")
 		scaleUpDetected := false

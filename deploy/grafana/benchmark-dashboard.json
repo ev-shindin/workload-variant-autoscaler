@@ -19,6 +19,7 @@
   "links": [],
   "panels": [
     {
+      "id": 1,
       "title": "Deployment Replicas",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
@@ -54,6 +55,7 @@
       "options": { "legend": { "displayMode": "list", "placement": "bottom" } }
     },
     {
+      "id": 2,
       "title": "WVA Desired Replicas",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
@@ -82,6 +84,7 @@
       "options": { "legend": { "displayMode": "list", "placement": "bottom" } }
     },
     {
+      "id": 3,
       "title": "KV Cache Usage",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
@@ -124,6 +127,7 @@
       "options": { "legend": { "displayMode": "list", "placement": "bottom" } }
     },
     {
+      "id": 4,
       "title": "Queue Depth (Requests Waiting)",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
@@ -157,6 +161,7 @@
       "options": { "legend": { "displayMode": "list", "placement": "bottom" } }
     },
     {
+      "id": 5,
       "title": "Saturation Metrics",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 24, "x": 0, "y": 16 },

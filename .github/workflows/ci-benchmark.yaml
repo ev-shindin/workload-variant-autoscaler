@@ -117,6 +117,8 @@ jobs:
     permissions:
       contents: read
       statuses: write
+      pull-requests: write
+      actions: read
     steps:
       - name: Set pending status on PR head
         uses: actions/github-script@v7
@@ -193,6 +195,7 @@ jobs:
           USE_SIMULATOR: "true"
           CREATE_CLUSTER: "true"
           INSTALL_GATEWAY_CTRLPLANE: "true"
+          E2E_TESTS_ENABLED: "true"
           IMG: ${{ steps.build-image.outputs.image }}
           SKIP_BUILD: "true"
           KV_SPARE_TRIGGER: "0.5"
@@ -207,6 +210,8 @@ jobs:
           BENCHMARK_RESULTS_FILE: /tmp/benchmark-results.json
           BENCHMARK_GRAFANA_ENABLED: "true"
           BENCHMARK_GRAFANA_SNAPSHOT_FILE: /tmp/benchmark-grafana-snapshot.txt
+          BENCHMARK_GRAFANA_SNAPSHOT_JSON: /tmp/benchmark-grafana-snapshot.json
+          BENCHMARK_GRAFANA_PANEL_DIR: /tmp/benchmark-panels
           KV_SPARE_TRIGGER: "0.5"
           QUEUE_SPARE_TRIGGER: "4.5"
         run: make test-benchmark
@@ -219,6 +224,8 @@ jobs:
           path: |
             /tmp/benchmark-results.json
             /tmp/benchmark-grafana-snapshot.txt
+            /tmp/benchmark-grafana-snapshot.json
+            /tmp/benchmark-panels/
           if-no-files-found: warn
 
       - name: Post benchmark results as PR comment
@@ -229,6 +236,24 @@ jobs:
             const fs = require('fs');
             const prNumber = parseInt('${{ needs.gate.outputs.pr_number }}');
             const sha = '${{ needs.gate.outputs.pr_head_sha }}';
+            const runId = context.runId;
+            const repoUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}`;
+
+            // Look up the uploaded artifact to get a direct download link
+            let artifactUrl = `${repoUrl}/actions/runs/${runId}`;
+            try {
+              const { data: { artifacts } } = await github.rest.actions.listWorkflowRunArtifacts({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: runId
+              });
+              const benchArtifact = artifacts.find(a => a.name === 'benchmark-results');
+              if (benchArtifact) {
+                artifactUrl = `${repoUrl}/actions/runs/${runId}/artifacts/${benchArtifact.id}`;
+              }
+            } catch (e) {
+              console.log(`Could not look up artifact: ${e.message}`);
+            }
 
             let resultsTable = '⚠️ Benchmark results file not found or could not be parsed.';
 
@@ -246,17 +271,31 @@ jobs:
             | Avg queue depth | ${data.avgQueueDepth.toFixed(1)} |
             | Replica oscillation (σ) | ${data.replicaOscillation.toFixed(2)} |
             | Total duration | ${data.totalDurationSec.toFixed(0)}s |`;
-
-              if (data.grafanaSnapshotUrl) {
-                resultsTable += `\n| Grafana snapshot | [View dashboard](${data.grafanaSnapshotUrl}) |`;
-              }
             } catch (e) {
               console.log(`Could not read results: ${e.message}`);
             }
 
+            // Check which Grafana artifacts exist
+            const hasSnapshotJson = fs.existsSync('/tmp/benchmark-grafana-snapshot.json');
+            const hasPanels = fs.existsSync('/tmp/benchmark-panels') &&
+              fs.readdirSync('/tmp/benchmark-panels').some(f => f.endsWith('.png'));
+
+            let artifactsSection = '';
+            if (hasSnapshotJson || hasPanels) {
+              const items = [];
+              if (hasSnapshotJson) {
+                items.push('Grafana snapshot JSON (re-import via `POST /api/snapshots`)');
+              }
+              if (hasPanels) {
+                const pngs = fs.readdirSync('/tmp/benchmark-panels').filter(f => f.endsWith('.png'));
+                items.push(`${pngs.length} dashboard panel PNGs`);
+              }
+              artifactsSection = `\n\n📎 **[Download artifacts](${artifactUrl})** — ${items.join(', ')}`;
+            }
+
             const body = `## Benchmark: scale-up-latency (Kind)
 
-            ${resultsTable}
+            ${resultsTable}${artifactsSection}
 
             <details>
             <summary>Environment</summary>
@@ -265,6 +304,7 @@ jobs:
             - Model: unsloth/Meta-Llama-3.1-8B (simulator)
             - Commit: ${sha.substring(0, 7)}
             - Scaler: prometheus-adapter
+            - [Workflow run](${repoUrl}/actions/runs/${runId})
 
             </details>`;
 

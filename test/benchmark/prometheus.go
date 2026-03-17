@@ -18,7 +18,9 @@ func QueryRangeAvg(api promv1.API, query string, start, end time.Time, step time
 		Step:  step,
 	}
 
-	result, warnings, err := api.QueryRange(context.Background(), query, r)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	result, warnings, err := api.QueryRange(ctx, query, r)
 	if err != nil {
 		return 0, fmt.Errorf("range query %q failed: %w", query, err)
 	}

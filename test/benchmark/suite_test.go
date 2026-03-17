@@ -120,14 +120,19 @@ var _ = BeforeSuite(func() {
 
 	if benchCfg.GrafanaEnabled {
 		By("Deploying ephemeral Grafana for benchmark snapshots")
-		err = DeployGrafana(ctx, k8sClient, benchCfg.MonitoringNS)
-		Expect(err).NotTo(HaveOccurred(), "Failed to deploy Grafana")
-
-		By("Setting up Grafana client with port-forward")
-		grafanaClient, err = NewGrafanaClient(k8sClient, ctx, benchCfg.MonitoringNS)
-		Expect(err).NotTo(HaveOccurred(), "Failed to create Grafana client")
-
-		GinkgoWriter.Println("Grafana deployed and ready for snapshot capture")
+		if grafanaErr := DeployGrafana(ctx, k8sClient, benchCfg.MonitoringNS); grafanaErr != nil {
+			GinkgoWriter.Printf("WARNING: Grafana deployment failed (non-fatal): %v\n", grafanaErr)
+		} else {
+			By("Setting up Grafana client with port-forward")
+			var clientErr error
+			grafanaClient, clientErr = NewGrafanaClient(k8sClient, ctx, benchCfg.MonitoringNS)
+			if clientErr != nil {
+				GinkgoWriter.Printf("WARNING: Grafana client setup failed (non-fatal): %v\n", clientErr)
+				grafanaClient = nil
+			} else {
+				GinkgoWriter.Println("Grafana deployed and ready for snapshot capture")
+			}
+		}
 	}
 
 	GinkgoWriter.Println("BeforeSuite completed — infrastructure ready for benchmarks")
