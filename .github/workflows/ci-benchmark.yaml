@@ -205,6 +205,8 @@ jobs:
           USE_SIMULATOR: "true"
           SCALER_BACKEND: prometheus-adapter
           BENCHMARK_RESULTS_FILE: /tmp/benchmark-results.json
+          BENCHMARK_GRAFANA_ENABLED: "true"
+          BENCHMARK_GRAFANA_SNAPSHOT_FILE: /tmp/benchmark-grafana-snapshot.txt
           KV_SPARE_TRIGGER: "0.5"
           QUEUE_SPARE_TRIGGER: "4.5"
         run: make test-benchmark
@@ -214,7 +216,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: benchmark-results
-          path: /tmp/benchmark-results.json
+          path: |
+            /tmp/benchmark-results.json
+            /tmp/benchmark-grafana-snapshot.txt
           if-no-files-found: warn
 
       - name: Post benchmark results as PR comment
@@ -242,6 +246,10 @@ jobs:
             | Avg queue depth | ${data.avgQueueDepth.toFixed(1)} |
             | Replica oscillation (σ) | ${data.replicaOscillation.toFixed(2)} |
             | Total duration | ${data.totalDurationSec.toFixed(0)}s |`;
+
+              if (data.grafanaSnapshotUrl) {
+                resultsTable += `\n| Grafana snapshot | [View dashboard](${data.grafanaSnapshotUrl}) |`;
+              }
             } catch (e) {
               console.log(`Could not read results: ${e.message}`);
             }

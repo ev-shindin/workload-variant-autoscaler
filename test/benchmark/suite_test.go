@@ -26,14 +26,15 @@ import (
 )
 
 var (
-	benchCfg      BenchmarkConfig
-	k8sClient     *kubernetes.Clientset
-	crClient      client.Client
-	restConfig    *rest.Config
-	ctx           context.Context
-	cancel        context.CancelFunc
-	promClient    *utils.PrometheusClient
+	benchCfg       BenchmarkConfig
+	k8sClient      *kubernetes.Clientset
+	crClient       client.Client
+	restConfig     *rest.Config
+	ctx            context.Context
+	cancel         context.CancelFunc
+	promClient     *utils.PrometheusClient
 	portForwardCmd *exec.Cmd
+	grafanaClient  *GrafanaClient
 )
 
 func TestBenchmark(t *testing.T) {
@@ -117,10 +118,27 @@ var _ = BeforeSuite(func() {
 	promClient, err = utils.NewPrometheusClient("https://localhost:9090", true)
 	Expect(err).NotTo(HaveOccurred(), "Failed to create Prometheus client")
 
+	if benchCfg.GrafanaEnabled {
+		By("Deploying ephemeral Grafana for benchmark snapshots")
+		err = DeployGrafana(ctx, k8sClient, benchCfg.MonitoringNS)
+		Expect(err).NotTo(HaveOccurred(), "Failed to deploy Grafana")
+
+		By("Setting up Grafana client with port-forward")
+		grafanaClient, err = NewGrafanaClient(k8sClient, ctx, benchCfg.MonitoringNS)
+		Expect(err).NotTo(HaveOccurred(), "Failed to create Grafana client")
+
+		GinkgoWriter.Println("Grafana deployed and ready for snapshot capture")
+	}
+
 	GinkgoWriter.Println("BeforeSuite completed — infrastructure ready for benchmarks")
 })
 
 var _ = AfterSuite(func() {
+	if grafanaClient != nil {
+		By("Closing Grafana port-forward")
+		grafanaClient.Close()
+	}
+
 	if portForwardCmd != nil && portForwardCmd.Process != nil {
 		By("Killing Prometheus port-forward")
 		_ = portForwardCmd.Process.Kill()

@@ -28,6 +28,7 @@ type BenchmarkResults struct {
 	AvgQueueDepth      float64 `json:"avgQueueDepth"`
 	ReplicaOscillation float64 `json:"replicaOscillation"`
 	TotalDurationSec   float64 `json:"totalDurationSec"`
+	GrafanaSnapshotURL string  `json:"grafanaSnapshotUrl,omitempty"`
 }
 
 // Benchmark load generation constants
@@ -138,6 +139,23 @@ var _ = Describe("Scale-Up Latency Benchmark", Label("benchmark"), Ordered, func
 
 	AfterAll(func() {
 		results.TotalDurationSec = time.Since(scenarioStart).Seconds()
+
+		if grafanaClient != nil && benchCfg.GrafanaEnabled {
+			By("Capturing Grafana snapshot of benchmark dashboard")
+			snapshotURL, snapErr := grafanaClient.CreateSnapshot(scenarioStart)
+			if snapErr != nil {
+				GinkgoWriter.Printf("Warning: failed to create Grafana snapshot: %v\n", snapErr)
+			} else {
+				results.GrafanaSnapshotURL = snapshotURL
+				GinkgoWriter.Printf("Grafana snapshot: %s\n", snapshotURL)
+
+				if benchCfg.GrafanaSnapshotFile != "" {
+					if writeErr := os.WriteFile(benchCfg.GrafanaSnapshotFile, []byte(snapshotURL+"\n"), 0644); writeErr != nil {
+						GinkgoWriter.Printf("Warning: failed to write snapshot file: %v\n", writeErr)
+					}
+				}
+			}
+		}
 
 		By("Writing benchmark results to file")
 		data, err := json.MarshalIndent(results, "", "  ")

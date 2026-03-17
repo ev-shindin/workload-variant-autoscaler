@@ -1,0 +1,216 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "title": "Deployment Replicas",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "pointSize": 5,
+            "showPoints": "auto",
+            "spanNulls": true
+          },
+          "unit": "short",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "kube_deployment_spec_replicas{namespace=~\"llm-d.*\", deployment=~\"bench-.*\"}",
+          "legendFormat": "spec replicas",
+          "refId": "A"
+        },
+        {
+          "expr": "kube_deployment_status_replicas_ready{namespace=~\"llm-d.*\", deployment=~\"bench-.*\"}",
+          "legendFormat": "ready replicas",
+          "refId": "B"
+        }
+      ],
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+    {
+      "title": "WVA Desired Replicas",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": true
+          },
+          "unit": "short",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "wva_desired_replicas{namespace=~\"llm-d.*\"}",
+          "legendFormat": "{{variant}}",
+          "refId": "A"
+        }
+      ],
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+    {
+      "title": "KV Cache Usage",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 20,
+            "spanNulls": true
+          },
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.7 },
+              { "color": "red", "value": 0.9 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "vllm:gpu_cache_usage_perc{namespace=~\"llm-d.*\"}",
+          "legendFormat": "{{pod}}",
+          "refId": "A"
+        },
+        {
+          "expr": "avg(vllm:gpu_cache_usage_perc{namespace=~\"llm-d.*\"})",
+          "legendFormat": "avg",
+          "refId": "B"
+        }
+      ],
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+    {
+      "title": "Queue Depth (Requests Waiting)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": true
+          },
+          "unit": "short",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "vllm:num_requests_waiting{namespace=~\"llm-d.*\"}",
+          "legendFormat": "{{pod}} waiting",
+          "refId": "A"
+        },
+        {
+          "expr": "vllm:num_requests_running{namespace=~\"llm-d.*\"}",
+          "legendFormat": "{{pod}} running",
+          "refId": "B"
+        }
+      ],
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+    {
+      "title": "Saturation Metrics",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": true
+          },
+          "unit": "short",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "wva_saturation_score{namespace=~\"llm-d.*\"}",
+          "legendFormat": "saturation score {{variant}}",
+          "refId": "A"
+        },
+        {
+          "expr": "wva_capacity_score{namespace=~\"llm-d.*\"}",
+          "legendFormat": "capacity score {{variant}}",
+          "refId": "B"
+        }
+      ],
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } }
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["benchmark", "wva", "autoscaling"],
+  "templating": {
+    "list": [
+      {
+        "current": { "selected": false, "text": "Prometheus", "value": "Prometheus" },
+        "hide": 0,
+        "includeAll": false,
+        "name": "DS_PROMETHEUS",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "regex": "",
+        "type": "datasource"
+      }
+    ]
+  },
+  "time": { "from": "now-30m", "to": "now" },
+  "timepicker": {},
+  "timezone": "utc",
+  "title": "WVA Benchmark: Scale-Up Latency",
+  "uid": "wva-benchmark-scaleup",
+  "version": 1
+}
