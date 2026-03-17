@@ -975,6 +975,11 @@ type PrometheusClient struct {
 	client promv1.API
 }
 
+// API returns the underlying Prometheus v1 API for advanced queries (e.g., QueryRange).
+func (p *PrometheusClient) API() promv1.API {
+	return p.client
+}
+
 // creates a new Prometheus client for e2e tests
 func NewPrometheusClient(baseURL string, insecureSkipVerify bool) (*PrometheusClient, error) {
 	config := promAPI.Config{
