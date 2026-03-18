@@ -73,19 +73,16 @@ func DeployGrafana(ctx context.Context, k8sClient *kubernetes.Clientset, monitor
 		if listErr != nil || len(pods.Items) == 0 {
 			return false, nil
 		}
-		for _, pod := range pods.Items {
-			if len(pod.Status.ContainerStatuses) == 0 {
+		pod := pods.Items[0]
+		if len(pod.Status.ContainerStatuses) == 0 {
+			return false, nil
+		}
+		for _, cs := range pod.Status.ContainerStatuses {
+			if !cs.Ready {
 				return false, nil
 			}
-			for _, cs := range pod.Status.ContainerStatuses {
-				if !cs.Ready {
-					return false, nil
-				}
-			}
-			// Single container, and it's ready
-			return true, nil
 		}
-		return false, nil
+		return true, nil
 	})
 	if err != nil {
 		dumpGrafanaDiagnostics(ctx, k8sClient, monitoringNS)
