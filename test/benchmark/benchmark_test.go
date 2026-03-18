@@ -253,6 +253,71 @@ var _ = Describe("Scale-Up Latency Benchmark", Label("benchmark"), Ordered, func
 			g.Expect(readyCount).To(BeNumerically(">", 0))
 		}, 5*time.Minute, 10*time.Second).Should(Succeed())
 
+		By("Running in-cluster connectivity probe to diagnose load path")
+		probePodName := "bench-connectivity-probe"
+		probeScript := fmt.Sprintf(`#!/bin/sh
+echo "=== DNS Resolution ==="
+nslookup %s.%s.svc.cluster.local 2>&1 || echo "nslookup failed (tool may not exist)"
+echo ""
+echo "=== Service ClusterIP ==="
+getent hosts %s.%s.svc.cluster.local 2>&1 || echo "getent failed"
+echo ""
+echo "=== Curl verbose GET ==="
+curl -v --max-time 10 "%s" 2>&1
+echo ""
+echo "=== Curl verbose POST ==="
+curl -v --max-time 10 -X POST "%s" -H "Content-Type: application/json" -d '{"model":"test","prompt":"hello","max_tokens":1}' 2>&1
+echo ""
+echo "=== HTTP status code only ==="
+HTTP_CODE=$(curl -s -o /dev/null -w "%%{http_code}" "%s" 2>/dev/null)
+echo "HTTP status code: $HTTP_CODE"
+echo "Grep test: $(echo $HTTP_CODE | grep -E '^(200|404)' && echo PASS || echo FAIL)"
+`, serviceName, benchCfg.LLMDNamespace, serviceName, benchCfg.LLMDNamespace, targetURL, targetURL, targetURL)
+
+		probePod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      probePodName,
+				Namespace: benchCfg.LLMDNamespace,
+			},
+			Spec: corev1.PodSpec{
+				RestartPolicy: corev1.RestartPolicyNever,
+				Containers: []corev1.Container{
+					{
+						Name:    "probe",
+						Image:   "quay.io/curl/curl:8.11.1",
+						Command: []string{"/bin/sh", "-c"},
+						Args:    []string{probeScript},
+					},
+				},
+			},
+		}
+		_ = k8sClient.CoreV1().Pods(benchCfg.LLMDNamespace).Delete(ctx, probePodName, metav1.DeleteOptions{})
+		time.Sleep(2 * time.Second)
+		_, probeErr := k8sClient.CoreV1().Pods(benchCfg.LLMDNamespace).Create(ctx, probePod, metav1.CreateOptions{})
+		if probeErr != nil {
+			GinkgoWriter.Printf("Warning: could not create connectivity probe pod: %v\n", probeErr)
+		} else {
+			// Wait for probe to complete
+			Eventually(func(g Gomega) {
+				p, err := k8sClient.CoreV1().Pods(benchCfg.LLMDNamespace).Get(ctx, probePodName, metav1.GetOptions{})
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(p.Status.Phase).To(SatisfyAny(Equal(corev1.PodSucceeded), Equal(corev1.PodFailed)),
+					fmt.Sprintf("Probe pod phase: %s", p.Status.Phase))
+			}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+			// Collect logs
+			logReq := k8sClient.CoreV1().Pods(benchCfg.LLMDNamespace).GetLogs(probePodName, &corev1.PodLogOptions{})
+			logBytes, logErr := logReq.DoRaw(ctx)
+			if logErr == nil {
+				GinkgoWriter.Printf("=== CONNECTIVITY PROBE OUTPUT ===\n%s\n=== END PROBE ===\n", string(logBytes))
+			} else {
+				GinkgoWriter.Printf("Warning: could not get probe logs: %v\n", logErr)
+			}
+
+			// Cleanup
+			_ = k8sClient.CoreV1().Pods(benchCfg.LLMDNamespace).Delete(ctx, probePodName, metav1.DeleteOptions{})
+		}
+
 		By("Launching parallel load generation jobs")
 		loadCfg := fixtures.LoadConfig{
 			Strategy:     benchCfg.LoadStrategy,
