@@ -147,9 +147,9 @@ var _ = Describe("Scale-Up Latency Benchmark", Label("benchmark"), Ordered, func
 
 		By("Waiting for Prometheus to scrape simulator metrics")
 		Eventually(func(g Gomega) {
-			_, err := promClient.QueryWithRetry(ctx, `vllm:gpu_cache_usage_perc`)
+			_, err := promClient.QueryWithRetry(ctx, `vllm:kv_cache_usage_perc`)
 			g.Expect(err).NotTo(HaveOccurred(), "Prometheus should have KV cache metrics from simulator")
-			GinkgoWriter.Println("Prometheus confirmed: vllm:gpu_cache_usage_perc is available")
+			GinkgoWriter.Println("Prometheus confirmed: vllm:kv_cache_usage_perc is available")
 		}, 5*time.Minute, 15*time.Second).Should(Succeed())
 
 		scenarioStart = time.Now()
@@ -345,7 +345,7 @@ var _ = Describe("Scale-Up Latency Benchmark", Label("benchmark"), Ordered, func
 		sustainedEnd := time.Now()
 		kvAvg, err := QueryRangeAvg(
 			promClient.API(),
-			`avg(vllm:gpu_cache_usage_perc)`,
+			`avg(vllm:kv_cache_usage_perc)`,
 			sustainedStart, sustainedEnd,
 			30*time.Second,
 		)

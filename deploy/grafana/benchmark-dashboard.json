@@ -114,12 +114,12 @@
       },
       "targets": [
         {
-          "expr": "vllm:gpu_cache_usage_perc{namespace=~\"llm-d.*\"}",
+          "expr": "vllm:kv_cache_usage_perc{namespace=~\"llm-d.*\"}",
           "legendFormat": "{{pod}}",
           "refId": "A"
         },
         {
-          "expr": "avg(vllm:gpu_cache_usage_perc{namespace=~\"llm-d.*\"})",
+          "expr": "avg(vllm:kv_cache_usage_perc{namespace=~\"llm-d.*\"})",
           "legendFormat": "avg",
           "refId": "B"
         }
