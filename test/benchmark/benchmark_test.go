@@ -32,8 +32,10 @@ type BenchmarkResults struct {
 }
 
 // Benchmark load generation constants
+// Match e2e's maxSingleReplicaWorkers=1 — single-replica deployments need only 1 worker
+// to avoid overwhelming the simulator's max-num-seqs queue and causing request failures.
 const (
-	benchLoadWorkers       = 4
+	benchLoadWorkers       = 1
 	benchRequestsPerWorker = 1100
 	benchMaxTokens         = 400
 )
@@ -327,13 +329,23 @@ var _ = Describe("Scale-Up Latency Benchmark", Label("benchmark"), Ordered, func
 					}
 				}
 
-				// Load pod status
+				// Load pod status with log collection for failed pods
 				loadPods, podErr := k8sClient.CoreV1().Pods(benchCfg.LLMDNamespace).List(ctx, metav1.ListOptions{
 					LabelSelector: fmt.Sprintf("experiment=%s", jobBaseName),
 				})
 				if podErr == nil {
 					for _, pod := range loadPods.Items {
 						GinkgoWriter.Printf("  Load pod %s: phase=%s\n", pod.Name, pod.Status.Phase)
+						if pod.Status.Phase == corev1.PodFailed {
+							tailLines := int64(50)
+							logReq := k8sClient.CoreV1().Pods(benchCfg.LLMDNamespace).GetLogs(pod.Name, &corev1.PodLogOptions{TailLines: &tailLines})
+							logBytes, logErr := logReq.DoRaw(ctx)
+							if logErr == nil {
+								GinkgoWriter.Printf("  === FAILED POD LOGS (%s) ===\n%s\n  === END LOGS ===\n", pod.Name, string(logBytes))
+							} else {
+								GinkgoWriter.Printf("  Could not get logs for %s: %v\n", pod.Name, logErr)
+							}
+						}
 					}
 				}
 
