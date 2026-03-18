@@ -16,7 +16,8 @@ permissions:
 # - Valid triggers: group 'e2e-openshift-{pr_number}' or 'e2e-openshift-v2-{pr_number}' (can cancel previous runs for same PR)
 # - Fallback chain for ID: pull_request.number -> issue.number -> run_id
 #
-# NOTE: Valid command list must stay in sync with gate job validation (line ~125)
+# NOTE: Valid command list must stay in sync with gate job validation
+# /ok-to-test and /retest trigger both V1 and V2
 concurrency:
   group: >-
     ${{
@@ -180,7 +181,7 @@ jobs:
                 return;
               }
 
-              // NOTE: This list must stay in sync with concurrency group logic (lines 23-25)
+              // NOTE: This list must stay in sync with concurrency group logic
               const validCommands = ['/ok-to-test', '/retest', '/ok-to-test-v2', '/retest-v2'];
               if (!validCommands.includes(comment)) {
                 console.log(`Comment "${comment}" is not a valid trigger command, skipping`);
@@ -188,7 +189,7 @@ jobs:
                 return;
               }
 
-              // Determine if this is a V2 trigger
+              // Determine if this is a V2-only trigger
               const isV2 = comment.endsWith('-v2');
               const analyzerName = isV2 ? 'saturation' : '';
 
