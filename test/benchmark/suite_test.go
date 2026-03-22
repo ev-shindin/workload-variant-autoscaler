@@ -2,6 +2,7 @@ package benchmark
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"testing"
@@ -111,10 +112,10 @@ var _ = BeforeSuite(func() {
 	By("Verifying EPP pods are running")
 	Eventually(func(g Gomega) {
 		pods, err := k8sClient.CoreV1().Pods(benchCfg.LLMDNamespace).List(ctx, metav1.ListOptions{
-			LabelSelector: "app.kubernetes.io/name=inferencepool",
+			LabelSelector: fmt.Sprintf("inferencepool=%s", benchCfg.EPPServiceName),
 		})
 		g.Expect(err).NotTo(HaveOccurred())
-		g.Expect(pods.Items).NotTo(BeEmpty(), "No EPP pods found")
+		g.Expect(pods.Items).NotTo(BeEmpty(), "No EPP pods found with label inferencepool=%s", benchCfg.EPPServiceName)
 
 		runningPods := 0
 		for _, pod := range pods.Items {
