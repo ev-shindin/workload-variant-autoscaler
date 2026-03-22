@@ -234,13 +234,17 @@ var _ = Describe("Scale-Up Latency Benchmark", Label("benchmark"), Ordered, func
 		GinkgoWriter.Printf("Running spike phase for %v\n", spikeDuration)
 
 		spikeStart := time.Now()
-		targetURL := fmt.Sprintf("http://%s.%s.svc.cluster.local:8000/v1/completions", serviceName, benchCfg.LLMDNamespace)
+
+		// Route load through the Gateway → EPP → model server (full llm-d stack)
+		gwHost := fmt.Sprintf("%s.%s.svc.cluster.local", benchCfg.GatewayServiceName, benchCfg.LLMDNamespace)
+		targetURL := fmt.Sprintf("http://%s:%d/v1/completions", gwHost, benchCfg.GatewayServicePort)
+		GinkgoWriter.Printf("Load target URL (via Gateway): %s\n", targetURL)
 
 		By("Cleaning up any existing load jobs")
 		fixtures.DeleteParallelLoadJobs(ctx, k8sClient, jobBaseName, benchCfg.LLMDNamespace, benchLoadWorkers)
 		time.Sleep(2 * time.Second)
 
-		By("Waiting for service endpoints to exist")
+		By("Waiting for model service endpoints to exist")
 		Eventually(func(g Gomega) {
 			endpoints, err := k8sClient.CoreV1().Endpoints(benchCfg.LLMDNamespace).Get(ctx, serviceName, metav1.GetOptions{})
 			g.Expect(err).NotTo(HaveOccurred())
@@ -253,26 +257,27 @@ var _ = Describe("Scale-Up Latency Benchmark", Label("benchmark"), Ordered, func
 			g.Expect(readyCount).To(BeNumerically(">", 0))
 		}, 5*time.Minute, 10*time.Second).Should(Succeed())
 
-		By("Running in-cluster connectivity probe to diagnose load path")
+		By("Running in-cluster connectivity probe via Gateway")
 		probePodName := "bench-connectivity-probe"
 		probeScript := fmt.Sprintf(`#!/bin/sh
-echo "=== DNS Resolution ==="
-nslookup %s.%s.svc.cluster.local 2>&1 || echo "nslookup failed (tool may not exist)"
+echo "=== Gateway DNS Resolution ==="
+nslookup %s 2>&1 || echo "nslookup failed (tool may not exist)"
 echo ""
-echo "=== Service ClusterIP ==="
-getent hosts %s.%s.svc.cluster.local 2>&1 || echo "getent failed"
+echo "=== Gateway Service ClusterIP ==="
+getent hosts %s 2>&1 || echo "getent failed"
 echo ""
-echo "=== Curl verbose GET ==="
-curl -v --max-time 10 "%s" 2>&1
+echo "=== Direct model service check ==="
+HTTP_CODE=$(curl -s -o /dev/null -w "%%{http_code}" --max-time 10 "http://%s.%s.svc.cluster.local:8000/v1/completions" 2>/dev/null)
+echo "Direct model service HTTP status: $HTTP_CODE"
 echo ""
-echo "=== Curl verbose POST ==="
-curl -v --max-time 10 -X POST "%s" -H "Content-Type: application/json" -d '{"model":"test","prompt":"hello","max_tokens":1}' 2>&1
+echo "=== Gateway POST (full stack path) ==="
+curl -v --max-time 15 -X POST "%s" -H "Content-Type: application/json" -d '{"model":"%s","prompt":"hello","max_tokens":1}' 2>&1
 echo ""
-echo "=== HTTP status code only ==="
-HTTP_CODE=$(curl -s -o /dev/null -w "%%{http_code}" "%s" 2>/dev/null)
-echo "HTTP status code: $HTTP_CODE"
-echo "Grep test: $(echo $HTTP_CODE | grep -E '^(200|404)' && echo PASS || echo FAIL)"
-`, serviceName, benchCfg.LLMDNamespace, serviceName, benchCfg.LLMDNamespace, targetURL, targetURL, targetURL)
+echo "=== Gateway HTTP status code ==="
+HTTP_CODE=$(curl -s -o /dev/null -w "%%{http_code}" --max-time 15 -X POST "%s" -H "Content-Type: application/json" -d '{"model":"%s","prompt":"test","max_tokens":1}' 2>/dev/null)
+echo "Gateway HTTP status code: $HTTP_CODE"
+echo "Grep test: $(echo $HTTP_CODE | grep -E '^(200|404|405)' && echo PASS || echo FAIL)"
+`, gwHost, gwHost, serviceName, benchCfg.LLMDNamespace, targetURL, benchCfg.ModelID, targetURL, benchCfg.ModelID)
 
 		probePod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{

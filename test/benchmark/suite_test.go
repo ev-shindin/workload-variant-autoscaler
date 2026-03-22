@@ -52,6 +52,8 @@ var _ = BeforeSuite(func() {
 	GinkgoWriter.Printf("Environment: %s\n", benchCfg.Environment)
 	GinkgoWriter.Printf("WVA Namespace: %s\n", benchCfg.WVANamespace)
 	GinkgoWriter.Printf("LLMD Namespace: %s\n", benchCfg.LLMDNamespace)
+	GinkgoWriter.Printf("Gateway Service: %s:%d\n", benchCfg.GatewayServiceName, benchCfg.GatewayServicePort)
+	GinkgoWriter.Printf("EPP Service: %s\n", benchCfg.EPPServiceName)
 	GinkgoWriter.Printf("Results File: %s\n", benchCfg.BenchmarkResultsFile)
 	GinkgoWriter.Printf("===============================\n\n")
 
@@ -97,6 +99,32 @@ var _ = BeforeSuite(func() {
 		}
 		g.Expect(runningPods).To(BeNumerically(">", 0), "No running WVA controller pods")
 	}, 2*time.Minute, 5*time.Second).Should(Succeed(), "WVA controller should be running")
+
+	By("Verifying Gateway service exists")
+	Eventually(func(g Gomega) {
+		svc, err := k8sClient.CoreV1().Services(benchCfg.LLMDNamespace).Get(ctx, benchCfg.GatewayServiceName, metav1.GetOptions{})
+		g.Expect(err).NotTo(HaveOccurred(), "Gateway service %s not found in namespace %s", benchCfg.GatewayServiceName, benchCfg.LLMDNamespace)
+		g.Expect(svc.Spec.Ports).NotTo(BeEmpty(), "Gateway service has no ports")
+		GinkgoWriter.Printf("Gateway service %s found (type=%s)\n", svc.Name, svc.Spec.Type)
+	}, 2*time.Minute, 5*time.Second).Should(Succeed(), "Gateway service should exist")
+
+	By("Verifying EPP pods are running")
+	Eventually(func(g Gomega) {
+		pods, err := k8sClient.CoreV1().Pods(benchCfg.LLMDNamespace).List(ctx, metav1.ListOptions{
+			LabelSelector: "app.kubernetes.io/name=inferencepool",
+		})
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(pods.Items).NotTo(BeEmpty(), "No EPP pods found")
+
+		runningPods := 0
+		for _, pod := range pods.Items {
+			if pod.Status.Phase == corev1.PodRunning {
+				runningPods++
+			}
+		}
+		g.Expect(runningPods).To(BeNumerically(">", 0), "No running EPP pods")
+		GinkgoWriter.Printf("EPP: %d running pods\n", runningPods)
+	}, 2*time.Minute, 5*time.Second).Should(Succeed(), "EPP pods should be running")
 
 	By("Verifying Prometheus is available")
 	Eventually(func(g Gomega) {

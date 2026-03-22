@@ -26,11 +26,13 @@ type BenchmarkConfig struct {
 	ScalerBackend string
 	KEDANamespace string
 
-	// EPP configuration
-	EPPMode          string
-	PoolName         string
-	EndpointSelector map[string]string
-	EPPServiceName   string
+	// EPP / Gateway configuration
+	EPPMode            string
+	PoolName           string
+	EndpointSelector   map[string]string
+	EPPServiceName     string
+	GatewayServiceName string
+	GatewayServicePort int
 
 	// Model configuration
 	ModelID         string
@@ -67,8 +69,10 @@ type BenchmarkConfig struct {
 func LoadConfigFromEnv() BenchmarkConfig {
 	env := getEnv("ENVIRONMENT", "kind-emulator")
 	eppServiceDefault := "gaie-inference-scheduling-epp"
+	gatewayServiceDefault := "infra-inference-scheduling-inference-gateway-istio"
 	if env == "kind-emulator" {
 		eppServiceDefault = "gaie-sim-epp"
+		gatewayServiceDefault = "infra-sim-inference-gateway-istio"
 	}
 
 	return BenchmarkConfig{
@@ -85,10 +89,12 @@ func LoadConfigFromEnv() BenchmarkConfig {
 		ScalerBackend: getEnv("SCALER_BACKEND", "prometheus-adapter"),
 		KEDANamespace: getEnv("KEDA_NAMESPACE", "keda-system"),
 
-		EPPMode:          getEnv("EPP_MODE", "poolName"),
-		PoolName:         getEnv("POOL_NAME", ""),
-		EndpointSelector: parseEndpointSelector(getEnv("ENDPOINT_SELECTOR", "")),
-		EPPServiceName:   getEnv("EPP_SERVICE_NAME", eppServiceDefault),
+		EPPMode:            getEnv("EPP_MODE", "poolName"),
+		PoolName:           getEnv("POOL_NAME", ""),
+		EndpointSelector:   parseEndpointSelector(getEnv("ENDPOINT_SELECTOR", "")),
+		EPPServiceName:     getEnv("EPP_SERVICE_NAME", eppServiceDefault),
+		GatewayServiceName: getEnv("GATEWAY_SERVICE_NAME", gatewayServiceDefault),
+		GatewayServicePort: getEnvInt("GATEWAY_SERVICE_PORT", 80),
 
 		ModelID:         getEnv("MODEL_ID", "unsloth/Meta-Llama-3.1-8B"),
 		AcceleratorType: getEnv("ACCELERATOR_TYPE", "H100"),
