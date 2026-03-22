@@ -42,12 +42,12 @@
       },
       "targets": [
         {
-          "expr": "wva_desired_replicas{namespace=~\"llm-d.*\"}",
+          "expr": "wva_desired_replicas",
           "legendFormat": "desired {{variant_name}}",
           "refId": "A"
         },
         {
-          "expr": "wva_current_replicas{namespace=~\"llm-d.*\"}",
+          "expr": "wva_current_replicas",
           "legendFormat": "current {{variant_name}}",
           "refId": "B"
         }
@@ -76,7 +76,7 @@
       },
       "targets": [
         {
-          "expr": "wva_desired_ratio{namespace=~\"llm-d.*\"}",
+          "expr": "wva_desired_ratio",
           "legendFormat": "ratio {{variant_name}}",
           "refId": "A"
         }
@@ -182,17 +182,17 @@
       },
       "targets": [
         {
-          "expr": "wva_desired_replicas{namespace=~\"llm-d.*\"}",
+          "expr": "wva_desired_replicas",
           "legendFormat": "desired {{variant_name}}",
           "refId": "A"
         },
         {
-          "expr": "wva_current_replicas{namespace=~\"llm-d.*\"}",
+          "expr": "wva_current_replicas",
           "legendFormat": "current {{variant_name}}",
           "refId": "B"
         },
         {
-          "expr": "rate(wva_replica_scaling_total{namespace=~\"llm-d.*\"}[2m])",
+          "expr": "rate(wva_replica_scaling_total[2m])",
           "legendFormat": "scaling rate {{variant_name}} {{direction}}",
           "refId": "C"
         }
