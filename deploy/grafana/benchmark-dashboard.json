@@ -42,13 +42,13 @@
       },
       "targets": [
         {
-          "expr": "kube_deployment_spec_replicas{namespace=~\"llm-d.*\", deployment=~\"bench-.*\"}",
-          "legendFormat": "spec replicas",
+          "expr": "wva_desired_replicas{namespace=~\"llm-d.*\"}",
+          "legendFormat": "desired {{variant_name}}",
           "refId": "A"
         },
         {
-          "expr": "kube_deployment_status_replicas_ready{namespace=~\"llm-d.*\", deployment=~\"bench-.*\"}",
-          "legendFormat": "ready replicas",
+          "expr": "wva_current_replicas{namespace=~\"llm-d.*\"}",
+          "legendFormat": "current {{variant_name}}",
           "refId": "B"
         }
       ],
@@ -56,7 +56,7 @@
     },
     {
       "id": 2,
-      "title": "WVA Desired Replicas",
+      "title": "WVA Desired Ratio",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
@@ -76,8 +76,8 @@
       },
       "targets": [
         {
-          "expr": "wva_desired_replicas{namespace=~\"llm-d.*\"}",
-          "legendFormat": "{{variant}}",
+          "expr": "wva_desired_ratio{namespace=~\"llm-d.*\"}",
+          "legendFormat": "ratio {{variant_name}}",
           "refId": "A"
         }
       ],
@@ -162,7 +162,7 @@
     },
     {
       "id": 5,
-      "title": "Saturation Metrics",
+      "title": "Scaling Activity",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 24, "x": 0, "y": 16 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
@@ -182,14 +182,19 @@
       },
       "targets": [
         {
-          "expr": "wva_saturation_score{namespace=~\"llm-d.*\"}",
-          "legendFormat": "saturation score {{variant}}",
+          "expr": "wva_desired_replicas{namespace=~\"llm-d.*\"}",
+          "legendFormat": "desired {{variant_name}}",
           "refId": "A"
         },
         {
-          "expr": "wva_capacity_score{namespace=~\"llm-d.*\"}",
-          "legendFormat": "capacity score {{variant}}",
+          "expr": "wva_current_replicas{namespace=~\"llm-d.*\"}",
+          "legendFormat": "current {{variant_name}}",
           "refId": "B"
+        },
+        {
+          "expr": "rate(wva_replica_scaling_total{namespace=~\"llm-d.*\"}[2m])",
+          "legendFormat": "scaling rate {{variant_name}} {{direction}}",
+          "refId": "C"
         }
       ],
       "options": { "legend": { "displayMode": "list", "placement": "bottom" } }
