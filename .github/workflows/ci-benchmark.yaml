@@ -202,10 +202,12 @@ jobs:
           QUEUE_SPARE_TRIGGER: "4.5"
         run: make deploy-e2e-infra
 
-      - name: Pre-load Grafana image into Kind
+      - name: Pre-load Grafana images into Kind
         run: |
           docker pull docker.io/grafana/grafana:11.4.0
+          docker pull docker.io/grafana/grafana-image-renderer:3.11.6
           kind load docker-image docker.io/grafana/grafana:11.4.0 --name kind-wva-gpu-cluster
+          kind load docker-image docker.io/grafana/grafana-image-renderer:3.11.6 --name kind-wva-gpu-cluster
 
       - name: Run benchmark
         env:

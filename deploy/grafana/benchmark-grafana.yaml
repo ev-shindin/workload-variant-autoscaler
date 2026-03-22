@@ -67,6 +67,12 @@ spec:
               value: admin
             - name: GF_SECURITY_ADMIN_PASSWORD
               value: admin
+            - name: GF_RENDERING_SERVER_URL
+              value: http://localhost:8081/render
+            - name: GF_RENDERING_CALLBACK_URL
+              value: http://localhost:3000/
+            - name: GF_LOG_FILTERS
+              value: rendering:debug
           volumeMounts:
             - name: grafana-ini
               mountPath: /etc/grafana/grafana.ini
@@ -96,6 +102,24 @@ spec:
               port: 3000
             initialDelaySeconds: 15
             periodSeconds: 10
+        - name: renderer
+          image: docker.io/grafana/grafana-image-renderer:3.11.6
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8081
+              name: renderer
+          env:
+            - name: ENABLE_METRICS
+              value: "false"
+            - name: HTTP_PORT
+              value: "8081"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
       volumes:
         - name: grafana-ini
           configMap:
