@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 
@@ -34,7 +35,15 @@ type GrafanaClient struct {
 }
 
 // NewGrafanaClient sets up port-forward to Grafana and returns a client.
+// It first verifies the Grafana service exists to avoid a fatal assertion
+// inside SetUpPortForward if the service is missing.
 func NewGrafanaClient(k8sClient *kubernetes.Clientset, ctx context.Context, monitoringNS string) (*GrafanaClient, error) {
+	// Pre-check: verify the Grafana service exists before calling SetUpPortForward,
+	// which uses Expect() internally and would fail the entire suite.
+	if _, err := k8sClient.CoreV1().Services(monitoringNS).Get(ctx, grafanaSvcName, metav1.GetOptions{}); err != nil {
+		return nil, fmt.Errorf("grafana service %q not found in namespace %q: %w", grafanaSvcName, monitoringNS, err)
+	}
+
 	pfCmd := utils.SetUpPortForward(k8sClient, ctx, grafanaSvcName, monitoringNS, grafanaLocalPort, grafanaSvcPort)
 
 	baseURL := fmt.Sprintf("http://localhost:%d", grafanaLocalPort)
