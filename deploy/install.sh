@@ -1167,6 +1167,18 @@ deploy_benchmark_grafana() {
         kind load docker-image docker.io/grafana/grafana-image-renderer:3.11.6 --name "${CLUSTER_NAME:-kind-wva-gpu-cluster}" || true
     fi
 
+    # Create the benchmark-dashboard ConfigMap from the JSON file
+    local DASHBOARD_JSON="$WVA_PROJECT/deploy/grafana/benchmark-dashboard.json"
+    if [ -f "$DASHBOARD_JSON" ]; then
+        kubectl create configmap benchmark-dashboard \
+            --from-file=benchmark-dashboard.json="$DASHBOARD_JSON" \
+            -n "$MONITORING_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+    else
+        log_warning "Dashboard JSON not found: $DASHBOARD_JSON — Grafana will start without dashboard"
+        kubectl create configmap benchmark-dashboard \
+            -n "$MONITORING_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+    fi
+
     kubectl apply -n "$MONITORING_NAMESPACE" -f "$GRAFANA_YAML"
     log_info "Waiting for benchmark Grafana to be ready..."
     kubectl rollout status deployment/benchmark-grafana -n "$MONITORING_NAMESPACE" --timeout=120s || \
