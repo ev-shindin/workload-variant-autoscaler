@@ -425,22 +425,29 @@ var _ = Describe("Saturation Mode - Multiple VariantAutoscalings", Label("full")
 
 	It("should prefer cheaper variant (VA A) for scale-up when both variants are available", func() {
 		By("Generating load to both services")
+		// Use burst load (curl) instead of guidellm because the simulator only tracks
+		// KV cache for /v1/completions requests. guidellm defaults to /v1/chat/completions,
+		// which bypasses KV cache tracking and prevents saturation detection.
+		scaleUpPrompts := 2400
+		if cfg.NumPrompts > scaleUpPrompts {
+			scaleUpPrompts = cfg.NumPrompts
+		}
 		loadCfg := fixtures.LoadConfig{
 			Strategy:     cfg.LoadStrategy,
-			RequestRate:  cfg.RequestRate,
-			NumPrompts:   cfg.NumPrompts,
+			RequestRate:  0,              // Not used for burst pattern
+			NumPrompts:   scaleUpPrompts, // Enough prompts to sustain load across multiple engine cycles
 			InputTokens:  cfg.InputTokens,
-			OutputTokens: cfg.OutputTokens,
+			OutputTokens: 400, // High output tokens to hold KV cache and create queue pressure
 			ModelID:      cfg.ModelID,
 		}
 
-		// Create load jobs for both services
-		targetA := fmt.Sprintf("http://%s-service:8000", modelServiceA)
-		err := fixtures.CreateLoadJob(ctx, k8sClient, cfg.LLMDNamespace, "multi-load-a", targetA, loadCfg)
+		// Create burst load jobs targeting /v1/completions endpoint directly
+		targetA := fmt.Sprintf("http://%s-service.%s.svc.cluster.local:8000/v1/completions", modelServiceA, cfg.LLMDNamespace)
+		err := fixtures.EnsureBurstLoadJob(ctx, k8sClient, cfg.LLMDNamespace, "multi-load-a", targetA, loadCfg)
 		Expect(err).NotTo(HaveOccurred())
 
-		targetB := fmt.Sprintf("http://%s-service:8000", modelServiceB)
-		err = fixtures.CreateLoadJob(ctx, k8sClient, cfg.LLMDNamespace, "multi-load-b", targetB, loadCfg)
+		targetB := fmt.Sprintf("http://%s-service.%s.svc.cluster.local:8000/v1/completions", modelServiceB, cfg.LLMDNamespace)
+		err = fixtures.EnsureBurstLoadJob(ctx, k8sClient, cfg.LLMDNamespace, "multi-load-b", targetB, loadCfg)
 		Expect(err).NotTo(HaveOccurred())
 
 		jobNameA := "multi-load-a-load"
@@ -469,18 +476,17 @@ var _ = Describe("Saturation Mode - Multiple VariantAutoscalings", Label("full")
 		})
 
 		By("Waiting for both load jobs to complete")
-		// 8 minute timeout: guidellm needs time for tokenizer download on first run
 		Eventually(func(g Gomega) {
 			jobA, err := k8sClient.BatchV1().Jobs(cfg.LLMDNamespace).Get(ctx, jobNameA, metav1.GetOptions{})
 			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(jobA.Status.Succeeded).To(BeNumerically(">", 0), "Job A should complete successfully")
-		}, 8*time.Minute, 10*time.Second).Should(Succeed())
+		}, 10*time.Minute, 10*time.Second).Should(Succeed())
 
 		Eventually(func(g Gomega) {
 			jobB, err := k8sClient.BatchV1().Jobs(cfg.LLMDNamespace).Get(ctx, jobNameB, metav1.GetOptions{})
 			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(jobB.Status.Succeeded).To(BeNumerically(">", 0), "Job B should complete successfully")
-		}, 8*time.Minute, 10*time.Second).Should(Succeed())
+		}, 10*time.Minute, 10*time.Second).Should(Succeed())
 
 		By("Verifying VA A (cheaper) scaled up more than VA B")
 		vaAObj := &variantautoscalingv1alpha1.VariantAutoscaling{}
