@@ -469,17 +469,18 @@ var _ = Describe("Saturation Mode - Multiple VariantAutoscalings", Label("full")
 		})
 
 		By("Waiting for both load jobs to complete")
+		// 8 minute timeout: guidellm needs time for tokenizer download on first run
 		Eventually(func(g Gomega) {
 			jobA, err := k8sClient.BatchV1().Jobs(cfg.LLMDNamespace).Get(ctx, jobNameA, metav1.GetOptions{})
 			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(jobA.Status.Succeeded).To(BeNumerically(">", 0), "Job A should complete successfully")
-		}, 5*time.Minute, 10*time.Second).Should(Succeed())
+		}, 8*time.Minute, 10*time.Second).Should(Succeed())
 
 		Eventually(func(g Gomega) {
 			jobB, err := k8sClient.BatchV1().Jobs(cfg.LLMDNamespace).Get(ctx, jobNameB, metav1.GetOptions{})
 			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(jobB.Status.Succeeded).To(BeNumerically(">", 0), "Job B should complete successfully")
-		}, 5*time.Minute, 10*time.Second).Should(Succeed())
+		}, 8*time.Minute, 10*time.Second).Should(Succeed())
 
 		By("Verifying VA A (cheaper) scaled up more than VA B")
 		vaAObj := &variantautoscalingv1alpha1.VariantAutoscaling{}
