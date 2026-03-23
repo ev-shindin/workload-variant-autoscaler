@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"time"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 
@@ -32,110 +31,6 @@ type GrafanaClient struct {
 	baseURL        string
 	httpClient     *http.Client
 	portForwardCmd *exec.Cmd
-}
-
-// DeployGrafana deploys a standalone Grafana pod via kubectl apply,
-// provisions the benchmark dashboard, and waits for readiness.
-func DeployGrafana(ctx context.Context, k8sClient *kubernetes.Clientset, monitoringNS string) error {
-	projectDir, err := utils.GetProjectDir()
-	if err != nil {
-		return fmt.Errorf("get project dir: %w", err)
-	}
-
-	grafanaYAML := filepath.Join(projectDir, "deploy", "grafana", "benchmark-grafana.yaml")
-	dashboardFile := filepath.Join(projectDir, "deploy", "grafana", "benchmark-dashboard.json")
-
-	// Create the dashboard ConfigMap (the Grafana deployment mounts it as a volume)
-	cmCmd := exec.CommandContext(ctx, "kubectl", "create", "configmap", "benchmark-dashboard",
-		"--from-file=benchmark-dashboard.json="+dashboardFile,
-		"-n", monitoringNS,
-		"--dry-run=client", "-o", "yaml")
-	cmYaml, err := cmCmd.Output()
-	if err != nil {
-		return fmt.Errorf("generate dashboard configmap yaml: %w", err)
-	}
-
-	applyCmd := exec.CommandContext(ctx, "kubectl", "apply", "-f", "-", "-n", monitoringNS)
-	applyCmd.Stdin = bytes.NewReader(cmYaml)
-	if out, err := applyCmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("apply dashboard configmap: %s: %w", string(out), err)
-	}
-
-	// Apply the standalone Grafana deployment + service + config
-	applyGrafana := exec.CommandContext(ctx, "kubectl", "apply", "-f", grafanaYAML, "-n", monitoringNS)
-	if out, err := applyGrafana.CombinedOutput(); err != nil {
-		return fmt.Errorf("apply grafana deployment: %s: %w", string(out), err)
-	}
-
-	// Wait for Grafana pod to be ready
-	err = wait.PollUntilContextTimeout(ctx, 5*time.Second, 5*time.Minute, true, func(ctx context.Context) (bool, error) {
-		pods, listErr := k8sClient.CoreV1().Pods(monitoringNS).List(ctx, labelSelector("app=benchmark-grafana"))
-		if listErr != nil || len(pods.Items) == 0 {
-			return false, nil
-		}
-		pod := pods.Items[0]
-		if len(pod.Status.ContainerStatuses) == 0 {
-			return false, nil
-		}
-		for _, cs := range pod.Status.ContainerStatuses {
-			if !cs.Ready {
-				return false, nil
-			}
-		}
-		return true, nil
-	})
-	if err != nil {
-		dumpGrafanaDiagnostics(ctx, k8sClient, monitoringNS)
-		return fmt.Errorf("waiting for grafana pod: %w", err)
-	}
-
-	return nil
-}
-
-// dumpGrafanaDiagnostics prints pod status, events, and service info to help debug failures.
-func dumpGrafanaDiagnostics(ctx context.Context, k8sClient *kubernetes.Clientset, ns string) {
-	fmt.Println("=== Grafana Diagnostics ===")
-
-	pods, err := k8sClient.CoreV1().Pods(ns).List(ctx, labelSelector("app=benchmark-grafana"))
-	if err != nil {
-		fmt.Printf("Could not list grafana pods: %v\n", err)
-	} else if len(pods.Items) == 0 {
-		fmt.Println("No grafana pods found")
-	} else {
-		for _, pod := range pods.Items {
-			fmt.Printf("Pod %s: phase=%s\n", pod.Name, pod.Status.Phase)
-			for _, cs := range pod.Status.ContainerStatuses {
-				fmt.Printf("  Container %s: ready=%v, restarts=%d, state=%+v\n",
-					cs.Name, cs.Ready, cs.RestartCount, cs.State)
-			}
-			for _, cs := range pod.Status.InitContainerStatuses {
-				fmt.Printf("  InitContainer %s: ready=%v, state=%+v\n",
-					cs.Name, cs.Ready, cs.State)
-			}
-		}
-	}
-
-	events, err := k8sClient.CoreV1().Events(ns).List(ctx, metav1.ListOptions{
-		FieldSelector: "involvedObject.kind=Pod",
-	})
-	if err == nil {
-		for _, ev := range events.Items {
-			if ev.InvolvedObject.Name != "" && ev.Reason != "" {
-				if ev.Count > 0 {
-					fmt.Printf("Event: %s %s: %s (x%d)\n", ev.InvolvedObject.Name, ev.Reason, ev.Message, ev.Count)
-				}
-			}
-		}
-	}
-
-	svc, err := k8sClient.CoreV1().Services(ns).Get(ctx, grafanaSvcName, metav1.GetOptions{})
-	if err != nil {
-		fmt.Printf("Could not get grafana service: %v\n", err)
-	} else {
-		fmt.Printf("Service %s: type=%s, ports=%v\n", svc.Name, svc.Spec.Type, svc.Spec.Ports)
-	}
-
-	fmt.Println("=== End Grafana Diagnostics ===")
 }
 
 // NewGrafanaClient sets up port-forward to Grafana and returns a client.
@@ -163,8 +58,7 @@ func NewGrafanaClient(k8sClient *kubernetes.Clientset, ctx context.Context, moni
 		return true, nil
 	})
 	if err != nil {
-		fmt.Printf("Grafana health check failed after %d attempts — dumping diagnostics\n", attempts)
-		dumpGrafanaDiagnostics(ctx, k8sClient, monitoringNS)
+		fmt.Printf("Grafana health check failed after %d attempts\n", attempts)
 		if pfCmd.Process != nil {
 			_ = pfCmd.Process.Kill()
 		}
@@ -371,9 +265,4 @@ func (g *GrafanaClient) RenderAllPanels(from, to time.Time, outputDir string) ([
 	}
 
 	return rendered, nil
-}
-
-// helper to build a ListOptions with a label selector
-func labelSelector(sel string) metav1.ListOptions {
-	return metav1.ListOptions{LabelSelector: sel}
 }
