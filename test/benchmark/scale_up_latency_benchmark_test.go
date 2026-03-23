@@ -1,15 +1,30 @@
+// Scenario: scale-up-latency
+//
+// Measures how quickly WVA scales from min to target replicas under sudden load.
+//
+//	phases:
+//	  - baseline (2m):  no load, establish baseline metrics, verify stable at 1 replica
+//	  - spike (5m):     burst load via parallel curl workers targeting /v1/completions,
+//	                    measure time to first scale-up (VA → HPA → deployment)
+//	  - sustained (3m): load continues, collect replica stability (stddev),
+//	                    avg KV cache usage and queue depth from Prometheus
+//	  - cooldown (5m):  remove load, measure time to scale back down to 1 replica
+//
+//	metrics:
+//	  - scale_up_time_seconds:   time from load start to VA recommending >1 replicas
+//	  - scale_down_time_seconds: time from load removal to deployment returning to 1 replica
+//	  - max_replicas_reached:    peak replica count during spike+sustained
+//	  - replica_oscillation:     stddev of replica samples during sustained phase
+//	  - avg_kv_cache_usage:      mean KV cache utilization during sustained phase
+//	  - avg_queue_depth:         mean queue depth during sustained phase
 package benchmark
 
 import (
-	"encoding/json"
 	"fmt"
-	"math"
-	"os"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	promoperator "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -19,19 +34,7 @@ import (
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/test/e2e/fixtures"
 )
 
-// BenchmarkResults holds the collected metrics from the benchmark scenario.
-type BenchmarkResults struct {
-	ScaleUpTimeSec     float64 `json:"scaleUpTimeSec"`
-	ScaleDownTimeSec   float64 `json:"scaleDownTimeSec"`
-	MaxReplicas        int32   `json:"maxReplicas"`
-	AvgKVCacheUsage    float64 `json:"avgKVCacheUsage"`
-	AvgQueueDepth      float64 `json:"avgQueueDepth"`
-	ReplicaOscillation float64 `json:"replicaOscillation"`
-	TotalDurationSec   float64 `json:"totalDurationSec"`
-	GrafanaSnapshotURL string  `json:"grafanaSnapshotUrl,omitempty"`
-}
-
-// Benchmark load generation constants
+// Benchmark load generation constants.
 // Match e2e's maxSingleReplicaWorkers=1 — single-replica deployments need only 1 worker
 // to avoid overwhelming the simulator's max-num-seqs queue and causing request failures.
 const (
@@ -42,172 +45,28 @@ const (
 
 var _ = Describe("Scale-Up Latency Benchmark", Label("benchmark"), Ordered, func() {
 	var (
-		poolName         = "bench-pool"
-		modelServiceName = "bench-ms"
-		vaName           = "bench-va"
-		hpaName          = "bench-hpa"
-		deploymentName   string
-		serviceName      string
-		jobBaseName      string
+		res = ScenarioResources{
+			PoolName:       "bench-pool",
+			ModelService:   "bench-ms",
+			DeploymentName: "bench-ms-decode",
+			ServiceName:    "bench-ms-service",
+			VAName:         "bench-va",
+			HPAName:        "bench-hpa",
+			JobBaseName:    "bench-ms",
+		}
 
 		results       BenchmarkResults
 		scenarioStart time.Time
 	)
 
 	BeforeAll(func() {
-		deploymentName = modelServiceName + "-decode"
-		serviceName = modelServiceName + "-service"
-		jobBaseName = "bench-ms"
-
-		By("Creating model service deployment")
-		err := fixtures.EnsureModelService(ctx, k8sClient, benchCfg.LLMDNamespace, modelServiceName, poolName, benchCfg.ModelID, benchCfg.UseSimulator, benchCfg.MaxNumSeqs)
-		Expect(err).NotTo(HaveOccurred(), "Failed to create model service")
-
-		DeferCleanup(func() {
-			_ = k8sClient.AppsV1().Deployments(benchCfg.LLMDNamespace).Delete(ctx, deploymentName, metav1.DeleteOptions{})
-		})
-
-		By("Creating service to expose model server")
-		err = fixtures.EnsureService(ctx, k8sClient, benchCfg.LLMDNamespace, modelServiceName, deploymentName, 8000)
-		Expect(err).NotTo(HaveOccurred(), "Failed to create service")
-
-		DeferCleanup(func() {
-			_ = k8sClient.CoreV1().Services(benchCfg.LLMDNamespace).Delete(ctx, serviceName, metav1.DeleteOptions{})
-		})
-
-		By("Creating ServiceMonitor for metrics scraping")
-		err = fixtures.EnsureServiceMonitor(ctx, crClient, benchCfg.MonitoringNS, benchCfg.LLMDNamespace, modelServiceName, deploymentName)
-		Expect(err).NotTo(HaveOccurred(), "Failed to create ServiceMonitor")
-
-		DeferCleanup(func() {
-			serviceMonitorName := modelServiceName + "-monitor"
-			_ = crClient.Delete(ctx, &promoperator.ServiceMonitor{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      serviceMonitorName,
-					Namespace: benchCfg.MonitoringNS,
-				},
-			})
-		})
-
-		By("Creating VariantAutoscaling resource")
-		err = fixtures.EnsureVariantAutoscalingWithDefaults(
-			ctx, crClient, benchCfg.LLMDNamespace, vaName,
-			deploymentName, benchCfg.ModelID, benchCfg.AcceleratorType,
-			benchCfg.ControllerInstance,
-		)
-		Expect(err).NotTo(HaveOccurred(), "Failed to create VariantAutoscaling")
-
-		DeferCleanup(func() {
-			va := &variantautoscalingv1alpha1.VariantAutoscaling{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      vaName,
-					Namespace: benchCfg.LLMDNamespace,
-				},
-			}
-			_ = crClient.Delete(ctx, va)
-		})
-
-		By("Creating HPA for the deployment")
-		err = fixtures.EnsureHPA(ctx, k8sClient, benchCfg.LLMDNamespace, hpaName, deploymentName, vaName, 1, 10)
-		Expect(err).NotTo(HaveOccurred(), "Failed to create HPA")
-
-		DeferCleanup(func() {
-			hpaNameFull := hpaName + "-hpa"
-			_ = k8sClient.AutoscalingV2().HorizontalPodAutoscalers(benchCfg.LLMDNamespace).Delete(ctx, hpaNameFull, metav1.DeleteOptions{})
-		})
-
-		By("Waiting for deployment to be ready at 1 replica")
-		Eventually(func(g Gomega) {
-			deployment, err := k8sClient.AppsV1().Deployments(benchCfg.LLMDNamespace).Get(ctx, deploymentName, metav1.GetOptions{})
-			g.Expect(err).NotTo(HaveOccurred())
-			g.Expect(deployment.Status.ReadyReplicas).To(BeNumerically(">=", 1), "Deployment should have at least 1 ready replica")
-		}, 5*time.Minute, 5*time.Second).Should(Succeed())
-
-		By("Waiting for VA to stabilize")
-		Eventually(func(g Gomega) {
-			currentVA := &variantautoscalingv1alpha1.VariantAutoscaling{}
-			err := crClient.Get(ctx, client.ObjectKey{
-				Namespace: benchCfg.LLMDNamespace,
-				Name:      vaName,
-			}, currentVA)
-			g.Expect(err).NotTo(HaveOccurred())
-			g.Expect(currentVA.Status.DesiredOptimizedAlloc.NumReplicas).NotTo(BeNil(), "NumReplicas should be set")
-			g.Expect(*currentVA.Status.DesiredOptimizedAlloc.NumReplicas).To(BeNumerically(">=", 1), "VA should have optimized >= 1")
-		}, 5*time.Minute, 10*time.Second).Should(Succeed())
-
-		By("Verifying external metrics API serves wva_desired_replicas")
-		Eventually(func(g Gomega) {
-			result, err := k8sClient.RESTClient().
-				Get().
-				AbsPath("/apis/external.metrics.k8s.io/v1beta1/namespaces/" + benchCfg.LLMDNamespace + "/wva_desired_replicas").
-				DoRaw(ctx)
-			g.Expect(err).NotTo(HaveOccurred(), "External metrics API should be accessible")
-			g.Expect(string(result)).To(ContainSubstring("wva_desired_replicas"), "Metric should be available")
-			g.Expect(string(result)).To(ContainSubstring(vaName), "Metric should reference the benchmark VA")
-			GinkgoWriter.Printf("External metrics API confirmed: wva_desired_replicas available for %s\n", vaName)
-		}, 5*time.Minute, 10*time.Second).Should(Succeed())
-
-		By("Waiting for Prometheus to scrape simulator metrics")
-		Eventually(func(g Gomega) {
-			_, err := promClient.QueryWithRetry(ctx, `vllm:kv_cache_usage_perc`)
-			g.Expect(err).NotTo(HaveOccurred(), "Prometheus should have KV cache metrics from simulator")
-			GinkgoWriter.Println("Prometheus confirmed: vllm:kv_cache_usage_perc is available")
-		}, 5*time.Minute, 15*time.Second).Should(Succeed())
-
+		SetupBenchmarkScenario(res)
 		scenarioStart = time.Now()
-		GinkgoWriter.Println("BeforeAll completed — metrics pipeline verified, benchmark scenario starting")
+		GinkgoWriter.Println("Benchmark scenario starting")
 	})
 
 	AfterAll(func() {
-		results.TotalDurationSec = time.Since(scenarioStart).Seconds()
-
-		if grafanaClient != nil && benchCfg.GrafanaEnabled {
-			By("Capturing Grafana snapshot of benchmark dashboard")
-			snapResult, snapErr := grafanaClient.CreateSnapshot(scenarioStart)
-			if snapErr != nil {
-				GinkgoWriter.Printf("Warning: failed to create Grafana snapshot: %v\n", snapErr)
-			} else {
-				results.GrafanaSnapshotURL = snapResult.URL
-				GinkgoWriter.Printf("Grafana snapshot: %s\n", snapResult.URL)
-
-				if benchCfg.GrafanaSnapshotFile != "" {
-					if writeErr := os.WriteFile(benchCfg.GrafanaSnapshotFile, []byte(snapResult.URL+"\n"), 0644); writeErr != nil {
-						GinkgoWriter.Printf("Warning: failed to write snapshot URL file: %v\n", writeErr)
-					}
-				}
-
-				// Export full snapshot JSON for offline re-import
-				if benchCfg.GrafanaSnapshotJSONFile != "" {
-					By("Exporting Grafana snapshot JSON")
-					if exportErr := grafanaClient.ExportSnapshotJSON(snapResult.Key, benchCfg.GrafanaSnapshotJSONFile); exportErr != nil {
-						GinkgoWriter.Printf("Warning: failed to export snapshot JSON: %v\n", exportErr)
-					} else {
-						GinkgoWriter.Printf("Snapshot JSON exported to %s\n", benchCfg.GrafanaSnapshotJSONFile)
-					}
-				}
-			}
-
-			// Render all panels to PNG
-			if benchCfg.GrafanaPanelDir != "" {
-				By("Rendering dashboard panels to PNG")
-				panelFiles, renderErr := grafanaClient.RenderAllPanels(scenarioStart, time.Now(), benchCfg.GrafanaPanelDir)
-				if renderErr != nil {
-					GinkgoWriter.Printf("Warning: panel rendering failed: %v\n", renderErr)
-				} else {
-					GinkgoWriter.Printf("Rendered %d panels to %s\n", len(panelFiles), benchCfg.GrafanaPanelDir)
-				}
-			}
-		}
-
-		By("Writing benchmark results to file")
-		data, err := json.MarshalIndent(results, "", "  ")
-		Expect(err).NotTo(HaveOccurred(), "Failed to marshal results")
-
-		err = os.WriteFile(benchCfg.BenchmarkResultsFile, data, 0644)
-		Expect(err).NotTo(HaveOccurred(), "Failed to write results file")
-
-		GinkgoWriter.Printf("Benchmark results written to %s\n", benchCfg.BenchmarkResultsFile)
-		GinkgoWriter.Printf("Results: %s\n", string(data))
+		CaptureResultsAndGrafana(&results, scenarioStart)
 	})
 
 	It("Phase 1: Baseline — verify stable at 1 replica", func() {
@@ -216,7 +75,7 @@ var _ = Describe("Scale-Up Latency Benchmark", Label("benchmark"), Ordered, func
 
 		deadline := time.Now().Add(baselineDuration)
 		for time.Now().Before(deadline) {
-			deployment, err := k8sClient.AppsV1().Deployments(benchCfg.LLMDNamespace).Get(ctx, deploymentName, metav1.GetOptions{})
+			deployment, err := k8sClient.AppsV1().Deployments(benchCfg.LLMDNamespace).Get(ctx, res.DeploymentName, metav1.GetOptions{})
 			Expect(err).NotTo(HaveOccurred())
 
 			replicas := deployment.Status.ReadyReplicas
@@ -235,36 +94,32 @@ var _ = Describe("Scale-Up Latency Benchmark", Label("benchmark"), Ordered, func
 
 		spikeStart := time.Now()
 
-		// Route load through the Gateway → EPP → model server (full llm-d stack)
-		gwHost := fmt.Sprintf("%s.%s.svc.cluster.local", benchCfg.GatewayServiceName, benchCfg.LLMDNamespace)
-		targetURL := fmt.Sprintf("http://%s:%d/v1/completions", gwHost, benchCfg.GatewayServicePort)
+		targetURL := GatewayTargetURL()
 		GinkgoWriter.Printf("Load target URL (via Gateway): %s\n", targetURL)
 
 		By("Cleaning up any existing load jobs")
-		fixtures.DeleteParallelLoadJobs(ctx, k8sClient, jobBaseName, benchCfg.LLMDNamespace, benchLoadWorkers)
+		fixtures.DeleteParallelLoadJobs(ctx, k8sClient, res.JobBaseName, benchCfg.LLMDNamespace, benchLoadWorkers)
 		time.Sleep(2 * time.Second)
 
 		By("Waiting for model service endpoints to exist")
 		Eventually(func(g Gomega) {
-			endpoints, err := k8sClient.CoreV1().Endpoints(benchCfg.LLMDNamespace).Get(ctx, serviceName, metav1.GetOptions{})
+			endpoints, err := k8sClient.CoreV1().Endpoints(benchCfg.LLMDNamespace).Get(ctx, res.ServiceName, metav1.GetOptions{})
 			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(endpoints.Subsets).NotTo(BeEmpty())
 			readyCount := 0
 			for _, subset := range endpoints.Subsets {
 				readyCount += len(subset.Addresses)
 			}
-			GinkgoWriter.Printf("Service %s has %d ready endpoints\n", serviceName, readyCount)
+			GinkgoWriter.Printf("Service %s has %d ready endpoints\n", res.ServiceName, readyCount)
 			g.Expect(readyCount).To(BeNumerically(">", 0))
 		}, 5*time.Minute, 10*time.Second).Should(Succeed())
 
 		By("Running in-cluster connectivity probe via Gateway")
+		gwHost := fmt.Sprintf("%s.%s.svc.cluster.local", benchCfg.GatewayServiceName, benchCfg.LLMDNamespace)
 		probePodName := "bench-connectivity-probe"
 		probeScript := fmt.Sprintf(`#!/bin/sh
 echo "=== Gateway DNS Resolution ==="
 nslookup %s 2>&1 || echo "nslookup failed (tool may not exist)"
-echo ""
-echo "=== Gateway Service ClusterIP ==="
-getent hosts %s 2>&1 || echo "getent failed"
 echo ""
 echo "=== Direct model service check ==="
 HTTP_CODE=$(curl -s -o /dev/null -w "%%{http_code}" --max-time 10 "http://%s.%s.svc.cluster.local:8000/v1/completions" 2>/dev/null)
@@ -276,8 +131,7 @@ echo ""
 echo "=== Gateway HTTP status code ==="
 HTTP_CODE=$(curl -s -o /dev/null -w "%%{http_code}" --max-time 15 -X POST "%s" -H "Content-Type: application/json" -d '{"model":"%s","prompt":"test","max_tokens":1}' 2>/dev/null)
 echo "Gateway HTTP status code: $HTTP_CODE"
-echo "Grep test: $(echo $HTTP_CODE | grep -E '^(200|404|405)' && echo PASS || echo FAIL)"
-`, gwHost, gwHost, serviceName, benchCfg.LLMDNamespace, targetURL, benchCfg.ModelID, targetURL, benchCfg.ModelID)
+`, gwHost, res.ServiceName, benchCfg.LLMDNamespace, targetURL, benchCfg.ModelID, targetURL, benchCfg.ModelID)
 
 		probePod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
@@ -302,7 +156,6 @@ echo "Grep test: $(echo $HTTP_CODE | grep -E '^(200|404|405)' && echo PASS || ec
 		if probeErr != nil {
 			GinkgoWriter.Printf("Warning: could not create connectivity probe pod: %v\n", probeErr)
 		} else {
-			// Wait for probe to complete
 			Eventually(func(g Gomega) {
 				p, err := k8sClient.CoreV1().Pods(benchCfg.LLMDNamespace).Get(ctx, probePodName, metav1.GetOptions{})
 				g.Expect(err).NotTo(HaveOccurred())
@@ -310,16 +163,12 @@ echo "Grep test: $(echo $HTTP_CODE | grep -E '^(200|404|405)' && echo PASS || ec
 					fmt.Sprintf("Probe pod phase: %s", p.Status.Phase))
 			}, 2*time.Minute, 5*time.Second).Should(Succeed())
 
-			// Collect logs
 			logReq := k8sClient.CoreV1().Pods(benchCfg.LLMDNamespace).GetLogs(probePodName, &corev1.PodLogOptions{})
 			logBytes, logErr := logReq.DoRaw(ctx)
 			if logErr == nil {
 				GinkgoWriter.Printf("=== CONNECTIVITY PROBE OUTPUT ===\n%s\n=== END PROBE ===\n", string(logBytes))
-			} else {
-				GinkgoWriter.Printf("Warning: could not get probe logs: %v\n", logErr)
 			}
 
-			// Cleanup
 			_ = k8sClient.CoreV1().Pods(benchCfg.LLMDNamespace).Delete(ctx, probePodName, metav1.DeleteOptions{})
 		}
 
@@ -331,17 +180,17 @@ echo "Grep test: $(echo $HTTP_CODE | grep -E '^(200|404|405)' && echo PASS || ec
 			OutputTokens: benchMaxTokens,
 			ModelID:      benchCfg.ModelID,
 		}
-		err := fixtures.EnsureParallelLoadJobs(ctx, k8sClient, jobBaseName, benchCfg.LLMDNamespace, targetURL, benchLoadWorkers, loadCfg)
+		err := fixtures.EnsureParallelLoadJobs(ctx, k8sClient, res.JobBaseName, benchCfg.LLMDNamespace, targetURL, benchLoadWorkers, loadCfg)
 		Expect(err).NotTo(HaveOccurred(), "Failed to create load generation jobs")
 
 		DeferCleanup(func() {
-			fixtures.DeleteParallelLoadJobs(ctx, k8sClient, jobBaseName, benchCfg.LLMDNamespace, benchLoadWorkers)
+			fixtures.DeleteParallelLoadJobs(ctx, k8sClient, res.JobBaseName, benchCfg.LLMDNamespace, benchLoadWorkers)
 		})
 
 		By("Waiting for load job pods to be running")
 		Eventually(func(g Gomega) {
 			podList, err := k8sClient.CoreV1().Pods(benchCfg.LLMDNamespace).List(ctx, metav1.ListOptions{
-				LabelSelector: fmt.Sprintf("experiment=%s", jobBaseName),
+				LabelSelector: fmt.Sprintf("experiment=%s", res.JobBaseName),
 			})
 			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(len(podList.Items)).To(BeNumerically(">=", benchLoadWorkers), "All job pods should exist")
@@ -361,7 +210,6 @@ echo "Grep test: $(echo $HTTP_CODE | grep -E '^(200|404|405)' && echo PASS || ec
 		time.Sleep(30 * time.Second)
 		GinkgoWriter.Println("Load ramp-up complete, monitoring VA for scale-up")
 
-		// Phase 2a: Monitor VA status for scale-up intent (matches e2e flow)
 		By("Monitoring VariantAutoscaling for scale-up recommendation")
 		vaScaleUpDetected := false
 		vaCheckStart := time.Now()
@@ -372,7 +220,7 @@ echo "Grep test: $(echo $HTTP_CODE | grep -E '^(200|404|405)' && echo PASS || ec
 			elapsed := time.Since(vaCheckStart)
 
 			currentVA := &variantautoscalingv1alpha1.VariantAutoscaling{}
-			err := crClient.Get(ctx, client.ObjectKey{Namespace: benchCfg.LLMDNamespace, Name: vaName}, currentVA)
+			err := crClient.Get(ctx, client.ObjectKey{Namespace: benchCfg.LLMDNamespace, Name: res.VAName}, currentVA)
 			g.Expect(err).NotTo(HaveOccurred())
 
 			var optimized int32
@@ -383,9 +231,8 @@ echo "Grep test: $(echo $HTTP_CODE | grep -E '^(200|404|405)' && echo PASS || ec
 				vaAttempt, elapsed.Round(time.Second), optimized)
 
 			// Dump diagnostics every 30s
-			if vaAttempt%3 == 1 {
-				// HPA status
-				hpaNameFull := hpaName + "-hpa"
+			if vaAttempt % 3 == 1 {
+				hpaNameFull := res.HPAName + "-hpa"
 				hpa, hpaErr := k8sClient.AutoscalingV2().HorizontalPodAutoscalers(benchCfg.LLMDNamespace).Get(ctx, hpaNameFull, metav1.GetOptions{})
 				if hpaErr == nil {
 					GinkgoWriter.Printf("  HPA: desired=%d, current=%d\n", hpa.Status.DesiredReplicas, hpa.Status.CurrentReplicas)
@@ -399,9 +246,8 @@ echo "Grep test: $(echo $HTTP_CODE | grep -E '^(200|404|405)' && echo PASS || ec
 					}
 				}
 
-				// Load pod status with log collection for failed pods
 				loadPods, podErr := k8sClient.CoreV1().Pods(benchCfg.LLMDNamespace).List(ctx, metav1.ListOptions{
-					LabelSelector: fmt.Sprintf("experiment=%s", jobBaseName),
+					LabelSelector: fmt.Sprintf("experiment=%s", res.JobBaseName),
 				})
 				if podErr == nil {
 					for _, pod := range loadPods.Items {
@@ -412,14 +258,11 @@ echo "Grep test: $(echo $HTTP_CODE | grep -E '^(200|404|405)' && echo PASS || ec
 							logBytes, logErr := logReq.DoRaw(ctx)
 							if logErr == nil {
 								GinkgoWriter.Printf("  === FAILED POD LOGS (%s) ===\n%s\n  === END LOGS ===\n", pod.Name, string(logBytes))
-							} else {
-								GinkgoWriter.Printf("  Could not get logs for %s: %v\n", pod.Name, logErr)
 							}
 						}
 					}
 				}
 
-				// Prometheus metrics
 				if promClient != nil {
 					kvVal, kvErr := promClient.QueryWithRetry(ctx, `avg(vllm:kv_cache_usage_perc)`)
 					qdVal, qdErr := promClient.QueryWithRetry(ctx, `avg(vllm:num_requests_waiting)`)
@@ -439,10 +282,9 @@ echo "Grep test: $(echo $HTTP_CODE | grep -E '^(200|404|405)' && echo PASS || ec
 			GinkgoWriter.Printf("VA scale-up detected at %.1fs\n", results.ScaleUpTimeSec)
 		}
 
-		// Phase 2b: Monitor HPA for scale-up (matches e2e flow)
 		By("Monitoring HPA for scale-up")
 		Eventually(func(g Gomega) {
-			hpaNameFull := hpaName + "-hpa"
+			hpaNameFull := res.HPAName + "-hpa"
 			hpa, err := k8sClient.AutoscalingV2().HorizontalPodAutoscalers(benchCfg.LLMDNamespace).Get(ctx, hpaNameFull, metav1.GetOptions{})
 			g.Expect(err).NotTo(HaveOccurred())
 			GinkgoWriter.Printf("HPA: desired=%d, current=%d\n", hpa.Status.DesiredReplicas, hpa.Status.CurrentReplicas)
@@ -450,11 +292,10 @@ echo "Grep test: $(echo $HTTP_CODE | grep -E '^(200|404|405)' && echo PASS || ec
 				fmt.Sprintf("HPA should desire >1 replicas (current: %d)", hpa.Status.DesiredReplicas))
 		}, 5*time.Minute, 10*time.Second).Should(Succeed())
 
-		// Phase 2c: Monitor deployment for actual scale-up (matches e2e flow)
 		By("Monitoring deployment for actual scale-up")
 		var maxReplicas int32 = 1
 		Eventually(func(g Gomega) {
-			deployment, err := k8sClient.AppsV1().Deployments(benchCfg.LLMDNamespace).Get(ctx, deploymentName, metav1.GetOptions{})
+			deployment, err := k8sClient.AppsV1().Deployments(benchCfg.LLMDNamespace).Get(ctx, res.DeploymentName, metav1.GetOptions{})
 			g.Expect(err).NotTo(HaveOccurred())
 			replicas := *deployment.Spec.Replicas
 			readyReplicas := deployment.Status.ReadyReplicas
@@ -476,12 +317,11 @@ echo "Grep test: $(echo $HTTP_CODE | grep -E '^(200|404|405)' && echo PASS || ec
 
 		sustainedStart := time.Now()
 
-		// Collect replica samples for oscillation (stddev)
 		var replicaSamples []float64
 		deadline := time.Now().Add(sustainedDuration)
 
 		for time.Now().Before(deadline) {
-			deployment, err := k8sClient.AppsV1().Deployments(benchCfg.LLMDNamespace).Get(ctx, deploymentName, metav1.GetOptions{})
+			deployment, err := k8sClient.AppsV1().Deployments(benchCfg.LLMDNamespace).Get(ctx, res.DeploymentName, metav1.GetOptions{})
 			Expect(err).NotTo(HaveOccurred())
 
 			replicas := float64(*deployment.Spec.Replicas)
@@ -495,12 +335,10 @@ echo "Grep test: $(echo $HTTP_CODE | grep -E '^(200|404|405)' && echo PASS || ec
 			time.Sleep(15 * time.Second)
 		}
 
-		// Compute replica oscillation (stddev)
 		if len(replicaSamples) > 1 {
 			results.ReplicaOscillation = stddev(replicaSamples)
 		}
 
-		// Query Prometheus for average KV cache usage during sustained phase
 		sustainedEnd := time.Now()
 		kvAvg, err := QueryRangeAvg(
 			promClient.API(),
@@ -514,7 +352,6 @@ echo "Grep test: $(echo $HTTP_CODE | grep -E '^(200|404|405)' && echo PASS || ec
 			results.AvgKVCacheUsage = kvAvg
 		}
 
-		// Query Prometheus for average queue depth during sustained phase
 		qdAvg, err := QueryRangeAvg(
 			promClient.API(),
 			`avg(vllm:num_requests_waiting)`,
@@ -536,14 +373,14 @@ echo "Grep test: $(echo $HTTP_CODE | grep -E '^(200|404|405)' && echo PASS || ec
 		GinkgoWriter.Printf("Running cooldown phase for %v\n", cooldownDuration)
 
 		By("Deleting load generation jobs")
-		fixtures.DeleteParallelLoadJobs(ctx, k8sClient, jobBaseName, benchCfg.LLMDNamespace, benchLoadWorkers)
+		fixtures.DeleteParallelLoadJobs(ctx, k8sClient, res.JobBaseName, benchCfg.LLMDNamespace, benchLoadWorkers)
 
 		cooldownStart := time.Now()
 		scaleDownDetected := false
 		deadline := time.Now().Add(cooldownDuration)
 
 		for time.Now().Before(deadline) {
-			deployment, err := k8sClient.AppsV1().Deployments(benchCfg.LLMDNamespace).Get(ctx, deploymentName, metav1.GetOptions{})
+			deployment, err := k8sClient.AppsV1().Deployments(benchCfg.LLMDNamespace).Get(ctx, res.DeploymentName, metav1.GetOptions{})
 			if err != nil {
 				if errors.IsNotFound(err) {
 					break
@@ -571,24 +408,3 @@ echo "Grep test: $(echo $HTTP_CODE | grep -E '^(200|404|405)' && echo PASS || ec
 		}
 	})
 })
-
-// stddev computes the standard deviation of a float64 slice.
-func stddev(values []float64) float64 {
-	if len(values) == 0 {
-		return 0
-	}
-	var sum float64
-	for _, v := range values {
-		sum += v
-	}
-	mean := sum / float64(len(values))
-
-	var variance float64
-	for _, v := range values {
-		diff := v - mean
-		variance += diff * diff
-	}
-	variance /= float64(len(values))
-
-	return math.Sqrt(variance)
-}

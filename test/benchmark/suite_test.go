@@ -2,17 +2,13 @@ package benchmark
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"os/exec"
 	"testing"
-	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	promoperator "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -84,58 +80,6 @@ var _ = BeforeSuite(func() {
 
 	ctx, cancel = context.WithCancel(context.Background())
 
-	By("Verifying WVA controller is running")
-	Eventually(func(g Gomega) {
-		pods, err := k8sClient.CoreV1().Pods(benchCfg.WVANamespace).List(ctx, metav1.ListOptions{
-			LabelSelector: "control-plane=controller-manager",
-		})
-		g.Expect(err).NotTo(HaveOccurred())
-		g.Expect(pods.Items).NotTo(BeEmpty(), "WVA controller pod not found")
-
-		runningPods := 0
-		for _, pod := range pods.Items {
-			if pod.Status.Phase == corev1.PodRunning {
-				runningPods++
-			}
-		}
-		g.Expect(runningPods).To(BeNumerically(">", 0), "No running WVA controller pods")
-	}, 2*time.Minute, 5*time.Second).Should(Succeed(), "WVA controller should be running")
-
-	By("Verifying Gateway service exists")
-	Eventually(func(g Gomega) {
-		svc, err := k8sClient.CoreV1().Services(benchCfg.LLMDNamespace).Get(ctx, benchCfg.GatewayServiceName, metav1.GetOptions{})
-		g.Expect(err).NotTo(HaveOccurred(), "Gateway service %s not found in namespace %s", benchCfg.GatewayServiceName, benchCfg.LLMDNamespace)
-		g.Expect(svc.Spec.Ports).NotTo(BeEmpty(), "Gateway service has no ports")
-		GinkgoWriter.Printf("Gateway service %s found (type=%s)\n", svc.Name, svc.Spec.Type)
-	}, 2*time.Minute, 5*time.Second).Should(Succeed(), "Gateway service should exist")
-
-	By("Verifying EPP pods are running")
-	Eventually(func(g Gomega) {
-		pods, err := k8sClient.CoreV1().Pods(benchCfg.LLMDNamespace).List(ctx, metav1.ListOptions{
-			LabelSelector: fmt.Sprintf("inferencepool=%s", benchCfg.EPPServiceName),
-		})
-		g.Expect(err).NotTo(HaveOccurred())
-		g.Expect(pods.Items).NotTo(BeEmpty(), "No EPP pods found with label inferencepool=%s", benchCfg.EPPServiceName)
-
-		runningPods := 0
-		for _, pod := range pods.Items {
-			if pod.Status.Phase == corev1.PodRunning {
-				runningPods++
-			}
-		}
-		g.Expect(runningPods).To(BeNumerically(">", 0), "No running EPP pods")
-		GinkgoWriter.Printf("EPP: %d running pods\n", runningPods)
-	}, 2*time.Minute, 5*time.Second).Should(Succeed(), "EPP pods should be running")
-
-	By("Verifying Prometheus is available")
-	Eventually(func(g Gomega) {
-		pods, err := k8sClient.CoreV1().Pods(benchCfg.MonitoringNS).List(ctx, metav1.ListOptions{
-			LabelSelector: "app.kubernetes.io/name=prometheus",
-		})
-		g.Expect(err).NotTo(HaveOccurred())
-		g.Expect(pods.Items).NotTo(BeEmpty(), "Prometheus pod not found")
-	}, 2*time.Minute, 5*time.Second).Should(Succeed(), "Prometheus should be running")
-
 	By("Setting up port-forward to Prometheus")
 	portForwardCmd = utils.SetUpPortForward(k8sClient, ctx, "kube-prometheus-stack-prometheus", benchCfg.MonitoringNS, 9090, 9090)
 
@@ -148,19 +92,14 @@ var _ = BeforeSuite(func() {
 	Expect(err).NotTo(HaveOccurred(), "Failed to create Prometheus client")
 
 	if benchCfg.GrafanaEnabled {
-		By("Deploying ephemeral Grafana for benchmark snapshots")
-		if grafanaErr := DeployGrafana(ctx, k8sClient, benchCfg.MonitoringNS); grafanaErr != nil {
-			GinkgoWriter.Printf("WARNING: Grafana deployment failed (non-fatal): %v\n", grafanaErr)
+		By("Setting up Grafana client with port-forward")
+		var clientErr error
+		grafanaClient, clientErr = NewGrafanaClient(k8sClient, ctx, benchCfg.MonitoringNS)
+		if clientErr != nil {
+			GinkgoWriter.Printf("WARNING: Grafana client setup failed (non-fatal): %v\n", clientErr)
+			grafanaClient = nil
 		} else {
-			By("Setting up Grafana client with port-forward")
-			var clientErr error
-			grafanaClient, clientErr = NewGrafanaClient(k8sClient, ctx, benchCfg.MonitoringNS)
-			if clientErr != nil {
-				GinkgoWriter.Printf("WARNING: Grafana client setup failed (non-fatal): %v\n", clientErr)
-				grafanaClient = nil
-			} else {
-				GinkgoWriter.Println("Grafana deployed and ready for snapshot capture")
-			}
+			GinkgoWriter.Println("Grafana client ready for snapshot capture")
 		}
 	}
 
