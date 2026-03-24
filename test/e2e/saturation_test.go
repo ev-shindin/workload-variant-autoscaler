@@ -334,6 +334,16 @@ var _ = Describe("Saturation Mode - Multiple VariantAutoscalings", Label("full")
 	)
 
 	BeforeAll(func() {
+		// Skip on non-simulator environments (e.g. OpenShift with real GPUs).
+		// This test validates WVA's cost-aware optimizer logic (which variant gets
+		// scaled up), not real model inference behavior. The simulator's tiny KV cache
+		// (kv-cache-size=1) guarantees deterministic saturation under any load, while
+		// real vLLM on A100/H100 has massive KV cache (~50GB) that cannot be reliably
+		// saturated in an e2e test within a reasonable time.
+		if !cfg.UseSimulator {
+			Skip("Multi-VA cost-preference test requires simulator: real vLLM KV cache is too large to saturate reliably")
+		}
+
 		// Note: InferencePools should already exist from infra-only deployment
 		// We no longer create InferencePools in individual tests.
 		// Both model services use the same pool so they are all reachable via
