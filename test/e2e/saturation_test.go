@@ -2,6 +2,7 @@ package e2e
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -318,10 +319,12 @@ var _ = Describe("Saturation Mode - Single VariantAutoscaling", Label("full"), O
 })
 
 // Multi-variant saturation test (cost-based scaling)
+// Both model services are placed in the same InferencePool and load is routed through
+// the Gateway/EPP stack, mirroring production traffic flow. The WVA cost-aware optimizer
+// should prefer scaling the cheaper variant (VA A) over the expensive one (VA B).
 var _ = Describe("Saturation Mode - Multiple VariantAutoscalings", Label("full"), Ordered, func() {
 	var (
-		poolA         = "saturation-multi-pool-a"
-		poolB         = "saturation-multi-pool-b"
+		multiPool     = "saturation-multi-pool"
 		modelServiceA = "saturation-multi-ms-a"
 		modelServiceB = "saturation-multi-ms-b"
 		vaA           = "saturation-multi-va-a"
@@ -332,12 +335,14 @@ var _ = Describe("Saturation Mode - Multiple VariantAutoscalings", Label("full")
 
 	BeforeAll(func() {
 		// Note: InferencePools should already exist from infra-only deployment
-		// We no longer create InferencePools in individual tests
+		// We no longer create InferencePools in individual tests.
+		// Both model services use the same pool so they are all reachable via
+		// the default InferencePool (which selects on llm-d.ai/inferenceServing=true).
 
-		By("Creating two model services with different configurations")
+		By("Creating two model services in the same pool with different configurations")
 
-		// Pool A (cheaper)
-		err := fixtures.EnsureModelService(ctx, k8sClient, cfg.LLMDNamespace, modelServiceA, poolA, cfg.ModelID, cfg.UseSimulator, cfg.MaxNumSeqs)
+		// Model service A (cheaper variant)
+		err := fixtures.EnsureModelService(ctx, k8sClient, cfg.LLMDNamespace, modelServiceA, multiPool, cfg.ModelID, cfg.UseSimulator, cfg.MaxNumSeqs)
 		Expect(err).NotTo(HaveOccurred())
 
 		err = fixtures.EnsureService(ctx, k8sClient, cfg.LLMDNamespace, modelServiceA, modelServiceA+"-decode", 8000)
@@ -347,8 +352,8 @@ var _ = Describe("Saturation Mode - Multiple VariantAutoscalings", Label("full")
 		err = fixtures.EnsureServiceMonitor(ctx, crClient, cfg.MonitoringNS, cfg.LLMDNamespace, modelServiceA, modelServiceA+"-decode")
 		Expect(err).NotTo(HaveOccurred(), "Failed to create ServiceMonitor A")
 
-		// Pool B (more expensive)
-		err = fixtures.EnsureModelService(ctx, k8sClient, cfg.LLMDNamespace, modelServiceB, poolB, cfg.ModelID, cfg.UseSimulator, cfg.MaxNumSeqs)
+		// Model service B (more expensive variant)
+		err = fixtures.EnsureModelService(ctx, k8sClient, cfg.LLMDNamespace, modelServiceB, multiPool, cfg.ModelID, cfg.UseSimulator, cfg.MaxNumSeqs)
 		Expect(err).NotTo(HaveOccurred())
 
 		err = fixtures.EnsureService(ctx, k8sClient, cfg.LLMDNamespace, modelServiceB, modelServiceB+"-decode", 8000)
@@ -424,77 +429,87 @@ var _ = Describe("Saturation Mode - Multiple VariantAutoscalings", Label("full")
 	})
 
 	It("should prefer cheaper variant (VA A) for scale-up when both variants are available", func() {
-		By("Generating load to both services")
-		// Use burst load (curl) instead of guidellm because the simulator only tracks
-		// KV cache for /v1/completions requests. guidellm defaults to /v1/chat/completions,
-		// which bypasses KV cache tracking and prevents saturation detection.
-		scaleUpPrompts := 2400
-		if cfg.NumPrompts > scaleUpPrompts {
-			scaleUpPrompts = cfg.NumPrompts
+		By("Waiting for both VAs to have metrics available before generating load")
+		// The engine must see metrics from BOTH variants in the same optimization cycle
+		// to make a cost-aware decision. If only one variant has metrics when saturation
+		// is detected, the engine scales that variant regardless of cost.
+		Eventually(func(g Gomega) {
+			for _, vaName := range []string{vaA, vaB} {
+				va := &variantautoscalingv1alpha1.VariantAutoscaling{}
+				err := crClient.Get(ctx, client.ObjectKey{Name: vaName, Namespace: cfg.LLMDNamespace}, va)
+				g.Expect(err).NotTo(HaveOccurred())
+				metricsReady := false
+				for _, c := range va.Status.Conditions {
+					if c.Type == variantautoscalingv1alpha1.TypeMetricsAvailable && c.Reason == variantautoscalingv1alpha1.ReasonMetricsFound {
+						metricsReady = true
+						break
+					}
+				}
+				GinkgoWriter.Printf("VA %s metrics ready: %v\n", vaName, metricsReady)
+				g.Expect(metricsReady).To(BeTrue(), "VA %s should have metrics available", vaName)
+			}
+		}, 5*time.Minute, 15*time.Second).Should(Succeed())
+
+		By("Discovering inference gateway service")
+		gatewayServiceName := ""
+		serviceList, err := k8sClient.CoreV1().Services(cfg.LLMDNamespace).List(ctx, metav1.ListOptions{})
+		Expect(err).NotTo(HaveOccurred(), "Should be able to list services")
+
+		for _, svc := range serviceList.Items {
+			if strings.Contains(svc.Name, "inference-gateway") {
+				gatewayServiceName = svc.Name
+				GinkgoWriter.Printf("Found inference gateway service: %s\n", gatewayServiceName)
+				break
+			}
 		}
+		Expect(gatewayServiceName).NotTo(BeEmpty(), "Inference gateway service should exist in namespace %s", cfg.LLMDNamespace)
+
+		By("Generating load through the Gateway/EPP stack")
+		// Route traffic through the Gateway so EPP distributes requests across both model
+		// services in the shared InferencePool. This mirrors the production traffic flow
+		// and ensures the WVA scaling decisions are based on total distributed load.
+		gatewayTarget := fmt.Sprintf("http://%s.%s.svc.cluster.local:80/v1/completions", gatewayServiceName, cfg.LLMDNamespace)
+
 		loadCfg := fixtures.LoadConfig{
 			Strategy:     cfg.LoadStrategy,
-			RequestRate:  0,              // Not used for burst pattern
-			NumPrompts:   scaleUpPrompts, // Enough prompts to sustain load across multiple engine cycles
+			RequestRate:  0,   // Not used for burst pattern
+			NumPrompts:   600, // Enough to sustain load for several engine cycles; reduced from 2400
 			InputTokens:  cfg.InputTokens,
 			OutputTokens: 400, // High output tokens to hold KV cache and create queue pressure
 			ModelID:      cfg.ModelID,
 		}
 
-		// Create burst load jobs targeting /v1/completions endpoint directly
-		targetA := fmt.Sprintf("http://%s-service.%s.svc.cluster.local:8000/v1/completions", modelServiceA, cfg.LLMDNamespace)
-		err := fixtures.EnsureBurstLoadJob(ctx, k8sClient, cfg.LLMDNamespace, "multi-load-a", targetA, loadCfg)
+		err = fixtures.EnsureBurstLoadJob(ctx, k8sClient, cfg.LLMDNamespace, "multi-load", gatewayTarget, loadCfg)
 		Expect(err).NotTo(HaveOccurred())
 
-		targetB := fmt.Sprintf("http://%s-service.%s.svc.cluster.local:8000/v1/completions", modelServiceB, cfg.LLMDNamespace)
-		err = fixtures.EnsureBurstLoadJob(ctx, k8sClient, cfg.LLMDNamespace, "multi-load-b", targetB, loadCfg)
-		Expect(err).NotTo(HaveOccurred())
+		loadJobName := "multi-load-load"
 
-		jobNameA := "multi-load-a-load"
-		jobNameB := "multi-load-b-load"
-
-		// Register cleanup for load jobs (runs even if test fails)
+		// Register cleanup for load job (runs even if test fails)
 		DeferCleanup(func() {
-			cleanupResource(ctx, "Job", cfg.LLMDNamespace, jobNameA,
+			cleanupResource(ctx, "Job", cfg.LLMDNamespace, loadJobName,
 				func() error {
 					propagation := metav1.DeletePropagationBackground
-					return k8sClient.BatchV1().Jobs(cfg.LLMDNamespace).Delete(ctx, jobNameA, metav1.DeleteOptions{PropagationPolicy: &propagation})
+					return k8sClient.BatchV1().Jobs(cfg.LLMDNamespace).Delete(ctx, loadJobName, metav1.DeleteOptions{PropagationPolicy: &propagation})
 				},
 				func() bool {
-					_, err := k8sClient.BatchV1().Jobs(cfg.LLMDNamespace).Get(ctx, jobNameA, metav1.GetOptions{})
-					return errors.IsNotFound(err)
-				})
-			cleanupResource(ctx, "Job", cfg.LLMDNamespace, jobNameB,
-				func() error {
-					propagation := metav1.DeletePropagationBackground
-					return k8sClient.BatchV1().Jobs(cfg.LLMDNamespace).Delete(ctx, jobNameB, metav1.DeleteOptions{PropagationPolicy: &propagation})
-				},
-				func() bool {
-					_, err := k8sClient.BatchV1().Jobs(cfg.LLMDNamespace).Get(ctx, jobNameB, metav1.GetOptions{})
+					_, err := k8sClient.BatchV1().Jobs(cfg.LLMDNamespace).Get(ctx, loadJobName, metav1.GetOptions{})
 					return errors.IsNotFound(err)
 				})
 		})
 
-		By("Waiting for load jobs to start running")
+		By("Waiting for load job to start running")
 		Eventually(func(g Gomega) {
-			jobA, err := k8sClient.BatchV1().Jobs(cfg.LLMDNamespace).Get(ctx, jobNameA, metav1.GetOptions{})
+			job, err := k8sClient.BatchV1().Jobs(cfg.LLMDNamespace).Get(ctx, loadJobName, metav1.GetOptions{})
 			g.Expect(err).NotTo(HaveOccurred())
-			g.Expect(jobA.Status.Active).To(BeNumerically(">", 0), "Job A should be running")
-		}, 2*time.Minute, 5*time.Second).Should(Succeed())
-
-		Eventually(func(g Gomega) {
-			jobB, err := k8sClient.BatchV1().Jobs(cfg.LLMDNamespace).Get(ctx, jobNameB, metav1.GetOptions{})
-			g.Expect(err).NotTo(HaveOccurred())
-			g.Expect(jobB.Status.Active).To(BeNumerically(">", 0), "Job B should be running")
+			g.Expect(job.Status.Active).To(BeNumerically(">", 0), "Load job should be running")
 		}, 2*time.Minute, 5*time.Second).Should(Succeed())
 
 		By("Waiting for load to ramp up (30 seconds)")
 		time.Sleep(30 * time.Second)
 
 		By("Waiting for VA A (cheaper) to scale up under load")
-		// Don't wait for burst load jobs to complete — they send 2400 requests at ~42s each,
-		// which takes much longer than the test timeout. Instead, wait for the saturation
-		// engine to detect load and recommend scale-up, matching the smoke test pattern.
+		// Wait for the saturation engine to detect load and recommend scale-up.
+		// The cost-aware optimizer should prefer scaling the cheaper variant first.
 		Eventually(func(g Gomega) {
 			vaAObj := &variantautoscalingv1alpha1.VariantAutoscaling{}
 			err := crClient.Get(ctx, client.ObjectKey{Name: vaA, Namespace: cfg.LLMDNamespace}, vaAObj)
@@ -504,27 +519,28 @@ var _ = Describe("Saturation Mode - Multiple VariantAutoscalings", Label("full")
 			GinkgoWriter.Printf("VA A (cheaper, cost=30.0) desired replicas: %d\n", replicasA)
 			g.Expect(replicasA).To(BeNumerically(">", 1),
 				"VA A should scale up beyond initial replica count")
-		}, 8*time.Minute, 15*time.Second).Should(Succeed())
+		}, 10*time.Minute, 15*time.Second).Should(Succeed())
 
-		By("Verifying VA A (cheaper) scaled up more than VA B")
+		By("Verifying VA A (cheaper) scaled up and VA B (expensive) did not")
 		vaAObj := &variantautoscalingv1alpha1.VariantAutoscaling{}
 		err = crClient.Get(ctx, client.ObjectKey{Name: vaA, Namespace: cfg.LLMDNamespace}, vaAObj)
 		Expect(err).NotTo(HaveOccurred())
+		Expect(vaAObj.Status.DesiredOptimizedAlloc.NumReplicas).NotTo(BeNil(), "VA A NumReplicas should be set")
+		replicasA := *vaAObj.Status.DesiredOptimizedAlloc.NumReplicas
+		GinkgoWriter.Printf("VA A (cheaper, cost=30.0) replicas: %d\n", replicasA)
 
 		vaBObj := &variantautoscalingv1alpha1.VariantAutoscaling{}
 		err = crClient.Get(ctx, client.ObjectKey{Name: vaB, Namespace: cfg.LLMDNamespace}, vaBObj)
 		Expect(err).NotTo(HaveOccurred())
-
-		Expect(vaAObj.Status.DesiredOptimizedAlloc.NumReplicas).NotTo(BeNil(), "VA A NumReplicas should be set")
 		Expect(vaBObj.Status.DesiredOptimizedAlloc.NumReplicas).NotTo(BeNil(), "VA B NumReplicas should be set")
-		replicasA := *vaAObj.Status.DesiredOptimizedAlloc.NumReplicas
 		replicasB := *vaBObj.Status.DesiredOptimizedAlloc.NumReplicas
-
-		GinkgoWriter.Printf("VA A (cheaper, cost=30.0) replicas: %d\n", replicasA)
 		GinkgoWriter.Printf("VA B (expensive, cost=50.0) replicas: %d\n", replicasB)
 
-		// Cheaper variant should be preferred (or at least equal)
-		Expect(replicasA).To(BeNumerically(">=", replicasB),
-			"Cheaper variant (VA A) should be preferred or equal to expensive variant (VA B)")
+		Expect(replicasA).To(BeNumerically(">", 1),
+			"Cheaper variant (VA A) should have scaled up beyond initial replica count")
+		// The cost-aware optimizer should satisfy demand entirely through the cheaper
+		// variant (VA A). VA B should remain at its initial 1 replica.
+		Expect(replicasB).To(Equal(int32(1)),
+			"Expensive variant (VA B) should stay at 1 replica — cost-aware optimizer should prefer VA A")
 	})
 })
