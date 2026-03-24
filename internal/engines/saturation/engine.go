@@ -583,6 +583,8 @@ func (e *Engine) optimizeV2(
 
 	// Stage 1: Collect ModelScalingRequests for all models
 	var requests []pipeline.ModelScalingRequest
+	// modelReplicaMetrics collects per-model replica metrics for KV token enrichment
+	modelReplicaMetrics := make(map[string][]interfaces.ReplicaMetrics)
 
 	for groupKey, modelVAs := range modelGroups {
 		modelID := modelVAs[0].Spec.ModelID
@@ -623,6 +625,7 @@ func (e *Engine) optimizeV2(
 		}
 
 		requests = append(requests, *req)
+		modelReplicaMetrics[modelID] = data.replicaMetrics
 	}
 
 	if len(requests) == 0 {
@@ -669,6 +672,11 @@ func (e *Engine) optimizeV2(
 				"modelID", req.ModelID)
 		}
 	}
+
+	// Stage 4: Enrich decisions with KV cache token data from replicaMetrics.
+	// Utilization, RequiredCapacity, and SpareCapacity are already set by
+	// buildDecisionsWithOptimizer from AnalyzerResult.
+	enrichDecisionsWithKvTokenData(allDecisions, modelReplicaMetrics)
 
 	return allDecisions
 }
@@ -868,6 +876,77 @@ func (e *Engine) convertSaturationTargetsToDecisions(
 	}
 
 	return decisions
+}
+
+// enrichDecisionsFromReplicaMetrics populates saturation observability fields on decisions
+// by aggregating per-pod ReplicaMetrics per variant. Used by the V1 path where
+// Utilization and RequiredCapacity are not set by the optimizer.
+func enrichDecisionsFromReplicaMetrics(decisions []interfaces.VariantDecision, replicaMetrics []interfaces.ReplicaMetrics, shouldScaleUp bool) {
+	// Aggregate per variant
+	type variantAgg struct {
+		kvUsed     int64
+		kvTotal    int64
+		kvUsageSum float64
+		count      int
+	}
+	agg := make(map[string]*variantAgg)
+	for _, rm := range replicaMetrics {
+		a, ok := agg[rm.VariantName]
+		if !ok {
+			a = &variantAgg{}
+			agg[rm.VariantName] = a
+		}
+		a.kvUsed += rm.TokensInUse
+		a.kvTotal += rm.TotalKvCapacityTokens
+		a.kvUsageSum += rm.KvCacheUsage
+		a.count++
+	}
+
+	requiredCapacity := float64(0)
+	if shouldScaleUp {
+		requiredCapacity = 1.0
+	}
+
+	for i := range decisions {
+		d := &decisions[i]
+		d.RequiredCapacity = requiredCapacity
+		if a, ok := agg[d.VariantName]; ok && a.count > 0 {
+			d.KvCacheTokensUsed = a.kvUsed
+			d.KvCacheTokensTotal = a.kvTotal
+			d.Utilization = a.kvUsageSum / float64(a.count)
+		}
+	}
+}
+
+// enrichDecisionsWithKvTokenData sets KvCacheTokensUsed and KvCacheTokensTotal on decisions
+// from replica metrics aggregated per variant. Used by V2 path where Utilization and
+// RequiredCapacity are already set from AnalyzerResult.
+func enrichDecisionsWithKvTokenData(decisions []interfaces.VariantDecision, modelReplicaMetrics map[string][]interfaces.ReplicaMetrics) {
+	// Build per-variant KV token aggregation across all models
+	type kvAgg struct {
+		kvUsed  int64
+		kvTotal int64
+	}
+	agg := make(map[string]*kvAgg)
+	for _, metrics := range modelReplicaMetrics {
+		for _, rm := range metrics {
+			a, ok := agg[rm.VariantName]
+			if !ok {
+				a = &kvAgg{}
+				agg[rm.VariantName] = a
+			}
+			a.kvUsed += rm.TokensInUse
+			a.kvTotal += rm.TotalKvCapacityTokens
+		}
+	}
+
+	for i := range decisions {
+		d := &decisions[i]
+		if a, ok := agg[d.VariantName]; ok {
+			d.KvCacheTokensUsed = a.kvUsed
+			d.KvCacheTokensTotal = a.kvTotal
+		}
+	}
 }
 
 // hasMinReplicasAboveZero returns true if any variant in the states has MinReplicas > 0.
@@ -1247,6 +1326,13 @@ func (e *Engine) applySaturationDecisions(
 					"accelerator", acceleratorName)
 			}
 			updateVa.Status.Actuation.Applied = true
+		}
+
+		// Emit saturation and capacity metrics for observability
+		if hasDecision {
+			if err := act.EmitSaturationMetrics(ctx, decision); err != nil {
+				logger.Error(err, "Failed to emit saturation metrics", "variant", updateVa.Name)
+			}
 		}
 
 		// Update Shared State and Trigger Reconcile via Channel

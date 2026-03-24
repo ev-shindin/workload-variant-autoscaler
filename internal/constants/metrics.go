@@ -131,6 +131,26 @@ const (
 	// WVAMetricsFreshnessStatus is a gauge that tracks the freshness status of metrics for each variant.
 	// Labels: variant_name, status
 	WVAMetricsFreshnessStatus = "wva_metrics_freshness_status"
+
+	// WVASaturationUtilization is a gauge that tracks per-variant utilization ratio (0.0-1.0).
+	// Labels: variant_name, namespace, accelerator_type
+	WVASaturationUtilization = "wva_saturation_utilization"
+
+	// WVASpareCapacity is a gauge that tracks per-variant spare capacity (0.0-1.0).
+	// Labels: variant_name, namespace, accelerator_type
+	WVASpareCapacity = "wva_spare_capacity"
+
+	// WVARequiredCapacity is a gauge that tracks model-level required capacity.
+	// >0 means scale-up needed. Labels: variant_name, namespace
+	WVARequiredCapacity = "wva_required_capacity"
+
+	// WVAKvCacheTokensUsed is a gauge that tracks total KV cache tokens currently in use per variant.
+	// Labels: variant_name, namespace
+	WVAKvCacheTokensUsed = "wva_kv_cache_tokens_used"
+
+	// WVAKvCacheTokensTotal is a gauge that tracks total KV cache token capacity per variant.
+	// Labels: variant_name, namespace
+	WVAKvCacheTokensTotal = "wva_kv_cache_tokens_total"
 )
 
 // Metric Label Names

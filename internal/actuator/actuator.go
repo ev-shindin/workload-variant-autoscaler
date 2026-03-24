@@ -6,6 +6,7 @@ import (
 
 	llmdOptv1alpha1 "github.com/llm-d/llm-d-workload-variant-autoscaler/api/v1alpha1"
 
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/interfaces"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/metrics"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/utils/scaletarget"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -91,4 +92,19 @@ func (a *Actuator) EmitMetrics(ctx context.Context, variantAutoscaling *llmdOptv
 		"desiredReplicas", desiredReplicas,
 		"accelerator", variantAutoscaling.Status.DesiredOptimizedAlloc.Accelerator)
 	return nil
+}
+
+// EmitSaturationMetrics emits saturation analysis and KV cache capacity metrics from a decision.
+func (a *Actuator) EmitSaturationMetrics(ctx context.Context, decision interfaces.VariantDecision) error {
+	return a.MetricsEmitter.EmitSaturationMetrics(
+		ctx,
+		decision.VariantName,
+		decision.Namespace,
+		decision.AcceleratorName,
+		decision.Utilization,
+		decision.SpareCapacity,
+		decision.RequiredCapacity,
+		decision.KvCacheTokensUsed,
+		decision.KvCacheTokensTotal,
+	)
 }

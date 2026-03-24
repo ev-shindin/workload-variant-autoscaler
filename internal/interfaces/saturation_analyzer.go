@@ -192,7 +192,22 @@ type VariantDecision struct {
 	// SpareCapacity indicates how much spare capacity this variant has.
 	// 0.0 = fully saturated, 1.0 = completely idle.
 	// Used by allocation algorithms to prioritize saturated variants.
+	// V1: threshold-relative spare KV capacity (AvgSpareKvCapacity).
+	// V2: 1.0 - Utilization (absolute spare).
 	SpareCapacity float64
+	// Utilization is the variant-level utilization ratio (0.0-1.0).
+	// V2: from AnalyzerResult.VariantCapacities[].Utilization.
+	// V1: average KvCacheUsage across this variant's replicas.
+	Utilization float64
+	// KvCacheTokensUsed is the sum of TokensInUse across this variant's replicas.
+	KvCacheTokensUsed int64
+	// KvCacheTokensTotal is the sum of TotalKvCapacityTokens across this variant's replicas.
+	KvCacheTokensTotal int64
+	// RequiredCapacity is the model-level required capacity (>0 means scale-up needed).
+	// Same value for all variants of a model.
+	// V1: binary (1.0 if shouldScaleUp, else 0.0).
+	// V2: continuous token-based demand from AnalyzerResult.
+	RequiredCapacity float64
 	// ScaleTargetRef references the Deployment/StatefulSet for scheduling constraints
 	ScaleTargetRef *autoscalingv2.CrossVersionObjectReference
 

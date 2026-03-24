@@ -28,6 +28,13 @@ var (
 	metricsPodsDiscovered     *prometheus.GaugeVec
 	metricsFreshnessStatus    *prometheus.GaugeVec
 
+	// Saturation and capacity metrics
+	saturationUtilization *prometheus.GaugeVec
+	spareCapacity         *prometheus.GaugeVec
+	requiredCapacity      *prometheus.GaugeVec
+	kvCacheTokensUsed     *prometheus.GaugeVec
+	kvCacheTokensTotal    *prometheus.GaugeVec
+
 	// controllerInstance stores the optional controller instance identifier.
 	// When set, it's added as a label to all emitted metrics.
 	controllerInstance string
@@ -50,10 +57,13 @@ func InitMetrics(registry prometheus.Registerer) error {
 	// Build label sets based on whether controller_instance is configured
 	baseLabels := []string{constants.LabelVariantName, constants.LabelNamespace, constants.LabelAcceleratorType}
 	scalingLabels := []string{constants.LabelVariantName, constants.LabelNamespace, constants.LabelDirection, constants.LabelReason}
+	// modelLabels: variant_name + namespace only (no accelerator_type) for model-level and token metrics
+	modelLabels := []string{constants.LabelVariantName, constants.LabelNamespace}
 
 	if controllerInstance != "" {
 		baseLabels = append(baseLabels, constants.LabelControllerInstance)
 		scalingLabels = append(scalingLabels, constants.LabelControllerInstance)
+		modelLabels = append(modelLabels, constants.LabelControllerInstance)
 	}
 
 	replicaScalingTotal = prometheus.NewCounterVec(
@@ -83,6 +93,41 @@ func InitMetrics(registry prometheus.Registerer) error {
 			Help: "Ratio of the desired number of replicas and the current number of replicas for each variant",
 		},
 		baseLabels,
+	)
+	saturationUtilization = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: constants.WVASaturationUtilization,
+			Help: "Per-variant utilization ratio (0.0-1.0) from saturation analysis",
+		},
+		baseLabels,
+	)
+	spareCapacity = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: constants.WVASpareCapacity,
+			Help: "Per-variant spare capacity (0.0-1.0) from saturation analysis",
+		},
+		baseLabels,
+	)
+	requiredCapacity = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: constants.WVARequiredCapacity,
+			Help: "Model-level required capacity; >0 indicates scale-up needed (V1: binary 0/1, V2: continuous token demand)",
+		},
+		modelLabels,
+	)
+	kvCacheTokensUsed = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: constants.WVAKvCacheTokensUsed,
+			Help: "Total KV cache tokens currently in use across all replicas of a variant",
+		},
+		modelLabels,
+	)
+	kvCacheTokensTotal = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: constants.WVAKvCacheTokensTotal,
+			Help: "Total KV cache token capacity across all replicas of a variant",
+		},
+		modelLabels,
 	)
 
 	optimizationDurationLabels := []string{constants.LabelStatus}
@@ -188,6 +233,21 @@ func InitMetrics(registry prometheus.Registerer) error {
 	}
 	if err := registry.Register(metricsFreshnessStatus); err != nil {
 		return fmt.Errorf("failed to register metricsFreshnessStatus metric: %w", err)
+	}
+	if err := registry.Register(saturationUtilization); err != nil {
+		return fmt.Errorf("failed to register saturationUtilization metric: %w", err)
+	}
+	if err := registry.Register(spareCapacity); err != nil {
+		return fmt.Errorf("failed to register spareCapacity metric: %w", err)
+	}
+	if err := registry.Register(requiredCapacity); err != nil {
+		return fmt.Errorf("failed to register requiredCapacity metric: %w", err)
+	}
+	if err := registry.Register(kvCacheTokensUsed); err != nil {
+		return fmt.Errorf("failed to register kvCacheTokensUsed metric: %w", err)
+	}
+	if err := registry.Register(kvCacheTokensTotal); err != nil {
+		return fmt.Errorf("failed to register kvCacheTokensTotal metric: %w", err)
 	}
 
 	return nil
@@ -344,4 +404,40 @@ func SetMetricsFreshnessStatus(variantName, status string, count int) {
 	}
 
 	metricsFreshnessStatus.With(labels).Set(float64(count))
+}
+
+// EmitSaturationMetrics emits saturation analysis and KV cache capacity metrics
+func (m *MetricsEmitter) EmitSaturationMetrics(
+	ctx context.Context,
+	variantName, namespace, acceleratorType string,
+	utilization, spare, required float64,
+	kvTokensUsed, kvTokensTotal int64,
+) error {
+	if saturationUtilization == nil || spareCapacity == nil || requiredCapacity == nil ||
+		kvCacheTokensUsed == nil || kvCacheTokensTotal == nil {
+		return fmt.Errorf("saturation metrics not initialized")
+	}
+
+	accelLabels := prometheus.Labels{
+		constants.LabelVariantName:     variantName,
+		constants.LabelNamespace:       namespace,
+		constants.LabelAcceleratorType: acceleratorType,
+	}
+	modelLabels := prometheus.Labels{
+		constants.LabelVariantName: variantName,
+		constants.LabelNamespace:   namespace,
+	}
+
+	if controllerInstance != "" {
+		accelLabels[constants.LabelControllerInstance] = controllerInstance
+		modelLabels[constants.LabelControllerInstance] = controllerInstance
+	}
+
+	saturationUtilization.With(accelLabels).Set(utilization)
+	spareCapacity.With(accelLabels).Set(spare)
+	requiredCapacity.With(modelLabels).Set(required)
+	kvCacheTokensUsed.With(modelLabels).Set(float64(kvTokensUsed))
+	kvCacheTokensTotal.With(modelLabels).Set(float64(kvTokensTotal))
+
+	return nil
 }
