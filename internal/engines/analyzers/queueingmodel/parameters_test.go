@@ -10,9 +10,11 @@ func TestNewParameterStore(t *testing.T) {
 	store := NewParameterStore()
 	if store == nil {
 		t.Fatal("NewParameterStore returned nil")
+		return
 	}
 	if store.params == nil {
 		t.Fatal("params map not initialized")
+		return
 	}
 	if len(store.params) != 0 {
 		t.Fatal("params map should be empty")
@@ -44,6 +46,7 @@ func TestParameterStore_SetAndGet(t *testing.T) {
 
 	if got == nil {
 		t.Fatal("expected non-nil parameters")
+		return
 	}
 	if got.Alpha != 1.5 {
 		t.Errorf("Alpha = %v, want 1.5", got.Alpha)

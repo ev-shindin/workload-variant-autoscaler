@@ -211,6 +211,7 @@ PROMETHEUS_METRICS_CACHE_TTL: "60s"
 	cacheConfig := cfg.PrometheusCacheConfig()
 	if cacheConfig == nil {
 		t.Fatal("Expected Prometheus cache config to be loaded")
+		return // unreachable, but satisfies staticcheck SA5011
 	}
 	if cacheConfig.TTL != 60*time.Second {
 		t.Errorf("Expected cache TTL 60s, got %v", cacheConfig.TTL)
