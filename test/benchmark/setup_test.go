@@ -27,12 +27,13 @@ type ScenarioResources struct {
 	JobBaseName    string
 }
 
-// SetupBenchmarkScenario creates the common infrastructure for a benchmark scenario:
+// setupBenchmarkScenario creates fresh benchmark infrastructure from scratch:
 // model service deployment, service, ServiceMonitor, VariantAutoscaling, and HPA.
 // It waits for the deployment to be ready, VA to stabilize, external metrics API to
 // serve wva_desired_replicas, and Prometheus to scrape simulator metrics.
 // Cleanup is registered via DeferCleanup.
-func SetupBenchmarkScenario(res ScenarioResources) {
+func setupBenchmarkScenario(res ScenarioResources) {
+	GinkgoHelper()
 	By("Creating model service deployment")
 	err := fixtures.EnsureModelService(ctx, k8sClient, benchCfg.LLMDNamespace, res.ModelService, res.PoolName, benchCfg.ModelID, benchCfg.UseSimulator, benchCfg.MaxNumSeqs)
 	Expect(err).NotTo(HaveOccurred(), "Failed to create model service")
@@ -131,9 +132,10 @@ func SetupBenchmarkScenario(res ScenarioResources) {
 	GinkgoWriter.Println("Scenario setup completed — metrics pipeline verified")
 }
 
-// CaptureResultsAndGrafana captures Grafana snapshots (if enabled) and writes benchmark
+// captureResultsAndGrafana captures Grafana snapshots (if enabled) and writes benchmark
 // results to the configured output file. Call this from AfterAll.
-func CaptureResultsAndGrafana(results *BenchmarkResults, scenarioStart time.Time) {
+func captureResultsAndGrafana(results *BenchmarkResults, scenarioStart time.Time) {
+	GinkgoHelper()
 	results.TotalDurationSec = time.Since(scenarioStart).Seconds()
 
 	if grafanaClient != nil && benchCfg.GrafanaEnabled {
@@ -183,8 +185,8 @@ func CaptureResultsAndGrafana(results *BenchmarkResults, scenarioStart time.Time
 	GinkgoWriter.Printf("Results: %s\n", string(data))
 }
 
-// GatewayTargetURL returns the full URL for load generation through the Gateway stack.
-func GatewayTargetURL() string {
+// gatewayTargetURL returns the full URL for load generation through the Gateway stack.
+func gatewayTargetURL() string {
 	gwHost := fmt.Sprintf("%s.%s.svc.cluster.local", benchCfg.GatewayServiceName, benchCfg.LLMDNamespace)
 	return fmt.Sprintf("http://%s:%d/v1/completions", gwHost, benchCfg.GatewayServicePort)
 }

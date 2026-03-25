@@ -57,13 +57,13 @@ var _ = Describe("Scale-Up Latency Benchmark", Label("benchmark"), Ordered, func
 	)
 
 	BeforeAll(func() {
-		SetupBenchmarkScenario(res)
+		setupBenchmarkScenario(res)
 		scenarioStart = time.Now()
 		GinkgoWriter.Println("Benchmark scenario starting")
 	})
 
 	AfterAll(func() {
-		CaptureResultsAndGrafana(&results, scenarioStart)
+		captureResultsAndGrafana(&results, scenarioStart)
 	})
 
 	It("Phase 1: Baseline — establish baseline metrics", func() {
@@ -81,7 +81,7 @@ var _ = Describe("Scale-Up Latency Benchmark", Label("benchmark"), Ordered, func
 
 		spikeStart := time.Now()
 
-		targetURL := GatewayTargetURL()
+		targetURL := gatewayTargetURL()
 		GinkgoWriter.Printf("Load target URL (via Gateway): %s\n", targetURL)
 
 		By("Cleaning up any existing load jobs")
