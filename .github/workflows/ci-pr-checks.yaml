@@ -11,13 +11,15 @@ name: CI - PR Checks
 # - workflow_dispatch: group 'ci-pr-checks-{run_id}' (unique per run)
 # - Fallback chain for ID: pull_request.number -> issue.number -> run_id
 #
-# NOTE: Accepted commands (/ok-to-test, /retest and their -v2 variants)
+# NOTE: /ok-to-test and /retest trigger all tests (V1+V2 Kind + OpenShift).
+#       /ok-to-test-v2 and /retest-v2 trigger V2 only.
 #       must stay in sync with check-full-tests job validation
 concurrency:
   group: >-
     ${{
       github.event_name == 'issue_comment' &&
-      !contains(github.event.comment.body, '/ok-to-test')
+      !contains(github.event.comment.body, '/ok-to-test') &&
+      !contains(github.event.comment.body, '/retest')
       && format('comment-isolated-{0}', github.run_id)
       || format('ci-pr-checks-{0}',
            github.event.pull_request.number
@@ -204,8 +206,8 @@ jobs:
                 return;
               }
 
-              // Accept /ok-to-test (same command triggers both Kind full E2E and OpenShift E2E)
-              const validCommands = ['/ok-to-test'];
+              // /ok-to-test triggers Kind full E2E (V1+V2) + OpenShift E2E
+              const validCommands = ['/ok-to-test', '/retest'];
               if (!validCommands.includes(comment)) {
                 console.log(`Comment "${comment}" is not a valid trigger command, skipping`);
                 core.setOutput('run_full', 'false');
@@ -245,7 +247,7 @@ jobs:
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: issue.number,
-                body: `🚀 **Kind E2E (full)** triggered by \`/ok-to-test\`\n\n[View the Kind E2E workflow run](${runUrl})`
+                body: `🚀 **Kind E2E (full V1+V2)** triggered by \`${comment}\`\n\n[View the Kind E2E workflow run](${runUrl})`
               });
 
               core.setOutput('run_full', 'true');
@@ -294,7 +296,7 @@ jobs:
                 return;
               }
 
-              // Accept V2 command variants — /ok-to-test and /retest trigger both V1 and V2
+              // /ok-to-test and /retest trigger V2 alongside V1; -v2 variants for V2-only
               const validCommands = ['/ok-to-test', '/retest', '/ok-to-test-v2', '/retest-v2'];
               if (!validCommands.includes(comment)) {
                 core.setOutput('run_full_v2', 'false');
