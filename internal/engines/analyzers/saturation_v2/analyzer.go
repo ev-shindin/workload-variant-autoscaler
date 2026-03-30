@@ -159,7 +159,12 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 	gpuCount int,
 ) *ReplicaCapacity {
 	if rm.TotalKvCapacityTokens <= 0 {
-		return nil
+		// TODO: implement proper demand estimation when vllm:cache_config_info is absent.
+		// Currently we fall back to percentage-based demand using the deployment-derived
+		// capacity from the capacity store. A better approach would be to estimate
+		// TotalKvCapacityTokens from deployment args (num_gpu_blocks_override, block_size)
+		// or use a dedicated percentage-based demand signal.
+		return a.computeReplicaCapacityFallback(rm, config, modelID, namespace, gpuCount)
 	}
 
 	// Compute demand
@@ -217,6 +222,50 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 		TotalKvCapacityTokens: rm.TotalKvCapacityTokens,
 		MemoryBoundCapacity:   k1,
 		ComputeBoundCapacity:  k2,
+		EffectiveCapacity:     effectiveCapacity,
+		IsSaturated:           isSaturated,
+		ReplicaDemand:         replicaDemand,
+	}
+}
+
+// computeReplicaCapacityFallback handles the case where vllm:cache_config_info
+// is not available (TotalKvCapacityTokens == 0). It uses the deployment-derived
+// capacity from the capacity store and estimates demand from KvCacheUsage percentage.
+// This allows V2 to work with model servers that don't emit cache_config_info
+// (e.g., the llm-d-inference-sim).
+func (a *SaturationAnalyzer) computeReplicaCapacityFallback(
+	rm interfaces.ReplicaMetrics,
+	config *config.SaturationScalingConfig,
+	modelID, namespace string,
+	gpuCount int,
+) *ReplicaCapacity {
+	rec := a.capacityStore.Get(namespace, modelID, rm.VariantName)
+	if rec == nil || rec.EffectiveCapacity <= 0 {
+		return nil
+	}
+
+	effectiveCapacity := rec.EffectiveCapacity
+
+	// Estimate demand from KV cache usage percentage applied to the stored capacity.
+	// This is a coarse approximation — KvCacheUsage reflects memory pressure, not
+	// exact token demand — but it's sufficient when token-level metrics are absent.
+	replicaDemand := int64(rm.KvCacheUsage * float64(effectiveCapacity))
+
+	// Add queue-based demand if we have average input token info
+	if rm.AvgInputTokens > 0 {
+		replicaDemand += int64(rm.QueueLength) * int64(rm.AvgInputTokens)
+	}
+
+	isSaturated := replicaDemand >= effectiveCapacity
+
+	return &ReplicaCapacity{
+		PodName:               rm.PodName,
+		VariantName:           rm.VariantName,
+		AcceleratorName:       rm.AcceleratorName,
+		TokensInUse:           replicaDemand,
+		TotalKvCapacityTokens: effectiveCapacity, // synthetic: store-derived
+		MemoryBoundCapacity:   effectiveCapacity,
+		ComputeBoundCapacity:  effectiveCapacity,
 		EffectiveCapacity:     effectiveCapacity,
 		IsSaturated:           isSaturated,
 		ReplicaDemand:         replicaDemand,
