@@ -107,6 +107,11 @@ DECODE_REPLICAS=${DECODE_REPLICAS:-""}
 # Useful for e2e testing where tests create their own VA/HPA resources
 INFRA_ONLY=${INFRA_ONLY:-false}
 
+# Analyzer name selection
+# Empty (default): V1 percentage-based analyzer
+# "saturation": V2 token-based capacity-constraint analyzer
+ANALYZER_NAME=${ANALYZER_NAME:-""}
+
 # Saturation threshold overrides (V1 analyzer)
 # kvSpareTrigger: scale-up fires when (kvCacheThreshold - avgKvUsage) < this value
 # queueSpareTrigger: scale-up fires when (queueLengthThreshold - avgQueueLength) < this value
@@ -593,6 +598,7 @@ deploy_wva_controller() {
         --set wva.scaleToZero=$ENABLE_SCALE_TO_ZERO \
         ${CONTROLLER_INSTANCE:+--set wva.controllerInstance=$CONTROLLER_INSTANCE} \
         ${POOL_GROUP:+--set wva.poolGroup=$POOL_GROUP} \
+        ${ANALYZER_NAME:+--set wva.capacityScaling.default.analyzerName=$ANALYZER_NAME} \
         ${KV_SPARE_TRIGGER:+--set wva.capacityScaling.default.kvSpareTrigger=$KV_SPARE_TRIGGER} \
         ${QUEUE_SPARE_TRIGGER:+--set wva.capacityScaling.default.queueSpareTrigger=$QUEUE_SPARE_TRIGGER}
 

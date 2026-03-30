@@ -11,12 +11,15 @@ name: CI - PR Checks
 # - workflow_dispatch: group 'ci-pr-checks-{run_id}' (unique per run)
 # - Fallback chain for ID: pull_request.number -> issue.number -> run_id
 #
-# NOTE: Accepted command (/ok-to-test) must stay in sync with check-full-tests job validation
+# NOTE: /ok-to-test and /retest trigger all tests (V1+V2 Kind + OpenShift).
+#       /ok-to-test-v2 and /retest-v2 trigger V2 only.
+#       must stay in sync with check-full-tests job validation
 concurrency:
   group: >-
     ${{
       github.event_name == 'issue_comment' &&
-      !contains(github.event.comment.body, '/ok-to-test')
+      !contains(github.event.comment.body, '/ok-to-test') &&
+      !contains(github.event.comment.body, '/retest')
       && format('comment-isolated-{0}', github.run_id)
       || format('ci-pr-checks-{0}',
            github.event.pull_request.number
@@ -203,8 +206,8 @@ jobs:
                 return;
               }
 
-              // Accept /ok-to-test (same command triggers both Kind full E2E and OpenShift E2E)
-              const validCommands = ['/ok-to-test'];
+              // /ok-to-test triggers Kind full E2E (V1+V2) + OpenShift E2E
+              const validCommands = ['/ok-to-test', '/retest'];
               if (!validCommands.includes(comment)) {
                 console.log(`Comment "${comment}" is not a valid trigger command, skipping`);
                 core.setOutput('run_full', 'false');
@@ -244,7 +247,7 @@ jobs:
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: issue.number,
-                body: `🚀 **Kind E2E (full)** triggered by \`/ok-to-test\`\n\n[View the Kind E2E workflow run](${runUrl})`
+                body: `🚀 **Kind E2E (full V1+V2)** triggered by \`${comment}\`\n\n[View the Kind E2E workflow run](${runUrl})`
               });
 
               core.setOutput('run_full', 'true');
@@ -252,6 +255,92 @@ jobs:
             }
 
             core.setOutput('run_full', 'false');
+
+  # Check if V2 full e2e tests should run (via comment trigger with -v2 suffix)
+  check-full-tests-v2:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write  # For posting comments and reactions on PRs
+    outputs:
+      run_full_v2: ${{ steps.check.outputs.run_full_v2 }}
+    steps:
+      - name: Check if V2 full tests requested
+        id: check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Helper to check if user has write access
+            async function hasWriteAccess(username) {
+              try {
+                const { data: permission } = await github.rest.repos.getCollaboratorPermissionLevel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  username: username
+                });
+                const privilegedRoles = ['admin', 'maintain', 'write'];
+                return privilegedRoles.includes(permission.permission);
+              } catch (e) {
+                console.log(`Could not get permissions for ${username}: ${e.message}`);
+                return false;
+              }
+            }
+
+            // Check for V2 comment trigger
+            if (context.eventName === 'issue_comment') {
+              const comment = context.payload.comment.body.trim();
+              const issue = context.payload.issue;
+
+              if (!issue.pull_request) {
+                core.setOutput('run_full_v2', 'false');
+                return;
+              }
+
+              // /ok-to-test and /retest trigger V2 alongside V1; -v2 variants for V2-only
+              const validCommands = ['/ok-to-test', '/retest', '/ok-to-test-v2', '/retest-v2'];
+              if (!validCommands.includes(comment)) {
+                core.setOutput('run_full_v2', 'false');
+                return;
+              }
+
+              const commenter = context.payload.comment.user.login;
+              const hasAccess = await hasWriteAccess(commenter);
+              if (!hasAccess) {
+                console.log(`User ${commenter} does not have write access, ignoring ${comment}`);
+                core.setOutput('run_full_v2', 'false');
+                return;
+              }
+
+              const { data: pr } = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: issue.number
+              });
+
+              console.log(`${comment} approved by ${commenter} for PR #${issue.number}`);
+
+              // Add reaction to acknowledge
+              await github.rest.reactions.createForIssueComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: context.payload.comment.id,
+                content: 'rocket'
+              });
+
+              // Post comment with link to the workflow run
+              const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: `🚀 **Kind E2E V2 (full)** triggered by \`${comment}\`\n\n[View the Kind E2E V2 workflow run](${runUrl})`
+              });
+
+              core.setOutput('run_full_v2', 'true');
+              return;
+            }
+
+            core.setOutput('run_full_v2', 'false');
 
   # E2E smoke tests - run automatically on every PR with code changes
   # Skip if PR only contains docs/metadata changes
@@ -443,16 +532,195 @@ jobs:
         run: |
           make test-e2e-full-with-setup
 
+  # V2 Engine E2E smoke tests - run in parallel with V1 smoke on every PR with code changes.
+  # Uses analyzerName=saturation to activate V2 token-based capacity-constraint analyzer.
+  e2e-tests-smoke-v2:
+    runs-on: ubuntu-latest
+    needs: [lint-and-test, check-code-changes, check-full-tests]
+    if: github.event_name == 'pull_request' && needs.check-code-changes.result == 'success' && needs.check-code-changes.outputs.has_code_changes == 'true'
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Extract Go version from go.mod
+        run: sed -En 's/^go (.*)$/GO_VERSION=\1/p' go.mod >> $GITHUB_ENV
+
+      - name: Set up Go with cache
+        uses: actions/setup-go@v6
+        with:
+          go-version: "${{ env.GO_VERSION }}"
+          cache-dependency-path: ./go.sum
+
+      - name: Install dependencies
+        run: go mod download
+
+      - name: Install Kind
+        run: |
+          ARCH=$(uname -m)
+          case "$ARCH" in
+            x86_64)  KIND_ARCH="amd64" ;;
+            aarch64) KIND_ARCH="arm64" ;;
+            *)       echo "Unsupported architecture: $ARCH"; exit 1 ;;
+          esac
+          curl -Lo ./kind "https://kind.sigs.k8s.io/dl/v0.25.0/kind-linux-${KIND_ARCH}"
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+          kind version
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build WVA image locally
+        id: build-image
+        env:
+          CHECKOUT_SHA: ${{ needs.check-code-changes.outputs.pr_head_sha || github.sha }}
+        run: |
+          IMAGE_NAME="llm-d-workload-variant-autoscaler"
+          IMAGE_TAG="pr-${GITHUB_RUN_ID}-${CHECKOUT_SHA:0:7}"
+          FULL_IMAGE="localhost/${IMAGE_NAME}:${IMAGE_TAG}"
+          echo "Building local image: $FULL_IMAGE"
+          make docker-build IMG="$FULL_IMAGE"
+          echo "image=$FULL_IMAGE" >> $GITHUB_OUTPUT
+
+      - name: Run e2e tests (V2 smoke)
+        shell: bash
+        env:
+          ENVIRONMENT: kind-emulator
+          USE_SIMULATOR: "true"
+          SCALE_TO_ZERO_ENABLED: "false"
+          CREATE_CLUSTER: "true"
+          INSTALL_GATEWAY_CTRLPLANE: "true"
+          E2E_TESTS_ENABLED: "true"
+          IMG: ${{ steps.build-image.outputs.image }}
+          SKIP_BUILD: "true"
+          PROMETHEUS_ADAPTER_WAIT: "false"
+          DELETE_CLUSTER: "true"
+          KV_SPARE_TRIGGER: "0.5"
+          QUEUE_SPARE_TRIGGER: "4.5"
+          # V2 engine: token-based capacity-constraint analyzer
+          ANALYZER_NAME: "saturation"
+        run: |
+          make test-e2e-smoke-with-setup
+
+  # V2 Engine Full Kind E2E - triggered by /ok-to-test, /retest (alongside V1), or /ok-to-test-v2, /retest-v2 (V2 only)
+  e2e-tests-full-v2:
+    runs-on: ubuntu-latest
+    needs: [lint-and-test, check-code-changes, check-full-tests-v2]
+    if: >-
+      always() && needs.check-full-tests-v2.outputs.run_full_v2 == 'true' && needs.check-code-changes.result == 'success'
+      && (github.event_name == 'issue_comment' || github.event_name == 'workflow_dispatch')
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      statuses: write
+    steps:
+      - name: Set pending status on PR head
+        if: github.event_name == 'issue_comment' && needs.check-code-changes.outputs.pr_head_sha != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: '${{ needs.check-code-changes.outputs.pr_head_sha }}',
+              state: 'pending',
+              target_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              description: 'V2 Full E2E tests running...',
+              context: '${{ github.workflow }} / e2e-v2 (comment trigger)'
+            });
+
+      - name: Validate PR head SHA for issue_comment events
+        if: github.event_name == 'issue_comment'
+        run: |
+          if [ -z "${{ needs.check-code-changes.outputs.pr_head_sha }}" ]; then
+            echo "::error::pr_head_sha is empty — refusing to fall back to main"
+            exit 1
+          fi
+          echo "Checkout will use PR head SHA: ${{ needs.check-code-changes.outputs.pr_head_sha }}"
+
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.check-code-changes.outputs.pr_head_repo || github.repository }}
+          ref: ${{ needs.check-code-changes.outputs.pr_head_sha || github.sha }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Go version from go.mod
+        run: sed -En 's/^go (.*)$/GO_VERSION=\1/p' go.mod >> $GITHUB_ENV
+
+      - name: Set up Go with cache
+        uses: actions/setup-go@v6
+        with:
+          go-version: "${{ env.GO_VERSION }}"
+          cache-dependency-path: ./go.sum
+
+      - name: Install dependencies
+        run: go mod download
+
+      - name: Install Kind
+        run: |
+          ARCH=$(uname -m)
+          case "$ARCH" in
+            x86_64)  KIND_ARCH="amd64" ;;
+            aarch64) KIND_ARCH="arm64" ;;
+            *)       echo "Unsupported architecture: $ARCH"; exit 1 ;;
+          esac
+          curl -Lo ./kind "https://kind.sigs.k8s.io/dl/v0.25.0/kind-linux-${KIND_ARCH}"
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+          kind version
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build WVA image locally
+        id: build-image
+        env:
+          CHECKOUT_SHA: ${{ needs.check-code-changes.outputs.pr_head_sha || github.sha }}
+        run: |
+          IMAGE_NAME="llm-d-workload-variant-autoscaler"
+          IMAGE_TAG="pr-${GITHUB_RUN_ID}-${CHECKOUT_SHA:0:7}"
+          FULL_IMAGE="localhost/${IMAGE_NAME}:${IMAGE_TAG}"
+          echo "Building local image: $FULL_IMAGE"
+          make docker-build IMG="$FULL_IMAGE"
+          echo "image=$FULL_IMAGE" >> $GITHUB_OUTPUT
+
+      - name: Run e2e tests (V2 full)
+        shell: bash
+        env:
+          ENVIRONMENT: kind-emulator
+          USE_SIMULATOR: "true"
+          SCALE_TO_ZERO_ENABLED: "true"
+          CREATE_CLUSTER: "true"
+          INSTALL_GATEWAY_CTRLPLANE: "true"
+          E2E_TESTS_ENABLED: "true"
+          IMG: ${{ steps.build-image.outputs.image }}
+          SKIP_BUILD: "true"
+          PROMETHEUS_ADAPTER_WAIT: "false"
+          DELETE_CLUSTER: "false"
+          KV_SPARE_TRIGGER: "0.5"
+          QUEUE_SPARE_TRIGGER: "4.5"
+          # V2 engine: token-based capacity-constraint analyzer
+          ANALYZER_NAME: "saturation"
+        run: |
+          make test-e2e-full-with-setup
+
   # Report status back to PR for issue_comment triggered runs
-  # This ensures fork PRs show the correct status after /ok-to-test runs complete
+  # This ensures fork PRs show the correct status after /ok-to-test or V2 runs complete
   report-status:
     runs-on: ubuntu-latest
-    needs: [check-code-changes, check-full-tests, e2e-tests-full]
-    if: always() && github.event_name == 'issue_comment' && needs.check-full-tests.outputs.run_full == 'true'
+    needs: [check-code-changes, check-full-tests, check-full-tests-v2, e2e-tests-full, e2e-tests-full-v2]
+    if: >-
+      always() && github.event_name == 'issue_comment'
+      && (needs.check-full-tests.outputs.run_full == 'true' || needs.check-full-tests-v2.outputs.run_full_v2 == 'true')
     permissions:
       statuses: write
     steps:
-      - name: Report status to PR
+      - name: Report V1 status to PR
+        if: needs.check-full-tests.outputs.run_full == 'true'
         uses: actions/github-script@v7
         with:
           script: |
@@ -479,7 +747,7 @@ jobs:
               description = 'E2E tests failed';
             }
 
-            console.log(`Reporting status to PR commit ${prHeadSha}: ${state} - ${description}`);
+            console.log(`Reporting V1 status to PR commit ${prHeadSha}: ${state} - ${description}`);
 
             await github.rest.repos.createCommitStatus({
               owner: context.repo.owner,
@@ -491,4 +759,42 @@ jobs:
               context: '${{ github.workflow }} / e2e (comment trigger)'
             });
 
-            console.log('Status reported successfully');
+      - name: Report V2 status to PR
+        if: needs.check-full-tests-v2.outputs.run_full_v2 == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prHeadSha = '${{ needs.check-code-changes.outputs.pr_head_sha }}';
+            const e2eResult = '${{ needs.e2e-tests-full-v2.result }}';
+
+            if (!prHeadSha) {
+              console.log('No PR head SHA available, skipping V2 status report');
+              return;
+            }
+
+            let state, description;
+            if (e2eResult === 'success') {
+              state = 'success';
+              description = 'V2 E2E tests passed';
+            } else if (e2eResult === 'skipped') {
+              state = 'failure';
+              description = 'V2 E2E tests did not run (prerequisite failed or skipped)';
+            } else if (e2eResult === 'cancelled') {
+              state = 'failure';
+              description = 'V2 E2E tests cancelled';
+            } else {
+              state = 'failure';
+              description = 'V2 E2E tests failed';
+            }
+
+            console.log(`Reporting V2 status to PR commit ${prHeadSha}: ${state} - ${description}`);
+
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: prHeadSha,
+              state: state,
+              target_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              description: description,
+              context: '${{ github.workflow }} / e2e-v2 (comment trigger)'
+            });

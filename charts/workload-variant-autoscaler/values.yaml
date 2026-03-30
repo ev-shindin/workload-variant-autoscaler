@@ -68,6 +68,10 @@ wva:
   capacityScaling:
     # Global defaults applied to all variants unless overridden
     default:
+      # analyzerName: Selects the scaling analyzer.
+      # Empty (default) uses V1 percentage-based analyzer.
+      # "saturation" uses V2 token-based capacity-constraint analyzer.
+      analyzerName: ""
       kvCacheThreshold: 0.80      # Replica saturated if KV cache utilization >= threshold (0.0-1.0)
       queueLengthThreshold: 5     # Replica saturated if queue length >= threshold
       kvSpareTrigger: 0.1         # Scale-up if avg spare KV capacity < trigger (0.0-1.0)
