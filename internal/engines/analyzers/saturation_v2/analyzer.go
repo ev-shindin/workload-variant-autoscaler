@@ -244,9 +244,15 @@ func (a *SaturationAnalyzer) computeReplicaCapacityFallback(
 		return nil
 	}
 
-	effectiveCapacity := rec.EffectiveCapacity
+	// Apply KvCacheThreshold to match the main path (where k1 = totalTokens * threshold).
+	// For deployment-derived records, EffectiveCapacity is the raw estimate; the threshold
+	// reduces it to the usable portion, consistent with the normal code path.
+	effectiveCapacity := int64(float64(rec.EffectiveCapacity) * config.KvCacheThreshold)
+	if effectiveCapacity <= 0 {
+		return nil
+	}
 
-	// Estimate demand from KV cache usage percentage applied to the stored capacity.
+	// Estimate demand from KV cache usage percentage applied to the thresholded capacity.
 	// This is a coarse approximation — KvCacheUsage reflects memory pressure, not
 	// exact token demand — but it's sufficient when token-level metrics are absent.
 	replicaDemand := int64(rm.KvCacheUsage * float64(effectiveCapacity))
