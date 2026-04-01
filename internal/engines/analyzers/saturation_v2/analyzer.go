@@ -164,7 +164,7 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 		// capacity from the capacity store. A better approach would be to estimate
 		// TotalKvCapacityTokens from deployment args (num_gpu_blocks_override, block_size)
 		// or use a dedicated percentage-based demand signal.
-		return a.computeReplicaCapacityFallback(rm, config, modelID, namespace, gpuCount)
+		return a.computeReplicaCapacityFallback(rm, config, modelID, namespace)
 	}
 
 	// Compute demand
@@ -235,9 +235,8 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 // (e.g., the llm-d-inference-sim).
 func (a *SaturationAnalyzer) computeReplicaCapacityFallback(
 	rm interfaces.ReplicaMetrics,
-	config *config.SaturationScalingConfig,
+	cfg *config.SaturationScalingConfig,
 	modelID, namespace string,
-	gpuCount int,
 ) *ReplicaCapacity {
 	rec := a.capacityStore.Get(namespace, modelID, rm.VariantName)
 	if rec == nil || rec.EffectiveCapacity <= 0 {
@@ -247,7 +246,7 @@ func (a *SaturationAnalyzer) computeReplicaCapacityFallback(
 	// Apply KvCacheThreshold to match the main path (where k1 = totalTokens * threshold).
 	// For deployment-derived records, EffectiveCapacity is the raw estimate; the threshold
 	// reduces it to the usable portion, consistent with the normal code path.
-	effectiveCapacity := int64(float64(rec.EffectiveCapacity) * config.KvCacheThreshold)
+	effectiveCapacity := int64(float64(rec.EffectiveCapacity) * cfg.KvCacheThreshold)
 	if effectiveCapacity <= 0 {
 		return nil
 	}

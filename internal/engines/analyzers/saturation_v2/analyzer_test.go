@@ -1027,7 +1027,7 @@ var _ = Describe("computeReplicaCapacityFallback", func() {
 			TotalKvCapacityTokens: 0,
 		}
 
-		result := analyzer.computeReplicaCapacityFallback(rm, cfg, "test-model", "test-ns", 1)
+		result := analyzer.computeReplicaCapacityFallback(rm, cfg, "test-model", "test-ns")
 		Expect(result).To(BeNil())
 	})
 
@@ -1043,7 +1043,7 @@ var _ = Describe("computeReplicaCapacityFallback", func() {
 			KvCacheUsage: 0.5,
 		}
 
-		result := analyzer.computeReplicaCapacityFallback(rm, cfg, "test-model", "test-ns", 1)
+		result := analyzer.computeReplicaCapacityFallback(rm, cfg, "test-model", "test-ns")
 		Expect(result).To(BeNil())
 	})
 
@@ -1063,7 +1063,7 @@ var _ = Describe("computeReplicaCapacityFallback", func() {
 			TotalKvCapacityTokens: 0,
 		}
 
-		result := analyzer.computeReplicaCapacityFallback(rm, cfg, "test-model", "test-ns", 1)
+		result := analyzer.computeReplicaCapacityFallback(rm, cfg, "test-model", "test-ns")
 		Expect(result).NotTo(BeNil())
 		// effectiveCapacity = 10000 * 0.8 (KvCacheThreshold) = 8000
 		Expect(result.EffectiveCapacity).To(Equal(int64(8000)))
@@ -1087,7 +1087,7 @@ var _ = Describe("computeReplicaCapacityFallback", func() {
 			TotalKvCapacityTokens: 0,
 		}
 
-		result := analyzer.computeReplicaCapacityFallback(rm, cfg, "test-model", "test-ns", 1)
+		result := analyzer.computeReplicaCapacityFallback(rm, cfg, "test-model", "test-ns")
 		Expect(result).NotTo(BeNil())
 		// effectiveCapacity = 10000 * 0.8 = 8000
 		// demand = 1.0 * 8000 = 8000 >= 8000
@@ -1112,7 +1112,7 @@ var _ = Describe("computeReplicaCapacityFallback", func() {
 			TotalKvCapacityTokens: 0,
 		}
 
-		result := analyzer.computeReplicaCapacityFallback(rm, cfg, "test-model", "test-ns", 1)
+		result := analyzer.computeReplicaCapacityFallback(rm, cfg, "test-model", "test-ns")
 		Expect(result).NotTo(BeNil())
 		// effectiveCapacity = 10000 * 0.8 = 8000
 		// demand = 0.9 * 8000 = 7200
@@ -1141,7 +1141,7 @@ var _ = Describe("computeReplicaCapacityFallback", func() {
 			AvgInputTokens:        500,
 		}
 
-		result := analyzer.computeReplicaCapacityFallback(rm, cfg, "test-model", "test-ns", 1)
+		result := analyzer.computeReplicaCapacityFallback(rm, cfg, "test-model", "test-ns")
 		Expect(result).NotTo(BeNil())
 		// effectiveCapacity = 10000 * 0.8 = 8000
 		// demand = 0.5 * 8000 + 3 * 500 = 4000 + 1500 = 5500
@@ -1166,7 +1166,7 @@ var _ = Describe("computeReplicaCapacityFallback", func() {
 			AvgInputTokens:        0,
 		}
 
-		result := analyzer.computeReplicaCapacityFallback(rm, cfg, "test-model", "test-ns", 1)
+		result := analyzer.computeReplicaCapacityFallback(rm, cfg, "test-model", "test-ns")
 		Expect(result).NotTo(BeNil())
 		// effectiveCapacity = 10000 * 0.8 = 8000
 		// demand = 0.3 * 8000 = 2400 (no queue contribution)
@@ -1188,7 +1188,7 @@ var _ = Describe("computeReplicaCapacityFallback", func() {
 			TotalKvCapacityTokens: 0,
 		}
 
-		result := analyzer.computeReplicaCapacityFallback(rm, cfg, "test-model", "test-ns", 1)
+		result := analyzer.computeReplicaCapacityFallback(rm, cfg, "test-model", "test-ns")
 		Expect(result).NotTo(BeNil())
 		// effectiveCapacity = 10000 * 0.8 = 8000
 		Expect(result.PodName).To(Equal("pod-1"))
@@ -1265,7 +1265,10 @@ var _ = Describe("Analyze with fallback (no cache_config_info)", func() {
 
 		vc := result.VariantCapacities[0]
 		Expect(vc.VariantName).To(Equal("variant-a"))
-		Expect(vc.PerReplicaCapacity).To(BeNumerically(">", 0))
+		// effectiveCapacity = int64(8192 * 0.8) = 6553
+		storeCapacity := float64(8192)
+		expectedCapacity := float64(int64(storeCapacity * 0.8))
+		Expect(vc.PerReplicaCapacity).To(Equal(expectedCapacity))
 		Expect(vc.TotalDemand).To(BeNumerically(">", 0))
 		Expect(result.TotalDemand).To(BeNumerically(">", 0))
 	})
@@ -1306,7 +1309,7 @@ var _ = Describe("Analyze with fallback (no cache_config_info)", func() {
 	})
 })
 
-var _ = Describe("parseSaturationConfig ApplyDefaults before Validate", func() {
+var _ = Describe("SaturationScalingConfig ApplyDefaults before Validate", func() {
 	It("should pass validation after ApplyDefaults for V2 config with omitted thresholds", func() {
 		cfg := config.SaturationScalingConfig{
 			KvCacheThreshold:     0.8,
