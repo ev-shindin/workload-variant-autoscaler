@@ -49,22 +49,25 @@ import (
 )
 
 // resolveSaturationConfig resolves config for a model.
-// Lookup: "{modelID}#{namespace}" → "default" → zero-value with defaults.
+// Starts from the "default" entry (or zero-value), then merges the model-specific
+// override "{modelID}#{namespace}" on top (if present). This allows per-model
+// overrides to specify only the fields they want to change.
+// ApplyDefaults is called last to fill any remaining zero-valued fields.
 func resolveSaturationConfig(
 	configMap map[string]config.SaturationScalingConfig,
 	modelID, namespace string,
 ) config.SaturationScalingConfig {
-	if cfg, ok := configMap[modelID+"#"+namespace]; ok {
-		cfg.ApplyDefaults()
-		return cfg
+	// Start with default config as base
+	base := config.SaturationScalingConfig{}
+	if defaultCfg, ok := configMap["default"]; ok {
+		base = defaultCfg
 	}
-	if cfg, ok := configMap["default"]; ok {
-		cfg.ApplyDefaults()
-		return cfg
+	// Overlay model-specific override if present (non-zero fields win)
+	if override, ok := configMap[modelID+"#"+namespace]; ok {
+		base.Merge(override)
 	}
-	cfg := config.SaturationScalingConfig{}
-	cfg.ApplyDefaults()
-	return cfg
+	base.ApplyDefaults()
+	return base
 }
 
 type Engine struct {
