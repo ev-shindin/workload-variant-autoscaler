@@ -23,8 +23,9 @@ The Saturation Analyzer is a **fast, reactive, and safe saturation guardrail** t
   - [Scale-Up Decision](#scale-up-decision)
   - [Scale-Down Safety Simulation](#scale-down-safety-simulation)
 - [Decision Logic](#decision-logic)
-  - [Calculate Capacity Targets](#calculate-capacity-targets)
-- [Multi-Variant Analysis](#multi-variant-analysis)
+  - [Calculate Saturation Targets](#calculate-saturation-targets)
+  - [Model-Level Transition Blocking](#model-level-transition-blocking)
+  - [Scaling Decision Table](#scaling-decision-table-when-model-is-stable)
 - [Configuration](#configuration)
   - [Cascade Scaling Prevention](#cascade-scaling-prevention)
 - [Architecture](#architecture)
@@ -41,7 +42,7 @@ A replica is **non-saturated** if:
 kv_cache_usage < kvCacheThreshold AND queue_length < queueLengthThreshold
 ```
 
-**Default thresholds:**
+**Recommended thresholds** (set via ConfigMap — see [Configuration](#configuration)):
 - `kvCacheThreshold`: 0.80 (80%)
 - `queueLengthThreshold`: 5
 
@@ -68,26 +69,40 @@ Trigger scale-up if:
 avg_spare_kv < kvSpareTrigger OR avg_spare_queue < queueSpareTrigger
 ```
 
-**Default triggers:**
+**Recommended triggers** (set via ConfigMap — see [Configuration](#configuration)):
 - `kvSpareTrigger`: 0.1 (10%)
 - `queueSpareTrigger`: 3
 
+> **Note:** These V1 thresholds are **not hardcoded** in the analyzer. They must be provided
+> via the `wva-saturation-scaling-config` ConfigMap. If the ConfigMap is missing or has no
+> `default` entry, all thresholds default to zero, which will cause every replica to appear
+> saturated. Always deploy the ConfigMap with a `default` entry.
+
 ### Scale-Down Safety Simulation
 
-Before allowing scale-down, simulate total load redistribution across remaining replicas:
+Before allowing scale-down, the analyzer simulates load redistribution using a scale-factor
+approach. Instead of summing raw per-replica loads, it derives the current average load from
+the already-computed average spare capacity and then applies a `N/(N-1)` scale factor to
+predict load after removing one replica.
+
+See: `internal/saturation/analyzer.go` — `isScaleDownSafe()`
 
 ```
-remaining_replicas = N_non_sat - 1
+// Pre-condition: require at least 2 non-saturated replicas
+if N_non_sat < 2:
+    return unsafe
 
-// Calculate total load across all non-saturated replicas
-total_kv_load = Σ kv_cache_usage_i (for all non-saturated replicas)
-total_queue_load = Σ queue_length_i (for all non-saturated replicas)
+// Derive current average load from average spare capacity
+// (Load = Threshold - Spare)
+avg_kv_load = kvCacheThreshold - avg_spare_kv
+avg_queue_load = queueLengthThreshold - avg_spare_queue
 
-// Simulate removing one replica: redistribute total load
-avg_kv_after_removal = total_kv_load / remaining_replicas
-avg_queue_after_removal = total_queue_load / remaining_replicas
+// Simulate removing one replica: load increases by factor N/(N-1)
+scale_factor = N_non_sat / (N_non_sat - 1)
+avg_kv_after_removal = avg_kv_load * scale_factor
+avg_queue_after_removal = avg_queue_load * scale_factor
 
-// Calculate remaining spare capacity
+// Calculate remaining spare capacity after redistribution
 remaining_spare_kv = kvCacheThreshold - avg_kv_after_removal
 remaining_spare_queue = queueLengthThreshold - avg_queue_after_removal
 ```
@@ -95,43 +110,82 @@ remaining_spare_queue = queueLengthThreshold - avg_queue_after_removal
 **Scale-down is safe if:**
 ```
 remaining_spare_kv >= kvSpareTrigger AND
-remaining_spare_queue >= queueSpareTrigger AND
-N_non_sat >= 2
+remaining_spare_queue >= queueSpareTrigger
 ```
+
+> **Note:** The minimum-replicas check (`N_non_sat >= 2`) is enforced as a pre-condition
+> before the simulation runs, defined by `MinNonSaturatedReplicasForScaleDown` in
+> `internal/saturation/constants.go`.
 
 ## Decision Logic
 
-### Calculate Capacity Targets
+### Calculate Saturation Targets
 
-`CalculateCapacityTargets(capacityAnalysis, variantStates) → map[variantName]targetReplicas`
+`CalculateSaturationTargets(saturationAnalysis, variantStates) → map[variantName]targetReplicas`
 
-For each variant, determines target replicas based on **capacity needs only**:
+For each variant, determines target replicas based on **saturation analysis**:
+
+#### Model-Level Transition Blocking
+
+Before any scaling decisions are made, the analyzer checks whether the **entire model** is
+in a transitional state. If **any** variant of the model is transitioning, **all** scaling
+decisions for the model are blocked. This prevents decisions based on incomplete capacity data.
+
+See: `internal/saturation/analyzer.go` — `CalculateSaturationTargets()`, Step 1
+
+A variant is considered transitioning if **either** condition is true:
+
+| Check | Condition | Meaning |
+|-------|-----------|---------|
+| **Desired vs Current** | `DesiredReplicas ≠ 0 AND DesiredReplicas ≠ CurrentReplicas` | A previous scaling decision is still being applied |
+| **Metrics vs Current** | `MetricsCount ≠ CurrentReplicas` | Not all pods are ready and reporting metrics |
+
+When transition is detected:
+- Variants with a desired/current mismatch preserve their `DesiredReplicas` as the target
+- All other variants preserve their `CurrentReplicas` as the target
+- No new scale-up or scale-down decisions are made for any variant of the model
+
+#### Scaling Decision Table (when model is stable)
 
 | Condition | Target Replicas | Rationale |
 |-----------|----------------|-----------|
-| **desired ≠ 0 AND desired ≠ current** | target = **desired** | Preserve previous decision (from CRD status) |
-| Capacity needs scale-up | **Cheapest** non-preserved variant: readyReplicas + 1 | Cost-optimized capacity expansion (deterministic: alphabetically first variant on tie) |
-| Capacity allows scale-down | **Most expensive** non-preserved variant: readyReplicas - 1 | Cost-optimized capacity reduction (deterministic: alphabetically last variant on tie) |
+| Capacity needs scale-up | **Cheapest** eligible variant: readyReplicas + 1 | Cost-optimized capacity expansion (deterministic: alphabetically first variant on tie) |
+| Capacity allows scale-down | **Most expensive** eligible variant (with target > 1): readyReplicas - 1 | Cost-optimized capacity reduction (deterministic: alphabetically last variant on tie) |
 | Otherwise | target = readyReplicas | No capacity action needed |
 
-**Note:** `readyReplicas` = number of replicas reporting capacity metrics (from `VariantCapacityAnalysis.ReplicaCount`). This prevents excessive scale-up when replicas are still starting up.
+After scaling decisions, targets are clamped to `[minReplicas, maxReplicas]` bounds from the
+VariantAutoscaling spec (if specified).
+
+**Note:** `readyReplicas` = number of replicas reporting capacity metrics (from `VariantSaturationAnalysis.ReplicaCount`). This prevents excessive scale-up when replicas are still starting up.
 
 **Cascade Scaling Prevention:** Variants with pending replicas (pods that exist but are not yet ready) are skipped during scale-up selection. This prevents the controller from repeatedly scaling up the same variant while previous scale-up operations are still in progress. Pod startup can take 2-7 minutes depending on model size and hardware (container initialization, model loading, health checks).
 
-**Example Output:**
+> **Important:** Cascade prevention (pending replica checks) only applies when the model is
+> **not** in transition. If any variant triggers model-level transition blocking (above),
+> all decisions are blocked before the per-variant cascade prevention logic runs.
+
+**Example Output (model stable — all variants have metrics == current and desired == current or 0):**
 ```
 Model: llama-70b
 Variants:
   - v1-l4 (cost=$5): current=2, ready=2, desired=0 → target=3 (cheapest, scaled up for capacity)
-  - v2-a100 (cost=$20): current=4, ready=3, desired=4 → target=4 (preserved desired)
+  - v2-a100 (cost=$20): current=2, ready=2, desired=0 → target=2 (no change)
+```
 
-Note: v2-a100 has 4 current replicas but only 3 are ready (reporting metrics).
-      Target is set to desired=4 because desired ≠ current.
+**Example Output (model in transition — scaling blocked):**
+```
+Model: llama-70b
+Variants:
+  - v1-l4 (cost=$5): current=2, ready=2, desired=0 → target=2 (blocked: model transitioning)
+  - v2-a100 (cost=$20): current=4, ready=3, desired=0 → target=4 (preserved current)
+
+Note: v2-a100 has metrics(3) ≠ current(4) — only 3 of 4 pods are reporting.
+      This triggers model-level transition, blocking all variants from new decisions.
 ```
 
 **Key Principles:**
-1. **Ready replicas only**: Use replicas reporting metrics to avoid scaling up for not-yet-ready pods
-2. **Preserve desired replicas**: When desired ≠ current, always use desired as capacity target
+1. **Model-level transition blocking**: If any variant is transitioning, block all scaling for the model
+2. **Ready replicas only**: Use replicas reporting metrics to avoid scaling up for not-yet-ready pods
 3. **Cost-aware selection**: Cheapest variant for scale-up, most expensive for scale-down
 4. **Deterministic tie-breaking**: When variants have equal costs, alphabetically first for scale-up, last for scale-down
 5. **Pending replica awareness**: Skip variants with pending replicas during scale-up to prevent cascade scaling
@@ -151,7 +205,9 @@ T+60s: Both new pods still starting, saturation persists → Scale up to 5 repli
 T+90s: All 5 pods now ready, but we have 3 extra replicas (over-provisioned)
 ```
 
-**Solution:** WVA tracks **pending replicas** (`CurrentReplicas - ReadyReplicas`) per variant and skips variants with pending replicas during scale-up selection.
+**Solution:** WVA uses two layers of protection:
+1. **Model-level transition blocking** (primary): If any variant has `desired ≠ current` or `metrics ≠ current`, all scaling is blocked for the entire model (see [Transition Blocking](#model-level-transition-blocking) above).
+2. **Pending replica checks** (secondary): When the model is stable, variants with pending replicas are skipped during scale-up selection.
 
 **How It Works:**
 1. **Replica State Tracking**: Controller maintains `VariantReplicaState` with:
@@ -159,12 +215,23 @@ T+90s: All 5 pods now ready, but we have 3 extra replicas (over-provisioned)
    - `DesiredReplicas`: Target from previous run (from CRD status)
    - `PendingReplicas`: Pods that exist but aren't ready (`CurrentReplicas - ReadyReplicas`)
 
-2. **Scale-Up Selection**: When saturation triggers scale-up:
+2. **Model-Level Transition Check** (Step 1 in `CalculateSaturationTargets`):
+   ```
+   // If ANY variant is transitioning, block ALL scaling for the model
+   for each variant:
+       if variant.DesiredReplicas ≠ 0 AND DesiredReplicas ≠ CurrentReplicas:
+           model_in_transition = true
+       if variant.MetricsCount ≠ CurrentReplicas:
+           model_in_transition = true
+
+   if model_in_transition:
+       return preserved targets (no new decisions)
+   ```
+
+3. **Scale-Up Selection** (Step 4, only when model is stable):
    ```go
    // Pseudo-code from internal/saturation/analyzer.go
    for each variant:
-       if variant has preserved desired replicas:
-           skip  // Already has decision from previous run
        if variant.PendingReplicas > 0:
            skip  // Wait for pending pods to become ready
        if variant.Cost < cheapest.Cost:
@@ -173,14 +240,17 @@ T+90s: All 5 pods now ready, but we have 3 extra replicas (over-provisioned)
    scale_up(cheapest)  // Only if no pending replicas
    ```
 
-3. **Per-Variant Tracking**: Each variant is tracked independently. If variant-1 has pending replicas, variant-2 can still scale up if it's the cheapest eligible variant.
+4. **Per-Variant Tracking**: Each variant is tracked independently. If variant-1 has pending replicas, variant-2 can still scale up if it's the cheapest eligible variant.
 
 **Timeline Example (With Protection):**
 ```
-T+0s:  Saturation detected → Scale up variant-1 from 2 to 3 (PendingReplicas=1)
-T+30s: Saturation still detected, but variant-1 skipped (has 1 pending replica)
-       If variant-2 is cheaper and has no pending replicas → Scale up variant-2
-T+90s: variant-1 pod becomes ready (PendingReplicas=0), now eligible for scale-up again
+T+0s:   Saturation detected → Scale up variant-1 from 2 to 3
+T+30s:  variant-1: current=3, but only 2 pods reporting metrics
+        Check 2 triggers: metrics(2) ≠ current(3)
+        → Model in transition, ALL scaling blocked
+T+90s:  variant-1: all 3 pods ready and reporting metrics
+        metrics(3) == current(3), desired reset to 0
+        → Model stable, new scaling decisions allowed
 ```
 
 **Benefits:**
@@ -196,7 +266,7 @@ Saturation scaling thresholds are configured via ConfigMap (see [../saturation-s
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: capacity-scaling-config
+  name: wva-saturation-scaling-config
   namespace: workload-variant-autoscaler-system
 data:
   default: |
@@ -207,31 +277,43 @@ data:
 ```
 
 **Per-model overrides:**
+
+The saturation engine resolves per-model config using a lookup key in the format
+`{modelID}#{namespace}` (see `internal/engines/saturation/engine.go` — `resolveSaturationConfig()`).
+The ConfigMap data key **must** match this format for overrides to take effect.
+Lookup order: `modelID#namespace` → `default` → zero-value with defaults applied.
+
 ```yaml
-  llama-70b-prod: |
-    model_id: meta/llama-70b
-    namespace: production
+  "meta/llama-70b#production": |
     kvCacheThreshold: 0.85
+    queueLengthThreshold: 5
     kvSpareTrigger: 0.15
+    queueSpareTrigger: 3
 ```
+
+> **Note:** Overrides **fully replace** the `default` config — there is no field-level
+> inheritance. Always specify all required threshold fields. The `model_id` and `namespace`
+> YAML fields inside the entry are parsed into the config struct but are **not used for
+> lookup**. The ConfigMap data key itself determines which model/namespace the override
+> applies to.
 
 ## Architecture
 
 ### Components
 
-**1. Saturation Analyzer (`internal/capacity/analyzer.go`)**
+**1. Saturation Analyzer (`internal/saturation/analyzer.go`)**
 - Core analysis logic for saturation-based scaling decisions
 - Implements spare capacity calculations
 - Performs worst-case scale-down safety simulation
 - Makes **per-variant** scaling decisions with cost-awareness
 
-**2. Metrics Collector (`internal/collector/capacity_metrics.go`)**
+**2. Metrics Collector (`internal/collector/replica_metrics.go`)**
 - Collects vLLM metrics from Prometheus using `max_over_time[1m]` queries
 - Queries `constants.VLLMKvCacheUsagePerc` and `constants.VLLMNumRequestsWaiting`
 - Uses peak values over 1 minute for safety-first capacity analysis
 - Enriches metrics with pod metadata (variant name, accelerator type)
 
-**3. Interfaces (`internal/interfaces/capacity_analyzer.go`)**
+**3. Interfaces (`internal/interfaces/analyzer.go`, `internal/interfaces/saturation_analyzer.go`)**
 - Defines data structures for replica metrics (including variant cost)
 - Defines analysis results and per-variant decision types
 - Provides interface for capacity analysis
@@ -252,16 +334,16 @@ data:
          │ ReplicaMetrics[] (with cost)
          ↓
 ┌──────────────────────────┐
-│ AnalyzeModelCapacity     │  ← CapacityScalingConfig
+│ AnalyzeModelSaturation   │  ← SaturationScalingConfig
 └────────┬─────────────────┘
-         │ ModelCapacityAnalysis (with per-variant breakdown)
+         │ ModelSaturationAnalysis (with per-variant breakdown)
          ↓
-┌─────────────────────────────┐
-│ CalculateCapacityTargets    │  ← VariantReplicaState[] (current/desired from CRD)
-│ - Preserves desired replicas      │
-│ - Cost-aware variant selection    │
-└────────┬──────────────────────────┘
-         │ Capacity Targets: map[variantName]targetReplicas
+┌─────────────────────────────────┐
+│ CalculateSaturationTargets      │  ← VariantReplicaState[] (current/desired from CRD)
+│ - Model-level transition blocking     │
+│ - Cost-aware variant selection        │
+└────────┬────────────────────────────┘
+         │ Saturation Targets: map[variantName]targetReplicas
          ↓
 ┌──────────────────┐
 │    Controller    │
