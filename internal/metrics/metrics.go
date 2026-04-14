@@ -59,11 +59,15 @@ func InitMetrics(registry prometheus.Registerer) error {
 	scalingLabels := []string{constants.LabelVariantName, constants.LabelNamespace, constants.LabelDirection, constants.LabelReason}
 	// modelLabels: variant_name + namespace only (no accelerator_type) for model-level and token metrics
 	modelLabels := []string{constants.LabelVariantName, constants.LabelNamespace}
+	// requiredCapacityLabels: model labels + analyzer_version to disambiguate V1 (binary)
+	// vs V2 (continuous tokens) units of the wva_required_capacity gauge
+	requiredCapacityLabels := []string{constants.LabelVariantName, constants.LabelNamespace, constants.LabelAnalyzerVersion}
 
 	if controllerInstance != "" {
 		baseLabels = append(baseLabels, constants.LabelControllerInstance)
 		scalingLabels = append(scalingLabels, constants.LabelControllerInstance)
 		modelLabels = append(modelLabels, constants.LabelControllerInstance)
+		requiredCapacityLabels = append(requiredCapacityLabels, constants.LabelControllerInstance)
 	}
 
 	replicaScalingTotal = prometheus.NewCounterVec(
@@ -111,9 +115,9 @@ func InitMetrics(registry prometheus.Registerer) error {
 	requiredCapacity = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: constants.WVARequiredCapacity,
-			Help: "Model-level required capacity; >0 indicates scale-up needed (V1: binary 0/1, V2: continuous token demand)",
+			Help: "Model-level required capacity; >0 indicates scale-up needed. Use the analyzer_version label to distinguish units (V1: binary 0/1, V2: continuous token demand).",
 		},
-		modelLabels,
+		requiredCapacityLabels,
 	)
 	kvCacheTokensUsed = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
@@ -406,10 +410,12 @@ func SetMetricsFreshnessStatus(variantName, status string, count int) {
 	metricsFreshnessStatus.With(labels).Set(float64(count))
 }
 
-// EmitSaturationMetrics emits saturation analysis and KV cache capacity metrics
+// EmitSaturationMetrics emits saturation analysis and KV cache capacity metrics.
+// analyzerVersion ("v1" or "v2") is used as a label on wva_required_capacity to
+// disambiguate the units of the required value (V1: binary, V2: continuous tokens).
 func (m *MetricsEmitter) EmitSaturationMetrics(
 	ctx context.Context,
-	variantName, namespace, acceleratorType string,
+	variantName, namespace, acceleratorType, analyzerVersion string,
 	utilization, spare, required float64,
 	kvTokensUsed, kvTokensTotal int64,
 ) error {
@@ -427,17 +433,60 @@ func (m *MetricsEmitter) EmitSaturationMetrics(
 		constants.LabelVariantName: variantName,
 		constants.LabelNamespace:   namespace,
 	}
+	requiredLabels := prometheus.Labels{
+		constants.LabelVariantName:     variantName,
+		constants.LabelNamespace:       namespace,
+		constants.LabelAnalyzerVersion: analyzerVersion,
+	}
 
 	if controllerInstance != "" {
 		accelLabels[constants.LabelControllerInstance] = controllerInstance
 		modelLabels[constants.LabelControllerInstance] = controllerInstance
+		requiredLabels[constants.LabelControllerInstance] = controllerInstance
 	}
 
 	saturationUtilization.With(accelLabels).Set(utilization)
 	spareCapacity.With(accelLabels).Set(spare)
-	requiredCapacity.With(modelLabels).Set(required)
+	requiredCapacity.With(requiredLabels).Set(required)
 	kvCacheTokensUsed.With(modelLabels).Set(float64(kvTokensUsed))
 	kvCacheTokensTotal.With(modelLabels).Set(float64(kvTokensTotal))
 
 	return nil
+}
+
+// DeleteSaturationMetrics removes saturation metric series for the given variant.
+// Should be called when a VariantAutoscaling resource is deleted to prevent stale
+// time series from accumulating in Prometheus.
+//
+// TODO: wire this from the controller's VariantAutoscaling delete handler / finalizer.
+// Until that wiring exists, deleted VAs leave their last-emitted metric values in the
+// registry indefinitely.
+func (m *MetricsEmitter) DeleteSaturationMetrics(variantName, namespace, acceleratorType, analyzerVersion string) {
+	if saturationUtilization == nil {
+		return
+	}
+	accelLabels := prometheus.Labels{
+		constants.LabelVariantName:     variantName,
+		constants.LabelNamespace:       namespace,
+		constants.LabelAcceleratorType: acceleratorType,
+	}
+	modelLabels := prometheus.Labels{
+		constants.LabelVariantName: variantName,
+		constants.LabelNamespace:   namespace,
+	}
+	requiredLabels := prometheus.Labels{
+		constants.LabelVariantName:     variantName,
+		constants.LabelNamespace:       namespace,
+		constants.LabelAnalyzerVersion: analyzerVersion,
+	}
+	if controllerInstance != "" {
+		accelLabels[constants.LabelControllerInstance] = controllerInstance
+		modelLabels[constants.LabelControllerInstance] = controllerInstance
+		requiredLabels[constants.LabelControllerInstance] = controllerInstance
+	}
+	saturationUtilization.Delete(accelLabels)
+	spareCapacity.Delete(accelLabels)
+	requiredCapacity.Delete(requiredLabels)
+	kvCacheTokensUsed.Delete(modelLabels)
+	kvCacheTokensTotal.Delete(modelLabels)
 }

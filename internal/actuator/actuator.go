@@ -101,6 +101,7 @@ func (a *Actuator) EmitSaturationMetrics(ctx context.Context, decision interface
 		decision.VariantName,
 		decision.Namespace,
 		decision.AcceleratorName,
+		decision.AnalyzerVersion,
 		decision.Utilization,
 		decision.SpareCapacity,
 		decision.RequiredCapacity,

@@ -207,7 +207,13 @@ type VariantDecision struct {
 	// Same value for all variants of a model.
 	// V1: binary (1.0 if shouldScaleUp, else 0.0).
 	// V2: continuous token-based demand from AnalyzerResult.
+	// Use AnalyzerVersion to disambiguate the units when consuming this field
+	// (or its corresponding Prometheus metric).
 	RequiredCapacity float64
+	// AnalyzerVersion identifies which analyzer produced this decision ("v1" or "v2").
+	// Exposed as a Prometheus label on saturation metrics so dashboards can filter
+	// by analyzer to handle the V1/V2 unit difference in RequiredCapacity.
+	AnalyzerVersion string
 	// ScaleTargetRef references the Deployment/StatefulSet for scheduling constraints
 	ScaleTargetRef *autoscalingv2.CrossVersionObjectReference
 

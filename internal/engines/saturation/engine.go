@@ -36,6 +36,7 @@ import (
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/collector/registration"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/collector/source"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/config"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/constants"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/discovery"
 	queueingmodel "github.com/llm-d/llm-d-workload-variant-autoscaler/internal/engines/analyzers/queueingmodel"
 	saturation_v2 "github.com/llm-d/llm-d-workload-variant-autoscaler/internal/engines/analyzers/saturation_v2"
@@ -910,6 +911,7 @@ func enrichDecisionsFromReplicaMetrics(decisions []interfaces.VariantDecision, r
 	for i := range decisions {
 		d := &decisions[i]
 		d.RequiredCapacity = requiredCapacity
+		d.AnalyzerVersion = constants.AnalyzerVersionV1
 		if a, ok := agg[d.VariantName]; ok && a.count > 0 {
 			d.KvCacheTokensUsed = a.kvUsed
 			d.KvCacheTokensTotal = a.kvTotal
@@ -918,22 +920,30 @@ func enrichDecisionsFromReplicaMetrics(decisions []interfaces.VariantDecision, r
 	}
 }
 
-// enrichDecisionsWithKvTokenData sets KvCacheTokensUsed and KvCacheTokensTotal on decisions
-// from replica metrics aggregated per variant. Used by V2 path where Utilization and
-// RequiredCapacity are already set from AnalyzerResult.
+// enrichDecisionsWithKvTokenData sets KvCacheTokensUsed, KvCacheTokensTotal, and
+// AnalyzerVersion on decisions from replica metrics aggregated per (model, variant).
+// Used by V2 path where Utilization and RequiredCapacity are already set from
+// AnalyzerResult.
+//
+// Aggregation is keyed by (modelID, variantName) — not just variantName — because
+// variant names can collide across different models in the same reconcile cycle.
 func enrichDecisionsWithKvTokenData(decisions []interfaces.VariantDecision, modelReplicaMetrics map[string][]interfaces.ReplicaMetrics) {
-	// Build per-variant KV token aggregation across all models
 	type kvAgg struct {
 		kvUsed  int64
 		kvTotal int64
 	}
-	agg := make(map[string]*kvAgg)
-	for _, metrics := range modelReplicaMetrics {
+	type variantKey struct {
+		modelID string
+		variant string
+	}
+	agg := make(map[variantKey]*kvAgg)
+	for modelID, metrics := range modelReplicaMetrics {
 		for _, rm := range metrics {
-			a, ok := agg[rm.VariantName]
+			k := variantKey{modelID: modelID, variant: rm.VariantName}
+			a, ok := agg[k]
 			if !ok {
 				a = &kvAgg{}
-				agg[rm.VariantName] = a
+				agg[k] = a
 			}
 			a.kvUsed += rm.TokensInUse
 			a.kvTotal += rm.TotalKvCapacityTokens
@@ -942,7 +952,8 @@ func enrichDecisionsWithKvTokenData(decisions []interfaces.VariantDecision, mode
 
 	for i := range decisions {
 		d := &decisions[i]
-		if a, ok := agg[d.VariantName]; ok {
+		d.AnalyzerVersion = constants.AnalyzerVersionV2
+		if a, ok := agg[variantKey{modelID: d.ModelID, variant: d.VariantName}]; ok {
 			d.KvCacheTokensUsed = a.kvUsed
 			d.KvCacheTokensTotal = a.kvTotal
 		}
@@ -1328,7 +1339,11 @@ func (e *Engine) applySaturationDecisions(
 			updateVa.Status.Actuation.Applied = true
 		}
 
-		// Emit saturation and capacity metrics for observability
+		// Emit saturation and capacity metrics for observability.
+		// Note: stale time series for deleted VAs are not cleaned up automatically here.
+		// The metrics package exposes DeleteSaturationMetrics for callers (e.g., the
+		// VariantAutoscaling reconciler's delete handler / finalizer) to remove series
+		// when a VA is removed.
 		if hasDecision {
 			if err := act.EmitSaturationMetrics(ctx, decision); err != nil {
 				logger.Error(err, "Failed to emit saturation metrics", "variant", updateVa.Name)

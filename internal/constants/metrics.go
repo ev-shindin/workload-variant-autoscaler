@@ -141,7 +141,11 @@ const (
 	WVASpareCapacity = "wva_spare_capacity"
 
 	// WVARequiredCapacity is a gauge that tracks model-level required capacity.
-	// >0 means scale-up needed. Labels: variant_name, namespace
+	// >0 means scale-up needed.
+	// Units differ by analyzer (use the analyzer_version label to distinguish):
+	//   - V1: binary signal (0.0 = no scale-up, 1.0 = scale-up needed)
+	//   - V2: continuous token-based demand
+	// Labels: variant_name, namespace, analyzer_version
 	WVARequiredCapacity = "wva_required_capacity"
 
 	// WVAKvCacheTokensUsed is a gauge that tracks total KV cache tokens currently in use per variant.
@@ -165,6 +169,7 @@ const (
 	LabelControllerInstance = "controller_instance"
 	LabelStatus             = "status"
 	LabelQueryType          = "query_type"
+	LabelAnalyzerVersion    = "analyzer_version"
 )
 
 // Metric Label Values for query_type
@@ -174,4 +179,10 @@ const (
 	QueryTypeQueueLength  = "queue_length"
 	QueryTypeRequestCount = "request_count"
 	QueryTypeCacheConfig  = "cache_config"
+)
+
+// Analyzer version label values used in saturation metrics.
+const (
+	AnalyzerVersionV1 = "v1"
+	AnalyzerVersionV2 = "v2"
 )
