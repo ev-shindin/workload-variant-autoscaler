@@ -421,7 +421,7 @@ func (m *MetricsEmitter) EmitSaturationMetrics(
 ) error {
 	if saturationUtilization == nil || spareCapacity == nil || requiredCapacity == nil ||
 		kvCacheTokensUsed == nil || kvCacheTokensTotal == nil {
-		return fmt.Errorf("saturation metrics not initialized")
+		return errors.New("saturation metrics not initialized")
 	}
 
 	accelLabels := prometheus.Labels{
