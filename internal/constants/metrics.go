@@ -133,28 +133,28 @@ const (
 	WVAMetricsFreshnessStatus = "wva_metrics_freshness_status"
 
 	// WVASaturationUtilization is a gauge that tracks per-variant utilization ratio (0.0-1.0).
-	// Labels: variant_name, namespace, accelerator_type
+	// Labels: variant_name, namespace, model_name, accelerator_type
 	WVASaturationUtilization = "wva_saturation_utilization"
 
 	// WVASpareCapacity is a gauge that tracks per-variant spare capacity (0.0-1.0).
-	// Labels: variant_name, namespace, accelerator_type
+	// Labels: variant_name, namespace, model_name, accelerator_type
 	WVASpareCapacity = "wva_spare_capacity"
 
 	// WVARequiredCapacity is a gauge that tracks model-level required capacity.
 	// >0 means scale-up needed.
-	// Units differ by analyzer (use the analyzer_version label to distinguish):
-	//   - V1: binary signal (0.0 = no scale-up, 1.0 = scale-up needed)
-	//   - V2: continuous token-based demand
-	// Labels: variant_name, namespace, analyzer_version
+	// Value semantics differ by analyzer (use the "unit" label to distinguish):
+	//   - unit="binary"     (V1): 0.0 = no scale-up, 1.0 = scale-up needed
+	//   - unit="continuous" (V2): continuous token-based demand
+	// Labels: variant_name, namespace, model_name, unit
 	WVARequiredCapacity = "wva_required_capacity"
 
 	// WVAKvCacheTokensUsed is a gauge that tracks total KV cache tokens currently in use per variant.
-	// Labels: variant_name, namespace
+	// Labels: variant_name, namespace, model_name
 	WVAKvCacheTokensUsed = "wva_kv_cache_tokens_used"
 
-	// WVAKvCacheTokensTotal is a gauge that tracks total KV cache token capacity per variant.
-	// Labels: variant_name, namespace
-	WVAKvCacheTokensTotal = "wva_kv_cache_tokens_total"
+	// WVAKvCacheTokensCapacity is a gauge that tracks total KV cache token capacity per variant.
+	// Labels: variant_name, namespace, model_name
+	WVAKvCacheTokensCapacity = "wva_kv_cache_tokens_capacity"
 )
 
 // Metric Label Names
@@ -169,7 +169,11 @@ const (
 	LabelControllerInstance = "controller_instance"
 	LabelStatus             = "status"
 	LabelQueryType          = "query_type"
-	LabelAnalyzerVersion    = "analyzer_version"
+	// LabelUnit distinguishes the unit of a metric value when a single metric name
+	// carries values with different semantic units. Currently applied to
+	// wva_required_capacity, whose value is either a binary scale-up signal (V1)
+	// or a continuous token-demand value (V2).
+	LabelUnit = "unit"
 )
 
 // Metric Label Values for query_type
@@ -181,8 +185,9 @@ const (
 	QueryTypeCacheConfig  = "cache_config"
 )
 
-// Analyzer version label values used in saturation metrics.
+// Values for the LabelUnit Prometheus label, describing how to interpret the
+// metric value ("binary" 0/1 vs. "continuous" absolute quantity).
 const (
-	AnalyzerVersionV1 = "v1"
-	AnalyzerVersionV2 = "v2"
+	UnitBinary     = "binary"
+	UnitContinuous = "continuous"
 )

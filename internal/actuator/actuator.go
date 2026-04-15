@@ -100,12 +100,21 @@ func (a *Actuator) EmitSaturationMetrics(ctx context.Context, decision interface
 		ctx,
 		decision.VariantName,
 		decision.Namespace,
+		decision.ModelID,
 		decision.AcceleratorName,
-		decision.AnalyzerVersion,
+		decision.RequiredCapacityUnit,
 		decision.Utilization,
 		decision.SpareCapacity,
 		decision.RequiredCapacity,
 		decision.KvCacheTokensUsed,
-		decision.KvCacheTokensTotal,
+		decision.KvCacheTokensCapacity,
 	)
+}
+
+// DeleteSaturationMetricsForVariant removes all saturation metric series for a
+// variant. Call this when the current optimization cycle produced no fresh
+// decision for the variant, or when the VA is being deleted — so dashboards
+// don't show stale values.
+func (a *Actuator) DeleteSaturationMetricsForVariant(variantName, namespace string) {
+	a.MetricsEmitter.DeleteSaturationMetricsForVariant(variantName, namespace)
 }

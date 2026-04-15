@@ -22,7 +22,7 @@ func resetMetrics() {
 	spareCapacity = nil
 	requiredCapacity = nil
 	kvCacheTokensUsed = nil
-	kvCacheTokensTotal = nil
+	kvCacheTokensCapacity = nil
 	controllerInstance = ""
 }
 
@@ -78,7 +78,7 @@ var _ = Describe("EmitSaturationMetrics", func() {
 
 	It("should emit all saturation metrics with correct values", func() {
 		err := emitter.EmitSaturationMetrics(ctx,
-			"variant-a", "test-ns", "nvidia-a100", constants.AnalyzerVersionV2,
+			"variant-a", "test-ns", "meta-llama/Llama-3.1-8B", "nvidia-a100", constants.UnitContinuous,
 			0.75, 0.25, 5000.0,
 			100000, 200000,
 		)
@@ -87,16 +87,19 @@ var _ = Describe("EmitSaturationMetrics", func() {
 		accelLabels := map[string]string{
 			constants.LabelVariantName:     "variant-a",
 			constants.LabelNamespace:       "test-ns",
+			constants.LabelModelName:       "meta-llama/Llama-3.1-8B",
 			constants.LabelAcceleratorType: "nvidia-a100",
 		}
 		modelLabels := map[string]string{
 			constants.LabelVariantName: "variant-a",
 			constants.LabelNamespace:   "test-ns",
+			constants.LabelModelName:   "meta-llama/Llama-3.1-8B",
 		}
 		requiredLabels := map[string]string{
-			constants.LabelVariantName:     "variant-a",
-			constants.LabelNamespace:       "test-ns",
-			constants.LabelAnalyzerVersion: constants.AnalyzerVersionV2,
+			constants.LabelVariantName: "variant-a",
+			constants.LabelNamespace:   "test-ns",
+			constants.LabelModelName:   "meta-llama/Llama-3.1-8B",
+			constants.LabelUnit:        constants.UnitContinuous,
 		}
 
 		// saturation_utilization
@@ -113,7 +116,7 @@ var _ = Describe("EmitSaturationMetrics", func() {
 		Expect(ok).To(BeTrue())
 		Expect(val).To(Equal(0.25))
 
-		// required_capacity (carries analyzer_version label)
+		// required_capacity (carries unit label)
 		mf = gatherMetric(registry, constants.WVARequiredCapacity)
 		Expect(mf).NotTo(BeNil())
 		val, ok = gaugeValue(mf, requiredLabels)
@@ -128,21 +131,21 @@ var _ = Describe("EmitSaturationMetrics", func() {
 		Expect(val).To(Equal(100000.0))
 
 		// kv_cache_tokens_total
-		mf = gatherMetric(registry, constants.WVAKvCacheTokensTotal)
+		mf = gatherMetric(registry, constants.WVAKvCacheTokensCapacity)
 		Expect(mf).NotTo(BeNil())
 		val, ok = gaugeValue(mf, modelLabels)
 		Expect(ok).To(BeTrue())
 		Expect(val).To(Equal(200000.0))
 	})
 
-	It("should distinguish V1 and V2 required_capacity series via analyzer_version label", func() {
-		// Same variant, same namespace, different analyzer versions → two series
+	It("should distinguish binary and continuous required_capacity series via unit label", func() {
+		// Same variant, same namespace, different units → two series
 		Expect(emitter.EmitSaturationMetrics(ctx,
-			"variant-multi", "ns", "h100", constants.AnalyzerVersionV1,
+			"variant-multi", "ns", "model-x", "h100", constants.UnitBinary,
 			0.5, 0.5, 1.0, 100, 200,
 		)).To(Succeed())
 		Expect(emitter.EmitSaturationMetrics(ctx,
-			"variant-multi", "ns", "h100", constants.AnalyzerVersionV2,
+			"variant-multi", "ns", "model-x", "h100", constants.UnitContinuous,
 			0.5, 0.5, 8000.0, 100, 200,
 		)).To(Succeed())
 
@@ -150,14 +153,16 @@ var _ = Describe("EmitSaturationMetrics", func() {
 		Expect(mf).NotTo(BeNil())
 
 		v1Labels := map[string]string{
-			constants.LabelVariantName:     "variant-multi",
-			constants.LabelNamespace:       "ns",
-			constants.LabelAnalyzerVersion: constants.AnalyzerVersionV1,
+			constants.LabelVariantName: "variant-multi",
+			constants.LabelNamespace:   "ns",
+			constants.LabelModelName:   "model-x",
+			constants.LabelUnit:        constants.UnitBinary,
 		}
 		v2Labels := map[string]string{
-			constants.LabelVariantName:     "variant-multi",
-			constants.LabelNamespace:       "ns",
-			constants.LabelAnalyzerVersion: constants.AnalyzerVersionV2,
+			constants.LabelVariantName: "variant-multi",
+			constants.LabelNamespace:   "ns",
+			constants.LabelModelName:   "model-x",
+			constants.LabelUnit:        constants.UnitContinuous,
 		}
 
 		v1Val, ok := gaugeValue(mf, v1Labels)
@@ -180,31 +185,33 @@ var _ = Describe("EmitSaturationMetrics", func() {
 		emitter = NewMetricsEmitter()
 
 		err := emitter.EmitSaturationMetrics(ctx,
-			"variant-b", "prod-ns", "nvidia-h100", constants.AnalyzerVersionV2,
+			"variant-b", "prod-ns", "ibm/granite-13b", "nvidia-h100", constants.UnitContinuous,
 			0.90, 0.10, 10000.0,
 			500000, 600000,
 		)
 		Expect(err).NotTo(HaveOccurred())
 
-		// Verify controller_instance on accel-scoped metric
+		// Verify controller_instance + model_name on accel-scoped metric
 		mf := gatherMetric(registry, constants.WVASaturationUtilization)
 		Expect(mf).NotTo(BeNil())
 		val, ok := gaugeValue(mf, map[string]string{
 			constants.LabelVariantName:        "variant-b",
 			constants.LabelNamespace:          "prod-ns",
+			constants.LabelModelName:          "ibm/granite-13b",
 			constants.LabelAcceleratorType:    "nvidia-h100",
 			constants.LabelControllerInstance: "controller-1",
 		})
 		Expect(ok).To(BeTrue())
 		Expect(val).To(Equal(0.90))
 
-		// Verify controller_instance + analyzer_version on required_capacity
+		// Verify controller_instance + model_name + unit on required_capacity
 		mf = gatherMetric(registry, constants.WVARequiredCapacity)
 		Expect(mf).NotTo(BeNil())
 		val, ok = gaugeValue(mf, map[string]string{
 			constants.LabelVariantName:        "variant-b",
 			constants.LabelNamespace:          "prod-ns",
-			constants.LabelAnalyzerVersion:    constants.AnalyzerVersionV2,
+			constants.LabelModelName:          "ibm/granite-13b",
+			constants.LabelUnit:               constants.UnitContinuous,
 			constants.LabelControllerInstance: "controller-1",
 		})
 		Expect(ok).To(BeTrue())
@@ -213,7 +220,7 @@ var _ = Describe("EmitSaturationMetrics", func() {
 
 	It("should handle zero values correctly", func() {
 		err := emitter.EmitSaturationMetrics(ctx,
-			"variant-c", "ns", "amd-mi300x", constants.AnalyzerVersionV1,
+			"variant-c", "ns", "model-z", "amd-mi300x", constants.UnitBinary,
 			0.0, 0.0, 0.0,
 			0, 0,
 		)
@@ -222,16 +229,19 @@ var _ = Describe("EmitSaturationMetrics", func() {
 		accelLabels := map[string]string{
 			constants.LabelVariantName:     "variant-c",
 			constants.LabelNamespace:       "ns",
+			constants.LabelModelName:       "model-z",
 			constants.LabelAcceleratorType: "amd-mi300x",
 		}
 		modelLabels := map[string]string{
 			constants.LabelVariantName: "variant-c",
 			constants.LabelNamespace:   "ns",
+			constants.LabelModelName:   "model-z",
 		}
 		requiredLabels := map[string]string{
-			constants.LabelVariantName:     "variant-c",
-			constants.LabelNamespace:       "ns",
-			constants.LabelAnalyzerVersion: constants.AnalyzerVersionV1,
+			constants.LabelVariantName: "variant-c",
+			constants.LabelNamespace:   "ns",
+			constants.LabelModelName:   "model-z",
+			constants.LabelUnit:        constants.UnitBinary,
 		}
 
 		for _, metricName := range []string{
@@ -253,7 +263,7 @@ var _ = Describe("EmitSaturationMetrics", func() {
 
 		for _, metricName := range []string{
 			constants.WVAKvCacheTokensUsed,
-			constants.WVAKvCacheTokensTotal,
+			constants.WVAKvCacheTokensCapacity,
 		} {
 			mf := gatherMetric(registry, metricName)
 			Expect(mf).NotTo(BeNil(), "metric %s not found", metricName)
@@ -268,7 +278,7 @@ var _ = Describe("EmitSaturationMetrics", func() {
 		uninitEmitter := NewMetricsEmitter()
 
 		err := uninitEmitter.EmitSaturationMetrics(ctx,
-			"v", "ns", "gpu", constants.AnalyzerVersionV2,
+			"v", "ns", "m", "gpu", constants.UnitContinuous,
 			0.5, 0.5, 100.0,
 			50, 100,
 		)
@@ -276,44 +286,48 @@ var _ = Describe("EmitSaturationMetrics", func() {
 		Expect(err.Error()).To(ContainSubstring("not initialized"))
 	})
 
-	It("DeleteSaturationMetrics should remove all series for a variant", func() {
+	It("DeleteSaturationMetricsForVariant should remove all series regardless of accelerator/unit", func() {
+		// Emit two different series for the same (variant, namespace) — different
+		// accelerator types and different unit values.
 		Expect(emitter.EmitSaturationMetrics(ctx,
-			"variant-del", "ns", "h100", constants.AnalyzerVersionV2,
-			0.5, 0.5, 1000.0, 100, 200,
+			"variant-multi-del", "ns", "model-x", "h100", constants.UnitBinary,
+			0.7, 0.3, 1.0, 100, 200,
+		)).To(Succeed())
+		Expect(emitter.EmitSaturationMetrics(ctx,
+			"variant-multi-del", "ns", "model-x", "a100", constants.UnitContinuous,
+			0.4, 0.6, 5000.0, 50, 400,
 		)).To(Succeed())
 
-		// Sanity check: series exists before deletion
+		// Both series exist before deletion
 		mf := gatherMetric(registry, constants.WVASaturationUtilization)
 		Expect(mf).NotTo(BeNil())
-		_, ok := gaugeValue(mf, map[string]string{
-			constants.LabelVariantName:     "variant-del",
-			constants.LabelNamespace:       "ns",
-			constants.LabelAcceleratorType: "h100",
-		})
-		Expect(ok).To(BeTrue())
 
-		emitter.DeleteSaturationMetrics("variant-del", "ns", "h100", constants.AnalyzerVersionV2)
+		// Partial-match delete by (variant, namespace) only — accelerator and unit
+		// are not provided.
+		emitter.DeleteSaturationMetricsForVariant("variant-multi-del", "ns")
 
-		// All five series for this variant should be gone
+		// All five series for this variant should be gone across both
+		// accelerator types and both unit values.
 		for _, name := range []string{
 			constants.WVASaturationUtilization,
 			constants.WVASpareCapacity,
 			constants.WVARequiredCapacity,
 			constants.WVAKvCacheTokensUsed,
-			constants.WVAKvCacheTokensTotal,
+			constants.WVAKvCacheTokensCapacity,
 		} {
 			mf := gatherMetric(registry, name)
 			if mf == nil {
-				continue // metric family removed entirely once last series is gone
+				continue
 			}
 			for _, m := range mf.GetMetric() {
 				for _, lp := range m.GetLabel() {
 					if lp.GetName() == constants.LabelVariantName {
-						Expect(lp.GetValue()).NotTo(Equal("variant-del"),
+						Expect(lp.GetValue()).NotTo(Equal("variant-multi-del"),
 							"metric %s still has series for deleted variant", name)
 					}
 				}
 			}
 		}
 	})
+
 })

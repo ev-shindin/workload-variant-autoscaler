@@ -911,17 +911,23 @@ func enrichDecisionsFromReplicaMetrics(decisions []interfaces.VariantDecision, r
 	for i := range decisions {
 		d := &decisions[i]
 		d.RequiredCapacity = requiredCapacity
-		d.AnalyzerVersion = constants.AnalyzerVersionV1
+		d.RequiredCapacityUnit = constants.UnitBinary
 		if a, ok := agg[d.VariantName]; ok && a.count > 0 {
 			d.KvCacheTokensUsed = a.kvUsed
-			d.KvCacheTokensTotal = a.kvTotal
+			d.KvCacheTokensCapacity = a.kvTotal
+			// V1 reasons about saturation per-replica using KvCacheUsage fractions
+			// (rm.KvCacheUsage is 0.0-1.0), not tokens. Report the mean of those
+			// per-replica fractions as the variant-level utilization — this
+			// matches what the V1 analyzer actually evaluates against its
+			// thresholds. V2 uses a different (token-demand / capacity) formula;
+			// see the field doc on VariantDecision.Utilization.
 			d.Utilization = a.kvUsageSum / float64(a.count)
 		}
 	}
 }
 
-// enrichDecisionsWithKvTokenData sets KvCacheTokensUsed, KvCacheTokensTotal, and
-// AnalyzerVersion on decisions from replica metrics aggregated per (model, variant).
+// enrichDecisionsWithKvTokenData sets KvCacheTokensUsed, KvCacheTokensCapacity, and
+// RequiredCapacityUnit on decisions from replica metrics aggregated per (model, variant).
 // Used by V2 path where Utilization and RequiredCapacity are already set from
 // AnalyzerResult.
 //
@@ -952,10 +958,10 @@ func enrichDecisionsWithKvTokenData(decisions []interfaces.VariantDecision, mode
 
 	for i := range decisions {
 		d := &decisions[i]
-		d.AnalyzerVersion = constants.AnalyzerVersionV2
+		d.RequiredCapacityUnit = constants.UnitContinuous
 		if a, ok := agg[variantKey{modelID: d.ModelID, variant: d.VariantName}]; ok {
 			d.KvCacheTokensUsed = a.kvUsed
-			d.KvCacheTokensTotal = a.kvTotal
+			d.KvCacheTokensCapacity = a.kvTotal
 		}
 	}
 }
@@ -1340,14 +1346,20 @@ func (e *Engine) applySaturationDecisions(
 		}
 
 		// Emit saturation and capacity metrics for observability.
-		// Note: stale time series for deleted VAs are not cleaned up automatically here.
-		// The metrics package exposes DeleteSaturationMetrics for callers (e.g., the
-		// VariantAutoscaling reconciler's delete handler / finalizer) to remove series
-		// when a VA is removed.
+		// When this cycle produced no fresh decision for the variant, actively
+		// clear the existing series so dashboards show a gap ("no fresh data")
+		// rather than stale values that would otherwise persist until Prometheus'
+		// 5-minute staleness marker fires. For fully-deleted VAs, additional
+		// cleanup via the reconciler's delete handler / finalizer is still
+		// required (see DeleteSaturationMetricsForVariant).
 		if hasDecision {
 			if err := act.EmitSaturationMetrics(ctx, decision); err != nil {
 				logger.Error(err, "Failed to emit saturation metrics", "variant", updateVa.Name)
 			}
+		} else {
+			act.DeleteSaturationMetricsForVariant(updateVa.Name, updateVa.Namespace)
+			logger.V(logging.DEBUG).Info("Cleared stale saturation metrics (no fresh decision this cycle)",
+				"variant", updateVa.Name, "namespace", updateVa.Namespace)
 		}
 
 		// Update Shared State and Trigger Reconcile via Channel

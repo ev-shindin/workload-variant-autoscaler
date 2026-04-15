@@ -33,7 +33,7 @@ var (
 	spareCapacity         *prometheus.GaugeVec
 	requiredCapacity      *prometheus.GaugeVec
 	kvCacheTokensUsed     *prometheus.GaugeVec
-	kvCacheTokensTotal    *prometheus.GaugeVec
+	kvCacheTokensCapacity *prometheus.GaugeVec
 
 	// controllerInstance stores the optional controller instance identifier.
 	// When set, it's added as a label to all emitted metrics.
@@ -54,19 +54,25 @@ func InitMetrics(registry prometheus.Registerer) error {
 	// Read controller instance from environment
 	controllerInstance = os.Getenv(ControllerInstanceEnvVar)
 
-	// Build label sets based on whether controller_instance is configured
+	// Build label sets based on whether controller_instance is configured.
+	// Existing replica metrics (baseLabels, scalingLabels) are unchanged.
+	// New saturation metrics carry an additional model_name label so dashboards
+	// can group/filter by the model a variant serves.
 	baseLabels := []string{constants.LabelVariantName, constants.LabelNamespace, constants.LabelAcceleratorType}
 	scalingLabels := []string{constants.LabelVariantName, constants.LabelNamespace, constants.LabelDirection, constants.LabelReason}
-	// modelLabels: variant_name + namespace only (no accelerator_type) for model-level and token metrics
-	modelLabels := []string{constants.LabelVariantName, constants.LabelNamespace}
-	// requiredCapacityLabels: model labels + analyzer_version to disambiguate V1 (binary)
-	// vs V2 (continuous tokens) units of the wva_required_capacity gauge
-	requiredCapacityLabels := []string{constants.LabelVariantName, constants.LabelNamespace, constants.LabelAnalyzerVersion}
+	// satAccelLabels: per-variant per-accelerator saturation metrics.
+	satAccelLabels := []string{constants.LabelVariantName, constants.LabelNamespace, constants.LabelModelName, constants.LabelAcceleratorType}
+	// satModelLabels: per-variant model-level saturation metrics (no accelerator_type).
+	satModelLabels := []string{constants.LabelVariantName, constants.LabelNamespace, constants.LabelModelName}
+	// requiredCapacityLabels: satModelLabels + "unit" to disambiguate V1 (binary 0/1)
+	// vs V2 (continuous token demand) values of the wva_required_capacity gauge.
+	requiredCapacityLabels := []string{constants.LabelVariantName, constants.LabelNamespace, constants.LabelModelName, constants.LabelUnit}
 
 	if controllerInstance != "" {
 		baseLabels = append(baseLabels, constants.LabelControllerInstance)
 		scalingLabels = append(scalingLabels, constants.LabelControllerInstance)
-		modelLabels = append(modelLabels, constants.LabelControllerInstance)
+		satAccelLabels = append(satAccelLabels, constants.LabelControllerInstance)
+		satModelLabels = append(satModelLabels, constants.LabelControllerInstance)
 		requiredCapacityLabels = append(requiredCapacityLabels, constants.LabelControllerInstance)
 	}
 
@@ -101,37 +107,37 @@ func InitMetrics(registry prometheus.Registerer) error {
 	saturationUtilization = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: constants.WVASaturationUtilization,
-			Help: "Per-variant utilization ratio (0.0-1.0) from saturation analysis",
+			Help: "Per-variant utilization ratio (0.0-1.0) from saturation analysis. V1 path: mean of per-replica KV-cache-usage fractions (matches the per-replica threshold V1 checks). V2 path: TotalDemand / TotalCapacity from the analyzer result. Numerically equivalent for uniform-capacity replicas; V2 is capacity-weighted for mixed-capacity cases.",
 		},
-		baseLabels,
+		satAccelLabels,
 	)
 	spareCapacity = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: constants.WVASpareCapacity,
-			Help: "Per-variant spare capacity (0.0-1.0) from saturation analysis",
+			Help: "Per-variant spare KV-cache capacity (0.0-1.0) from saturation analysis. V1 path: threshold-relative spare (kvCacheThreshold - avg KV usage). V2 path: 1.0 - utilization.",
 		},
-		baseLabels,
+		satAccelLabels,
 	)
 	requiredCapacity = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: constants.WVARequiredCapacity,
-			Help: "Model-level required capacity; >0 indicates scale-up needed. Use the analyzer_version label to distinguish units (V1: binary 0/1, V2: continuous token demand).",
+			Help: fmt.Sprintf("Model-level required capacity; >0 indicates scale-up needed. Use the %q label to interpret the value: %q → 0/1 scale-up signal (V1), %q → token demand (V2).", constants.LabelUnit, constants.UnitBinary, constants.UnitContinuous),
 		},
 		requiredCapacityLabels,
 	)
 	kvCacheTokensUsed = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: constants.WVAKvCacheTokensUsed,
-			Help: "Total KV cache tokens currently in use across all replicas of a variant",
+			Help: "Total KV cache tokens currently in use across all replicas of a variant (sum of vLLM TokensInUse).",
 		},
-		modelLabels,
+		satModelLabels,
 	)
-	kvCacheTokensTotal = prometheus.NewGaugeVec(
+	kvCacheTokensCapacity = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Name: constants.WVAKvCacheTokensTotal,
-			Help: "Total KV cache token capacity across all replicas of a variant",
+			Name: constants.WVAKvCacheTokensCapacity,
+			Help: "Total KV cache token capacity across all replicas of a variant (sum of vLLM TotalKvCapacityTokens).",
 		},
-		modelLabels,
+		satModelLabels,
 	)
 
 	optimizationDurationLabels := []string{constants.LabelStatus}
@@ -250,8 +256,8 @@ func InitMetrics(registry prometheus.Registerer) error {
 	if err := registry.Register(kvCacheTokensUsed); err != nil {
 		return fmt.Errorf("failed to register kvCacheTokensUsed metric: %w", err)
 	}
-	if err := registry.Register(kvCacheTokensTotal); err != nil {
-		return fmt.Errorf("failed to register kvCacheTokensTotal metric: %w", err)
+	if err := registry.Register(kvCacheTokensCapacity); err != nil {
+		return fmt.Errorf("failed to register kvCacheTokensCapacity metric: %w", err)
 	}
 
 	return nil
@@ -411,32 +417,37 @@ func SetMetricsFreshnessStatus(variantName, status string, count int) {
 }
 
 // EmitSaturationMetrics emits saturation analysis and KV cache capacity metrics.
-// analyzerVersion ("v1" or "v2") is used as a label on wva_required_capacity to
-// disambiguate the units of the required value (V1: binary, V2: continuous tokens).
+// modelID is exposed as the model_name label so dashboards can group/filter by
+// the model a variant serves. requiredCapacityUnit ("binary" or "continuous")
+// is used as the "unit" label on wva_required_capacity to describe how the
+// value should be interpreted.
 func (m *MetricsEmitter) EmitSaturationMetrics(
 	ctx context.Context,
-	variantName, namespace, acceleratorType, analyzerVersion string,
+	variantName, namespace, modelID, acceleratorType, requiredCapacityUnit string,
 	utilization, spare, required float64,
-	kvTokensUsed, kvTokensTotal int64,
+	kvTokensUsed, kvTokensCapacity int64,
 ) error {
 	if saturationUtilization == nil || spareCapacity == nil || requiredCapacity == nil ||
-		kvCacheTokensUsed == nil || kvCacheTokensTotal == nil {
+		kvCacheTokensUsed == nil || kvCacheTokensCapacity == nil {
 		return errors.New("saturation metrics not initialized")
 	}
 
 	accelLabels := prometheus.Labels{
 		constants.LabelVariantName:     variantName,
 		constants.LabelNamespace:       namespace,
+		constants.LabelModelName:       modelID,
 		constants.LabelAcceleratorType: acceleratorType,
 	}
 	modelLabels := prometheus.Labels{
 		constants.LabelVariantName: variantName,
 		constants.LabelNamespace:   namespace,
+		constants.LabelModelName:   modelID,
 	}
 	requiredLabels := prometheus.Labels{
-		constants.LabelVariantName:     variantName,
-		constants.LabelNamespace:       namespace,
-		constants.LabelAnalyzerVersion: analyzerVersion,
+		constants.LabelVariantName: variantName,
+		constants.LabelNamespace:   namespace,
+		constants.LabelModelName:   modelID,
+		constants.LabelUnit:        requiredCapacityUnit,
 	}
 
 	if controllerInstance != "" {
@@ -449,44 +460,44 @@ func (m *MetricsEmitter) EmitSaturationMetrics(
 	spareCapacity.With(accelLabels).Set(spare)
 	requiredCapacity.With(requiredLabels).Set(required)
 	kvCacheTokensUsed.With(modelLabels).Set(float64(kvTokensUsed))
-	kvCacheTokensTotal.With(modelLabels).Set(float64(kvTokensTotal))
+	kvCacheTokensCapacity.With(modelLabels).Set(float64(kvTokensCapacity))
 
 	return nil
 }
 
-// DeleteSaturationMetrics removes saturation metric series for the given variant.
-// Should be called when a VariantAutoscaling resource is deleted to prevent stale
-// time series from accumulating in Prometheus.
+// DeleteSaturationMetricsForVariant removes all saturation metric series for the
+// given (variant, namespace) regardless of accelerator type or unit label. Uses
+// Prometheus DeletePartialMatch so callers don't need to know every label value.
 //
-// TODO: wire this from the controller's VariantAutoscaling delete handler / finalizer.
-// Until that wiring exists, deleted VAs leave their last-emitted metric values in the
-// registry indefinitely.
-func (m *MetricsEmitter) DeleteSaturationMetrics(variantName, namespace, acceleratorType, analyzerVersion string) {
-	if saturationUtilization == nil {
+// Intended for two scenarios:
+//   - The optimization cycle produced no fresh decision for this variant —
+//     existing series would otherwise persist with stale values until
+//     Prometheus' default 5-minute staleness marker fires. Calling this
+//     ensures dashboards show a gap ("no fresh data") rather than stale values.
+//     This is already handled by the engine's applySaturationDecisions.
+//   - A VA is being removed (delete handler / finalizer). See TODO below.
+//
+// TODO: wire this from the controller's VariantAutoscaling delete handler /
+// finalizer so series for fully-deleted VAs are cleaned up too. The
+// in-cycle "no fresh decision" case is already handled by the engine; the
+// remaining gap is when the VA itself is removed — the engine no longer
+// iterates it, so no delete fires here, and the last-emitted series persist
+// until Prometheus' staleness marker (5-min default) or a controller restart.
+func (m *MetricsEmitter) DeleteSaturationMetricsForVariant(variantName, namespace string) {
+	if saturationUtilization == nil || spareCapacity == nil || requiredCapacity == nil ||
+		kvCacheTokensUsed == nil || kvCacheTokensCapacity == nil {
 		return
 	}
-	accelLabels := prometheus.Labels{
-		constants.LabelVariantName:     variantName,
-		constants.LabelNamespace:       namespace,
-		constants.LabelAcceleratorType: acceleratorType,
-	}
-	modelLabels := prometheus.Labels{
+	match := prometheus.Labels{
 		constants.LabelVariantName: variantName,
 		constants.LabelNamespace:   namespace,
 	}
-	requiredLabels := prometheus.Labels{
-		constants.LabelVariantName:     variantName,
-		constants.LabelNamespace:       namespace,
-		constants.LabelAnalyzerVersion: analyzerVersion,
-	}
 	if controllerInstance != "" {
-		accelLabels[constants.LabelControllerInstance] = controllerInstance
-		modelLabels[constants.LabelControllerInstance] = controllerInstance
-		requiredLabels[constants.LabelControllerInstance] = controllerInstance
+		match[constants.LabelControllerInstance] = controllerInstance
 	}
-	saturationUtilization.Delete(accelLabels)
-	spareCapacity.Delete(accelLabels)
-	requiredCapacity.Delete(requiredLabels)
-	kvCacheTokensUsed.Delete(modelLabels)
-	kvCacheTokensTotal.Delete(modelLabels)
+	saturationUtilization.DeletePartialMatch(match)
+	spareCapacity.DeletePartialMatch(match)
+	requiredCapacity.DeletePartialMatch(match)
+	kvCacheTokensUsed.DeletePartialMatch(match)
+	kvCacheTokensCapacity.DeletePartialMatch(match)
 }
