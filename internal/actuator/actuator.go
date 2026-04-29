@@ -94,9 +94,11 @@ func (a *Actuator) EmitMetrics(ctx context.Context, variantAutoscaling *llmdOptv
 	return nil
 }
 
-// EmitSaturationMetrics emits saturation analysis and KV cache capacity metrics from a decision.
-func (a *Actuator) EmitSaturationMetrics(ctx context.Context, decision interfaces.VariantDecision) error {
-	return a.MetricsEmitter.EmitSaturationMetrics(
+// RecordSaturationMetrics records saturation analysis and KV cache capacity
+// metrics from a decision. The controller does not actively push metrics —
+// Prometheus scrapes them — so the verb is "Record", not "Emit".
+func (a *Actuator) RecordSaturationMetrics(ctx context.Context, decision interfaces.VariantDecision) {
+	a.MetricsEmitter.RecordSaturationMetrics(
 		ctx,
 		decision.VariantName,
 		decision.Namespace,
@@ -109,12 +111,4 @@ func (a *Actuator) EmitSaturationMetrics(ctx context.Context, decision interface
 		decision.KvCacheTokensUsed,
 		decision.KvCacheTokensCapacity,
 	)
-}
-
-// DeleteSaturationMetricsForVariant removes all saturation metric series for a
-// variant. Call this when the current optimization cycle produced no fresh
-// decision for the variant, or when the VA is being deleted — so dashboards
-// don't show stale values.
-func (a *Actuator) DeleteSaturationMetricsForVariant(variantName, namespace string) {
-	a.MetricsEmitter.DeleteSaturationMetricsForVariant(variantName, namespace)
 }

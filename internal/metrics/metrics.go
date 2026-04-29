@@ -416,22 +416,25 @@ func SetMetricsFreshnessStatus(variantName, status string, count int) {
 	metricsFreshnessStatus.With(labels).Set(float64(count))
 }
 
-// EmitSaturationMetrics emits saturation analysis and KV cache capacity metrics.
+// RecordSaturationMetrics records saturation analysis and KV cache capacity
+// metrics. The "Record" naming reflects the fact that the controller does not
+// actively push these metrics — Prometheus scrapes them.
+//
 // modelID is exposed as the model_name label so dashboards can group/filter by
 // the model a variant serves. requiredCapacityUnit ("binary" or "continuous")
 // is used as the "unit" label on wva_required_capacity to describe how the
 // value should be interpreted.
-func (m *MetricsEmitter) EmitSaturationMetrics(
+//
+// Callers MUST invoke InitMetrics before this method (the package-level
+// metric vars are nil otherwise, and the Set calls below would panic).
+// InitMetricsAndEmitter is the recommended construction path because it
+// performs the registration before returning the emitter.
+func (m *MetricsEmitter) RecordSaturationMetrics(
 	ctx context.Context,
 	variantName, namespace, modelID, acceleratorType, requiredCapacityUnit string,
 	utilization, spare, required float64,
 	kvTokensUsed, kvTokensCapacity int64,
-) error {
-	if saturationUtilization == nil || spareCapacity == nil || requiredCapacity == nil ||
-		kvCacheTokensUsed == nil || kvCacheTokensCapacity == nil {
-		return errors.New("saturation metrics not initialized")
-	}
-
+) {
 	accelLabels := prometheus.Labels{
 		constants.LabelVariantName:     variantName,
 		constants.LabelNamespace:       namespace,
@@ -461,43 +464,4 @@ func (m *MetricsEmitter) EmitSaturationMetrics(
 	requiredCapacity.With(requiredLabels).Set(required)
 	kvCacheTokensUsed.With(modelLabels).Set(float64(kvTokensUsed))
 	kvCacheTokensCapacity.With(modelLabels).Set(float64(kvTokensCapacity))
-
-	return nil
-}
-
-// DeleteSaturationMetricsForVariant removes all saturation metric series for the
-// given (variant, namespace) regardless of accelerator type or unit label. Uses
-// Prometheus DeletePartialMatch so callers don't need to know every label value.
-//
-// Intended for two scenarios:
-//   - The optimization cycle produced no fresh decision for this variant —
-//     existing series would otherwise persist with stale values until
-//     Prometheus' default 5-minute staleness marker fires. Calling this
-//     ensures dashboards show a gap ("no fresh data") rather than stale values.
-//     This is already handled by the engine's applySaturationDecisions.
-//   - A VA is being removed (delete handler / finalizer). See TODO below.
-//
-// TODO: wire this from the controller's VariantAutoscaling delete handler /
-// finalizer so series for fully-deleted VAs are cleaned up too. The
-// in-cycle "no fresh decision" case is already handled by the engine; the
-// remaining gap is when the VA itself is removed — the engine no longer
-// iterates it, so no delete fires here, and the last-emitted series persist
-// until Prometheus' staleness marker (5-min default) or a controller restart.
-func (m *MetricsEmitter) DeleteSaturationMetricsForVariant(variantName, namespace string) {
-	if saturationUtilization == nil || spareCapacity == nil || requiredCapacity == nil ||
-		kvCacheTokensUsed == nil || kvCacheTokensCapacity == nil {
-		return
-	}
-	match := prometheus.Labels{
-		constants.LabelVariantName: variantName,
-		constants.LabelNamespace:   namespace,
-	}
-	if controllerInstance != "" {
-		match[constants.LabelControllerInstance] = controllerInstance
-	}
-	saturationUtilization.DeletePartialMatch(match)
-	spareCapacity.DeletePartialMatch(match)
-	requiredCapacity.DeletePartialMatch(match)
-	kvCacheTokensUsed.DeletePartialMatch(match)
-	kvCacheTokensCapacity.DeletePartialMatch(match)
 }

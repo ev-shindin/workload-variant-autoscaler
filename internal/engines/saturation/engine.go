@@ -1345,21 +1345,14 @@ func (e *Engine) applySaturationDecisions(
 			updateVa.Status.Actuation.Applied = true
 		}
 
-		// Emit saturation and capacity metrics for observability.
-		// When this cycle produced no fresh decision for the variant, actively
-		// clear the existing series so dashboards show a gap ("no fresh data")
-		// rather than stale values that would otherwise persist until Prometheus'
-		// 5-minute staleness marker fires. For fully-deleted VAs, additional
-		// cleanup via the reconciler's delete handler / finalizer is still
-		// required (see DeleteSaturationMetricsForVariant).
+		// Record saturation and capacity metrics when this cycle produced a
+		// fresh decision for the variant. When there is no fresh decision the
+		// existing series persist with their last-recorded values until
+		// Prometheus' staleness marker fires; surfacing freshness on the
+		// dashboard side is tracked as a follow-up (e.g. an explicit "up"
+		// gauge per VA, rather than deleting series here).
 		if hasDecision {
-			if err := act.EmitSaturationMetrics(ctx, decision); err != nil {
-				logger.Error(err, "Failed to emit saturation metrics", "variant", updateVa.Name)
-			}
-		} else {
-			act.DeleteSaturationMetricsForVariant(updateVa.Name, updateVa.Namespace)
-			logger.V(logging.DEBUG).Info("Cleared stale saturation metrics (no fresh decision this cycle)",
-				"variant", updateVa.Name, "namespace", updateVa.Namespace)
+			act.RecordSaturationMetrics(ctx, decision)
 		}
 
 		// Update Shared State and Trigger Reconcile via Channel

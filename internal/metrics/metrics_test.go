@@ -13,6 +13,9 @@ import (
 )
 
 // resetMetrics clears package-level metric vars so each test starts fresh.
+// Callers MUST invoke InitMetrics before recording any metric afterwards —
+// the Record* methods deliberately have no nil guard, so a missed init
+// would panic at the first Set call.
 func resetMetrics() {
 	replicaScalingTotal = nil
 	desiredReplicas = nil
@@ -60,7 +63,7 @@ func gaugeValue(mf *dto.MetricFamily, labels map[string]string) (float64, bool) 
 	return 0, false
 }
 
-var _ = Describe("EmitSaturationMetrics", func() {
+var _ = Describe("RecordSaturationMetrics", func() {
 
 	var (
 		registry *prometheus.Registry
@@ -76,13 +79,12 @@ var _ = Describe("EmitSaturationMetrics", func() {
 		ctx = context.Background()
 	})
 
-	It("should emit all saturation metrics with correct values", func() {
-		err := emitter.EmitSaturationMetrics(ctx,
+	It("should record all saturation metrics with correct values", func() {
+		emitter.RecordSaturationMetrics(ctx,
 			"variant-a", "test-ns", "meta-llama/Llama-3.1-8B", "nvidia-a100", constants.UnitContinuous,
 			0.75, 0.25, 5000.0,
 			100000, 200000,
 		)
-		Expect(err).NotTo(HaveOccurred())
 
 		accelLabels := map[string]string{
 			constants.LabelVariantName:     "variant-a",
@@ -140,14 +142,14 @@ var _ = Describe("EmitSaturationMetrics", func() {
 
 	It("should distinguish binary and continuous required_capacity series via unit label", func() {
 		// Same variant, same namespace, different units → two series
-		Expect(emitter.EmitSaturationMetrics(ctx,
+		emitter.RecordSaturationMetrics(ctx,
 			"variant-multi", "ns", "model-x", "h100", constants.UnitBinary,
 			0.5, 0.5, 1.0, 100, 200,
-		)).To(Succeed())
-		Expect(emitter.EmitSaturationMetrics(ctx,
+		)
+		emitter.RecordSaturationMetrics(ctx,
 			"variant-multi", "ns", "model-x", "h100", constants.UnitContinuous,
 			0.5, 0.5, 8000.0, 100, 200,
-		)).To(Succeed())
+		)
 
 		mf := gatherMetric(registry, constants.WVARequiredCapacity)
 		Expect(mf).NotTo(BeNil())
@@ -184,12 +186,11 @@ var _ = Describe("EmitSaturationMetrics", func() {
 		Expect(InitMetrics(registry)).To(Succeed())
 		emitter = NewMetricsEmitter()
 
-		err := emitter.EmitSaturationMetrics(ctx,
+		emitter.RecordSaturationMetrics(ctx,
 			"variant-b", "prod-ns", "ibm/granite-13b", "nvidia-h100", constants.UnitContinuous,
 			0.90, 0.10, 10000.0,
 			500000, 600000,
 		)
-		Expect(err).NotTo(HaveOccurred())
 
 		// Verify controller_instance + model_name on accel-scoped metric
 		mf := gatherMetric(registry, constants.WVASaturationUtilization)
@@ -219,12 +220,11 @@ var _ = Describe("EmitSaturationMetrics", func() {
 	})
 
 	It("should handle zero values correctly", func() {
-		err := emitter.EmitSaturationMetrics(ctx,
+		emitter.RecordSaturationMetrics(ctx,
 			"variant-c", "ns", "model-z", "amd-mi300x", constants.UnitBinary,
 			0.0, 0.0, 0.0,
 			0, 0,
 		)
-		Expect(err).NotTo(HaveOccurred())
 
 		accelLabels := map[string]string{
 			constants.LabelVariantName:     "variant-c",
@@ -270,63 +270,6 @@ var _ = Describe("EmitSaturationMetrics", func() {
 			val, ok := gaugeValue(mf, modelLabels)
 			Expect(ok).To(BeTrue(), "gauge not found for %s", metricName)
 			Expect(val).To(Equal(0.0), "expected 0 for %s", metricName)
-		}
-	})
-
-	It("should return error when metrics are not initialized", func() {
-		resetMetrics()
-		uninitEmitter := NewMetricsEmitter()
-
-		err := uninitEmitter.EmitSaturationMetrics(ctx,
-			"v", "ns", "m", "gpu", constants.UnitContinuous,
-			0.5, 0.5, 100.0,
-			50, 100,
-		)
-		Expect(err).To(HaveOccurred())
-		Expect(err.Error()).To(ContainSubstring("not initialized"))
-	})
-
-	It("DeleteSaturationMetricsForVariant should remove all series regardless of accelerator/unit", func() {
-		// Emit two different series for the same (variant, namespace) — different
-		// accelerator types and different unit values.
-		Expect(emitter.EmitSaturationMetrics(ctx,
-			"variant-multi-del", "ns", "model-x", "h100", constants.UnitBinary,
-			0.7, 0.3, 1.0, 100, 200,
-		)).To(Succeed())
-		Expect(emitter.EmitSaturationMetrics(ctx,
-			"variant-multi-del", "ns", "model-x", "a100", constants.UnitContinuous,
-			0.4, 0.6, 5000.0, 50, 400,
-		)).To(Succeed())
-
-		// Both series exist before deletion
-		mf := gatherMetric(registry, constants.WVASaturationUtilization)
-		Expect(mf).NotTo(BeNil())
-
-		// Partial-match delete by (variant, namespace) only — accelerator and unit
-		// are not provided.
-		emitter.DeleteSaturationMetricsForVariant("variant-multi-del", "ns")
-
-		// All five series for this variant should be gone across both
-		// accelerator types and both unit values.
-		for _, name := range []string{
-			constants.WVASaturationUtilization,
-			constants.WVASpareCapacity,
-			constants.WVARequiredCapacity,
-			constants.WVAKvCacheTokensUsed,
-			constants.WVAKvCacheTokensCapacity,
-		} {
-			mf := gatherMetric(registry, name)
-			if mf == nil {
-				continue
-			}
-			for _, m := range mf.GetMetric() {
-				for _, lp := range m.GetLabel() {
-					if lp.GetName() == constants.LabelVariantName {
-						Expect(lp.GetValue()).NotTo(Equal("variant-multi-del"),
-							"metric %s still has series for deleted variant", name)
-					}
-				}
-			}
 		}
 	})
 
