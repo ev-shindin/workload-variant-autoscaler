@@ -879,53 +879,6 @@ func (e *Engine) convertSaturationTargetsToDecisions(
 	return decisions
 }
 
-// enrichDecisionsFromReplicaMetrics populates saturation observability fields on decisions
-// by aggregating per-pod ReplicaMetrics per variant. Used by the V1 path where
-// Utilization and RequiredCapacity are not set by the optimizer.
-func enrichDecisionsFromReplicaMetrics(decisions []interfaces.VariantDecision, replicaMetrics []interfaces.ReplicaMetrics, shouldScaleUp bool) {
-	// Aggregate per variant
-	type variantAgg struct {
-		kvUsed     int64
-		kvTotal    int64
-		kvUsageSum float64
-		count      int
-	}
-	agg := make(map[string]*variantAgg)
-	for _, rm := range replicaMetrics {
-		a, ok := agg[rm.VariantName]
-		if !ok {
-			a = &variantAgg{}
-			agg[rm.VariantName] = a
-		}
-		a.kvUsed += rm.TokensInUse
-		a.kvTotal += rm.TotalKvCapacityTokens
-		a.kvUsageSum += rm.KvCacheUsage
-		a.count++
-	}
-
-	requiredCapacity := float64(0)
-	if shouldScaleUp {
-		requiredCapacity = 1.0
-	}
-
-	for i := range decisions {
-		d := &decisions[i]
-		d.RequiredCapacity = requiredCapacity
-		d.RequiredCapacityUnit = constants.UnitBinary
-		if a, ok := agg[d.VariantName]; ok && a.count > 0 {
-			d.KvCacheTokensUsed = a.kvUsed
-			d.KvCacheTokensCapacity = a.kvTotal
-			// V1 reasons about saturation per-replica using KvCacheUsage fractions
-			// (rm.KvCacheUsage is 0.0-1.0), not tokens. Report the mean of those
-			// per-replica fractions as the variant-level utilization — this
-			// matches what the V1 analyzer actually evaluates against its
-			// thresholds. V2 uses a different (token-demand / capacity) formula;
-			// see the field doc on VariantDecision.Utilization.
-			d.Utilization = a.kvUsageSum / float64(a.count)
-		}
-	}
-}
-
 // enrichDecisionsWithKvTokenData sets KvCacheTokensUsed, KvCacheTokensCapacity, and
 // RequiredCapacityUnit on decisions from replica metrics aggregated per (model, variant).
 // Used by V2 path where Utilization and RequiredCapacity are already set from
@@ -1349,8 +1302,8 @@ func (e *Engine) applySaturationDecisions(
 		// fresh decision for the variant. When there is no fresh decision the
 		// existing series persist with their last-recorded values until
 		// Prometheus' staleness marker fires; surfacing freshness on the
-		// dashboard side is tracked as a follow-up (e.g. an explicit "up"
-		// gauge per VA, rather than deleting series here).
+		// dashboard side is tracked in #1082 (an explicit "up" gauge per VA,
+		// rather than deleting series here).
 		if hasDecision {
 			act.RecordSaturationMetrics(ctx, decision)
 		}
