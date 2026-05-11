@@ -18,32 +18,24 @@ import (
 
 // V2 smoke calibration via the simulator's --fake-metrics flag.
 //
-// The simulator (llm-d-inference-sim) emits a fixed set of vLLM Prometheus
-// metric values rather than tracking them from real traffic. Setting
-// kv-cache-usage to 0.4 gives V2 a deterministic input that:
+// kv-cache-usage = 0.4 is the operating point that deterministically exercises
+// both arcs of the V2 cost-aware optimizer with the suite's chosen thresholds:
 //
-//   - Crosses scaleUpThreshold=0.30 at 1 replica:
-//     replicaDemand = 0.4 * effectiveCapacity (~6553) ≈ 2621 tokens
-//     requiredCapacity = 2621/0.30 - 6553 = 2184 > 0 → scale-up
+//   - At 1 replica with scaleUpThreshold = 0.30, replicaDemand crosses the
+//     threshold and the optimizer's required-capacity signal becomes positive
+//     → scale-up. (Drives the "should recommend scale-up" It below.)
+//   - At 2 replicas with the canonical-ordering thresholds scaleUpThreshold =
+//     0.95 and scaleDownBoundary = 0.85, the cost-aware optimizer's
+//     scale-down rule (cost_aware_optimizer.go: math.Floor(remaining /
+//     vc.PerReplicaCapacity)) sees a remaining-capacity ≥ one full per-replica
+//     budget → remove 1 replica. (Drives the "should recommend scale-down"
+//     It below.)
 //
-//   - Falls below scaleDownBoundary=0.85 at 2 replicas:
-//     totalSupply = 2 * 6553 = 13106
-//     totalDemand = 2 * 2621  = 5242
-//     spareCapacity = 13106 - 5242/0.85 = 6939 ≥ 6553 (per-replica capacity)
-//     → cost-aware optimizer removes 1 replica
+// --fake-metrics replaces simulator runtime emission entirely; service traffic
+// has no effect on the values V2 reads. That is the point — the suite
+// exercises V2's decision logic against deterministic inputs.
 //
-// The 0.85 boundary (rather than a more aggressive 0.5) is deliberate: the
-// CostAwareOptimizer's scale-down rule requires the spare to absorb a full
-// replica's worth of capacity before removing one
-// (cost_aware_optimizer.go: replicasToRemove := floor(spare / perReplicaCapacity)).
-// At kv=0.4 with 2 replicas, that lower bound is scaleDownBoundary ≥ 0.8.
-//
-// The simulator docs note that --fake-metrics replaces real metric emission
-// entirely, so traffic against the model service has no effect on these
-// values — that's the point: the test exercises V2's decision logic against
-// known inputs rather than depending on the simulator's runtime fidelity.
-//
-// Format documented at:
+// --fake-metrics format:
 //
 //	https://github.com/llm-d/llm-d-inference-sim/blob/main/docs/configuration.md
 const v2SmokeFakeMetricsJSON = `{"kv-cache-usage":0.4,"running-requests":1,"waiting-requests":0}`
@@ -86,6 +78,17 @@ var _ = Describe("Saturation V2 engine", Label("smoke", "full"), Ordered, func()
 	)
 
 	BeforeAll(func() {
+		// The suite depends on the simulator's --fake-metrics flag to drive
+		// deterministic kv-cache-usage values into V2. That flag only exists
+		// on llm-d-inference-sim — real vLLM rejects it and the model
+		// Deployment fails to start. Skip cleanly on non-simulator runs
+		// (e.g., OpenShift-style CI against real vLLM) rather than producing
+		// a broken Deployment and timing out on readiness.
+		if !cfg.UseSimulator {
+			Skip("This suite needs the simulator runtime: set USE_SIMULATOR=true. " +
+				"The suite uses llm-d-inference-sim's --fake-metrics flag, which real vLLM rejects.")
+		}
+
 		modelID = cfg.ModelID
 		cmName = saturationConfigMapName()
 		cmNamespace = cfg.WVANamespace
@@ -227,9 +230,10 @@ var _ = Describe("Saturation V2 engine", Label("smoke", "full"), Ordered, func()
 	//                             one full per-replica capacity — see calibration
 	//                             comment on v2SmokeFakeMetricsJSON for the math)
 	//
-	// Assertion is "<2" rather than "==1" because V2 routes through the
-	// optimizer pipeline and its honoring of MinReplicas hasn't been verified
-	// at e2e level — landing at 0 OR 1 both prove "scale-down happened from 2".
+	// VA enforces minReplicas=1, so the only valid scale-down outcome from 2 is 1.
+	// Assert Equal(1) so any regression that lands at 0 (MinReplicas violated) or
+	// 2 (no scale-down) fails loudly with a precise diff rather than passing on
+	// the previously-defensive "<2" bound.
 	It("should recommend scale-down when load drops below scaleDownBoundary", func() {
 		By("Patching deployment to 2 replicas to give V2 a non-floor starting point")
 		Eventually(func(g Gomega) {
@@ -262,7 +266,7 @@ var _ = Describe("Saturation V2 engine", Label("smoke", "full"), Ordered, func()
 		)
 		Expect(upsertSaturationConfigEntry(ctx, cmNamespace, cmName, cmKey, cfgYAML)).To(Succeed())
 
-		By("Asserting V2 recommends fewer than 2 replicas (lands at 0 or 1)")
+		By("Asserting V2 recommends exactly 1 replica (minReplicas floor)")
 		Eventually(func(g Gomega) {
 			va := &variantautoscalingv1alpha1.VariantAutoscaling{}
 			g.Expect(crClient.Get(ctx, client.ObjectKey{
@@ -270,8 +274,8 @@ var _ = Describe("Saturation V2 engine", Label("smoke", "full"), Ordered, func()
 			}, va)).To(Succeed())
 			g.Expect(va.Status.DesiredOptimizedAlloc.NumReplicas).NotTo(BeNil())
 			g.Expect(*va.Status.DesiredOptimizedAlloc.NumReplicas).
-				To(BeNumerically("<", int32(2)),
-					"V2 should drop below 2 replicas when load is below scaleDownBoundary")
+				To(Equal(int32(1)),
+					"V2 should drop from 2 to 1 (MinReplicas floor) when load is below scaleDownBoundary")
 		}, time.Duration(cfg.ScaleUpTimeout)*time.Second, time.Duration(cfg.PollIntervalSec)*time.Second).
 			Should(Succeed())
 	})

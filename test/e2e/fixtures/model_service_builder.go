@@ -26,6 +26,13 @@ func CreateModelService(ctx context.Context, k8sClient *kubernetes.Clientset, na
 // CreateModelServiceWithExtraArgs is like CreateModelService but appends additional
 // CLI args to the model-server (simulator or vLLM) container. Used by tests that
 // need to inject engine-specific configuration such as --fake-metrics.
+//
+// The caller is responsible for ensuring extraArgs are valid for the chosen
+// runtime — this function performs no flag validation. Engine-specific flags
+// (e.g., --fake-metrics, which exists only on llm-d-inference-sim) will cause
+// the container to crash-loop if passed to the wrong runtime. Tests that use
+// simulator-only flags should gate their suite on `cfg.UseSimulator` and Skip
+// otherwise.
 func CreateModelServiceWithExtraArgs(ctx context.Context, k8sClient *kubernetes.Clientset, namespace, name, poolName, modelID string, useSimulator bool, maxNumSeqs int, extraArgs []string) error {
 	deployment := buildModelServiceDeployment(namespace, name, poolName, modelID, useSimulator, maxNumSeqs, extraArgs)
 	_, err := k8sClient.AppsV1().Deployments(namespace).Create(ctx, deployment, metav1.CreateOptions{})
