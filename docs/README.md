@@ -21,6 +21,7 @@ Welcome to the WVA documentation! This directory contains comprehensive guides f
 - **[Saturation Scaling Configuration](developer-guide/saturation-scaling-config.md)** - Tuning the saturation-based scaling algorithm
 - **[Throughput Analyzer](developer-guide/throughput-analyzer.md)** - How the throughput analyzer works
 - **[Queue Model Analyzer](developer-guide/slo-queuemodel.md)** - SLO-aware queueing model
+- **[Scaling Optimizers](developer-guide/optimizers.md)** - How capacity signals become per-variant replica targets
 - **[Pod Scraping Source](developer-guide/pod-scraping-source.md)** - Direct pod metric scraping
 - **[Prometheus Integration](developer-guide/prometheus.md)** - Prometheus metrics and configuration
 
