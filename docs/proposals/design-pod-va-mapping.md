@@ -54,11 +54,11 @@ The cache exposes a single internal API — `Lookup(podKey) → discovery key` �
 
 ### Informer-Backed Pod→VA Cache
 
-A new `internal/collector/source/pod_va_cache.go` maintains an in-memory map keyed by pod (`namespace/name`, or `namespace/name:port` for multi-vLLM pods) whose value is the discovery key — a `VariantAutoscaling` namespaced key today, an annotated-workload key after VA deprecation. The cache reuses the controller-runtime informers WVA already runs:
+A new `internal/collector/source/pod_va_cache.go` maintains an in-memory map keyed by pod (`namespace/name`, or `namespace/name:port` for multi-vLLM pods) whose value is the discovery key — a `VariantAutoscaling` namespaced key today, an annotated-workload key after VA deprecation. The cache is driven by controller-runtime informers. The `VariantAutoscaling`, `Deployment`, and `LeaderWorkerSet` watches **already exist** in the controller; the **`Pod` watch is new** — WVA watches no pods today (see [Watch & Memory Cost](#watch--memory-cost) for the cost this adds and the scoping that bounds it):
 
-- `VariantAutoscaling` add/update → recompute mappings for its scale target's pods.
-- `Deployment` / `LeaderWorkerSet` add/update → recompute mappings for their selected pods.
-- `Pod` add/update → resolve once via owner refs + the indexed VA map; cache the result.
+- `VariantAutoscaling` add/update → recompute mappings for its scale target's pods *(existing watch)*.
+- `Deployment` / `LeaderWorkerSet` add/update → recompute mappings for their selected pods *(existing watch)*.
+- `Pod` add/update → resolve once via owner refs + the indexed VA map; cache the result *(**new** watch)*.
 - Delete events → evict.
 
 The 4-hop walk that previously ran *per metric* now runs *once per watch event*, behind the informer. Lookups on the metric hot path are O(1).
@@ -78,6 +78,32 @@ When a metric arrives for a pod the cache cannot resolve, WVA increments `wva_po
 ### Tenant-Facing UX
 
 Author a `VariantAutoscaling` referencing a `Deployment`/`LWS` — done. The same shape as `HorizontalPodAutoscaler` against a `Deployment`. No required label. No required relabeling rule. No LWS double-template. No Prometheus relabeling knowledge. After VA deprecation, the same applies with discovery moved to annotations on `ScaledObject`/`HPA`.
+
+---
+
+## Watch & Memory Cost
+
+This is the proposal's main resource trade-off and the one point that most needs to be designed in rather than assumed away (raised in review by @dumb0002).
+
+**WVA has no Pod watch today.** Its controllers watch `VariantAutoscaling` (primary), `ServiceMonitor`, `Deployment`, and `LeaderWorkerSet` (`internal/controller/variantautoscaling_controller.go`), plus `ConfigMap`, `HorizontalPodAutoscaler`, `ScaledObject`, and `InferencePool` in their own reconcilers. **None watch `Pod`.** The informer-backed cache therefore introduces **WVA's first always-on Pod informer** — genuinely new API-server load and new cache memory, not a free side-index over watches WVA already runs. (The pod-scraping source lists pods on demand within a single service's namespace; it does not establish a continuous cluster-wide Pod watch.)
+
+**Scope determines cost.** The cache scope follows the manager's, set by `--watch-namespace` (`cmd/main.go`): unset ⇒ all namespaces (cluster-scoped), set ⇒ a single namespace.
+
+| | Namespace-scoped (`--watch-namespace=ns`) | Cluster-scoped (default) |
+|---|---|---|
+| Pod LIST/WATCH | one namespace | **whole cluster** |
+| Event volume | pod churn in that namespace | **all pod churn cluster-wide** — every Deployment/Job/DaemonSet rollout, not just vLLM |
+| Cache memory | pods in that namespace | **every `Pod` object in the cluster** |
+
+The dominant cost is **memory**: a controller-runtime informer caches the **full `Pod` object** (spec + status), not the small `podKey → discovery-key` map the cache exposes. An estimate counting only the side-index map ("one entry per managed pod") understates the real footprint by the size of the cached pod objects. On a large multi-tenant cluster (10k+ pods) an unfiltered cluster-scoped Pod cache can reach hundreds of MB to GBs.
+
+**Mitigations — and existing precedent in WVA.** WVA already scopes an informer to cut memory: in multi-namespace mode the ConfigMap cache is filtered by label via `cache.Options.ByObject` (`cmd/main.go`, commented "significantly reduces memory usage"). The Pod informer uses the same mechanism, as a **Phase 1 deliverable, not a later optimization**:
+
+1. **Field/label selector on the Pod cache** — `ByObject[&corev1.Pod{}]{Label/Field, Namespaces}`. Scope to pods of managed scale targets by selecting on labels the **workload already carries** (the `Deployment`/`LWS` pod-template selector WVA reads from the scale target) — *not* a new WVA-specific pod label, which would reintroduce the tenant-labeling dependency this proposal removes. Optionally exclude terminal pods (`status.phase` ∉ {`Succeeded`,`Failed`}).
+2. **Restrict watched namespaces to those containing a `VariantAutoscaling`** — the controller already tracks discovery namespaces (the HPA/ScaledObject reconcilers maintain this set), so the cluster-scoped default can be narrowed to active namespaces.
+3. **`TransformFunc` on cached Pods** — strip `managedFields`, env, and volume detail before the object enters the cache; the cache only needs owner refs, labels, namespace/name, and ready status.
+
+**Recommendation.** The scoped Pod informer (selector + transform) is required, not optional, and lands in Phase 1. For very large clusters, namespace-scoped deployment is the supported high-scale mode. The memory cost is real and is **bounded by the selector** — the bound must be part of the design.
 
 ---
 
@@ -118,6 +144,7 @@ None required. The change is non-breaking: installs that retain `llm-d.ai/varian
 **Deliverables:**
 
 - `internal/collector/source/pod_va_cache.go` with informer watches on `VariantAutoscaling`, `Deployment`, `LeaderWorkerSet`, and `Pod`.
+- A **scoped Pod informer** — label/field selector + `TransformFunc` configured via `cache.Options.ByObject`, following the existing ConfigMap-cache precedent — so the new Pod watch does not cache every pod in the cluster (see [Watch & Memory Cost](#watch--memory-cost)).
 - `Lookup(podKey) → VariantKey` API plus a single `extractPodKey(labels)` helper at the collector boundary, replacing the per-metric `pod`/`pod_name` fallback in `internal/collector/replica_metrics.go`.
 - `wva_pod_va_cache_miss_total{reason}` counter and a `PodMappingMissing` status condition on `VariantAutoscaling`.
 - Documented opt-in precedence for the `llm-d.ai/variant` label: cache reads it when present, never writes it.
@@ -175,6 +202,7 @@ None required. The change is non-breaking: installs that retain `llm-d.ai/varian
 | GitOps drift / fight | no | **yes** | no |
 | Failure observability | silent fallback | n/a | counter + status condition |
 | Kind coupling | wherever tenant labels | write paths per kind | one mapper per kind (already needed for scale-target reads) |
+| Controller watch/memory cost | none new | none new (writes templates) | **new Pod informer — bounded by selector + transform** (see [Watch & Memory Cost](#watch--memory-cost)) |
 | Adoption friction | high (Prometheus relabeling knowledge) | low | **lowest** (zero WVA-specific YAML) |
 | Forward-compatible with VA deprecation | awkward (label tracks a deprecated name) | awkward (controller writes a label whose anchor is being deprecated) | **clean** (cache value type abstracts the discovery anchor) |
 | Composes with the config-ux persona contract | partial (tenant authors WVA-specific YAML) | conflicts (controller mutates tenant resources) | **fully** (WVA reads, never writes) |
@@ -183,8 +211,7 @@ None required. The change is non-breaking: installs that retain `llm-d.ai/varian
 
 ## Open Questions
 
-- **Memory cost.** One map entry per managed pod plus owner-resolution indices. At realistic scales (~hundreds of pods per cluster) this is negligible relative to existing informer caches.
-- **Watch cost.** Informers WVA already runs; the pod→VA cache is a side index, not new API-server load.
+- **Watch & memory cost.** Addressed in [Watch & Memory Cost](#watch--memory-cost): the Pod informer is **new** (WVA watches no pods today), the dominant cost is the full-object Pod cache in cluster-scoped mode, and the mitigation is a scoped informer (label/field selector + transform) shipped in Phase 1, following the label-selector pattern already used for WVA's ConfigMap cache. Open sub-question: the exact selector — workload pod-template labels vs. restricting to VA-bearing namespaces — to be settled with a memory benchmark on a representative cluster.
 - **Custom workload kinds.** The opt-in label covers them. No regression versus the post-#1145 state.
 - **Rolling updates.** Eviction on `Pod` delete + repopulation on the new pod's add event is straight-line. The brief overlap window matches the same window the current label-based path faces between pod creation and the first scrape.
 - **Interaction with the `PodMappingMissing` condition once VAs disappear.** Post-deprecation, this becomes an event on the discovery owner (`ScaledObject`/`HPA`) rather than a CRD condition. The event payload and observability surface are settled when Phase 3 lands.
