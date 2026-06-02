@@ -42,7 +42,7 @@ Operator-declared YAML/ConfigMap, parsed into `QuotaLimiterEntries`, enforced vi
 | Scope | Cluster or namespace, both can coexist as separate entries |
 | Granularity | Per accelerator type (`H100`, `A100`, …); `-1` = unlimited |
 | Enforcement point | WVA scaling decision (per cycle, before requesting replicas) |
-| Operator UX | ConfigMap or YAML file; familiar map-of-map shape |
+| Operator UX | ConfigMap/YAML map-of-map shape as the **bootstrap** surface; the user-facing surface lands on the `ScalingPolicy` cluster default (see §6.1) |
 | Multi-tenancy | `default` key as per-namespace fallback (LimitRange-style) |
 | Failure mode | Decision capped at quota; emits `DecisionStep` with `limited by quota[…]` |
 | Dependencies | Zero new operators / CRDs / admission webhooks |
