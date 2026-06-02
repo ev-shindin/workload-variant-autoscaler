@@ -252,7 +252,7 @@ A2 is intentionally a separate, smaller PR — it has its own design questions (
 
 ## 6. Configuration surface and deployment scope
 
-§3–5 settle *where the cap is enforced* (the WVA decision loop) and *what mechanism* enforces it. Two further questions — where the operator *declares* quota, and how that interacts with WVA's deployment scope — are settled jointly with the config-UX proposal (`docs/proposals/design-config-ux.md`, #1194), which owns WVA's user-facing configuration surface.
+§3–5 settle *where the cap is enforced* (the WVA decision loop) and *what mechanism* enforces it. Two further questions — where the operator *declares* quota, and how that interacts with WVA's deployment scope — are settled jointly with the config-UX proposal (#1194), which owns WVA's user-facing configuration surface.
 
 ### 6.1 Where the operator declares quota
 
