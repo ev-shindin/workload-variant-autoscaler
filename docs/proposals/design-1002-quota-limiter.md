@@ -27,7 +27,7 @@ This proposal evaluates the alternatives — including native Kubernetes primiti
 **Non-goals.**
 - Job admission, queueing, or fair-share scheduling. WVA scales long-running Deployments / LWS, not batch jobs.
 - Per-pod resource accounting, billing, or chargeback ledger. Other tools own that.
-- Replacing or duplicating Kubernetes `ResourceQuota` — we will read from it if available (Section 6).
+- Replacing or duplicating Kubernetes `ResourceQuota` — we will read from it if available (option A2, §3).
 - Cluster autoscaler-level decisions. WVA assumes nodes already exist; provisioning is upstream.
 - Multi-cluster federation. One controller, one cluster.
 
@@ -249,4 +249,23 @@ A2 reuses the same `ConstraintProvider` plumbing A introduces, so the two compos
 | **A2 — `ResourceQuotaReader`** | New issue, to be filed alongside merging A | Not yet started; estimated ~300 lines (informer + `ConstraintProvider`) | Platform-admin-persona need; not part of #1002 |
 
 A2 is intentionally a separate, smaller PR — it has its own design questions (informer setup, handling of `ResourceQuota.status.used` vs. WVA's per-cycle computed usage, eventual consistency across the watch) that deserve their own design discussion rather than being bundled into #1002.
+
+## 6. Configuration surface and deployment scope
+
+§3–5 settle *where the cap is enforced* (the WVA decision loop) and *what mechanism* enforces it. Two further questions — where the operator *declares* quota, and how that interacts with WVA's deployment scope — are settled jointly with the config-UX proposal (`docs/proposals/design-config-ux.md`, #1194), which owns WVA's user-facing configuration surface.
+
+### 6.1 Where the operator declares quota
+
+Option A above describes the cap as a ConfigMap/YAML — the shape WVA uses for config today. The config-UX proposal consolidates all WVA *policy* onto a single typed `ScalingPolicy` CRD after the VA CRD deprecation, specifically to avoid the configuration fragmentation that results from each feature adding its own ConfigMap. Quota is a scaling *constraint* — the GPU budget the optimizer allocates within — so its long-term home is that single surface (the cluster-default `ScalingPolicy`), not a standalone quota ConfigMap.
+
+This proposal therefore treats the option-A ConfigMap as the **bootstrap surface** for the `QuotaLimiter` prototype, and defers the user-facing surface to land on the `ScalingPolicy` cluster default as #1194 matures. Both proposals share one rule: quota is authored in exactly one place, owned by the cluster admin.
+
+### 6.2 Deployment scope: quota is cluster-scoped
+
+Quota enforcement is intrinsically **cluster-scoped**, which constrains how WVA may be deployed when quota is in use:
+
+- **A cluster aggregate needs a cluster-wide view.** A namespace-scoped WVA instance (`--watch-namespace`) sees only its own namespace, so it can enforce only that namespace's cap — not an overall cluster cap. Running one WVA per namespace cannot honor a cluster aggregate: the sum of per-namespace caps can exceed physical cluster capacity, and independent instances each see the full node inventory without coordinating, so they would collectively overcommit.
+- **Ownership.** Per-namespace caps are a cluster-admin decision; a tenant must not be able to raise their own. A per-namespace deployment would place the quota config in the tenant's namespace/hands.
+
+So cluster-scoped quota (the cluster-scope half of #1002) requires a cluster-scoped WVA controller and a cluster-admin-owned surface. A namespace-scoped WVA can still enforce a namespace-local cap it is given, but cannot own or arbitrate the cluster aggregate. This matches the persona split in #1194: thresholds/scale-to-zero are tenant-owned and namespace-local; quota is cluster-admin-owned and cluster-scoped.
 
