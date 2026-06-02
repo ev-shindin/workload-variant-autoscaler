@@ -14,6 +14,8 @@ Anticipated growth makes this worse, not better. Issue #1002 will add another co
 
 This proposal introduces a single typed CRD as the source of truth for scaling policy, while leaving discovery on annotations (per the VA CRD deprecation) and infrastructure config on env vars / Kustomize. Three configuration domains, three surfaces, no overlap.
 
+The day-1 value stands on its own, independent of quota (deferred to #1162): the four policy ConfigMaps collapse into one typed `ScalingPolicy` CRD — admission-validated (OpenAPI + CEL), discoverable via `kubectl explain`, resolved through a single three-tier precedence — replacing scattered, parse-time-validated maps with one inspectable surface.
+
 > The sprawl above is independent of the VA CRD deprecation. The companion `docs/proposals/deprecate-va-crd.md` moves *discovery* to annotations on `ScaledObject`/`HPA` but not *policy*; this proposal picks up policy where that leaves off. The deprecation only adds urgency, by pushing yet more config into annotations.
 
 ---
