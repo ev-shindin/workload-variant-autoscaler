@@ -37,7 +37,7 @@ This split assumes a shared, cluster-scoped install. In a namespace-scoped insta
 |---|---|---|
 | Discovery (which workloads WVA manages) and per-workload identity | Annotations on `ScaledObject`/`HPA` | Tenant |
 | Scaling policy: thresholds, analyzers, scale-to-zero, queueing-model | `ScalingPolicy` CRD (this proposal — the only new surface) | Tenant |
-| Quota: per-namespace GPU caps | Deferred to the dedicated quota proposal (#1002); cluster-scoped | Cluster admin |
+| Quota: per-namespace GPU caps | Deferred to the dedicated quota proposal (#1162, issue #1002); cluster-scoped | Cluster admin |
 | Infrastructure: Prometheus URL, TLS, leader election, log level | Env vars + Kustomize overlays | Cluster admin (install-time) |
 
 Discovery is tenant-owned because the tenant deploying a model knows which model it is. Threshold tuning is tenant-owned because each tenant knows their own workload. Quota is cluster-admin-owned because allocation governance flows from above. Infrastructure is install-time because it doesn't change per-workload.
@@ -109,7 +109,7 @@ The effective policy is a property of the `(pool[, role])`, not of each variant 
 
 ### Quota: Deferred to the Dedicated Proposal
 
-Quota is a required feature, but **how** it is configured is being settled in the dedicated quota proposal (and #1002, open for a while with no comments) — not here. This proposal does not pin down a `spec.quota` schema. It records only two constraints any quota surface must satisfy, and the position that `ScalingPolicy` is the intended single home (rather than yet another ConfigMap), since quota is a scaling *constraint* — the GPU budget the optimizer allocates within.
+Quota is a required feature, but **how** it is configured is being settled in the dedicated quota proposal (#1162, for issue #1002) — not here. This proposal does not pin down a `spec.quota` schema. It records only two constraints any quota surface must satisfy, and the position that `ScalingPolicy` is the intended single home (rather than yet another ConfigMap), since quota is a scaling *constraint* — the GPU budget the optimizer allocates within.
 
 #### Quota & Deployment Scope
 
@@ -179,7 +179,7 @@ Duplicate (`spec.inferencePoolRef.name`, `spec.role`) tuples are rejected at adm
 | 4 ConfigMaps (`wva-*-config`) | 1+ `ScalingPolicy` objects |
 | Per-model overrides via `{modelID}#{namespace}` map keys | Per-pool `ScalingPolicy` objects, matched by `spec.inferencePoolRef` |
 | Threshold typos surface in controller logs | Threshold typos rejected at `kubectl apply` |
-| Quota planned as a separate ConfigMap (#1002) | Deferred to the dedicated quota proposal (#1002) |
+| Quota planned as a separate ConfigMap (#1002) | Deferred to the dedicated quota proposal (#1162) |
 | Discoverability: read four ConfigMap YAMLs | `kubectl get scalingpolicy` / `wva-config explain <pool>` |
 
 ### Migration Tool
@@ -247,7 +247,7 @@ The tool maps the cluster-default ConfigMap entries to a system-namespace `Scali
 
 6. **One cluster-scoped CRD with `namespaceSelector` + `weight` (Karpenter `NodePool` shape).** Necessary if WVA needed "all `tier=prod` namespaces inherit X" without enumerating namespaces. Most clusters have a handful of namespaces, not hundreds. The selector-and-weight engine carries permanent complexity (conflict resolution, status reporting) that the three-tier name lookup avoids.
 
-7. **Annotated `ResourceQuota` for per-GPU-type quotas.** Tempting (K8s-native, no new CRD), but K8s admission does not interpret the annotation; multiple `ResourceQuota`s on `requests.nvidia.com/gpu` compound as `min(hard_i)`, not per-type, and per-type caps at admission need DRA (K8s 1.34+). The full quota-surface comparison (including core-`ResourceQuota`-vs-`spec.quota`) is deferred to the dedicated quota proposal (#1002).
+7. **Annotated `ResourceQuota` for per-GPU-type quotas.** Tempting (K8s-native, no new CRD), but K8s admission does not interpret the annotation; multiple `ResourceQuota`s on `requests.nvidia.com/gpu` compound as `min(hard_i)`, not per-type, and per-type caps at admission need DRA (K8s 1.34+). The full quota-surface comparison (including core-`ResourceQuota`-vs-`spec.quota`) is deferred to the dedicated quota proposal (#1162).
 
 8. **`spec.modelID` as the match key (with `metadata.name` as a sanitized DNS-safe slug).** Earlier draft of this proposal. Rejected once we accepted llm-d-as-stack: the `InferencePool` reference is always available, exact-match, and post-transition naturally encodes role. `status.modelID` is preferable to `spec.modelID` because the model identity is derivable, not an authoritative input.
 
