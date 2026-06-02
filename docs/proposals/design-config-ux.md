@@ -111,9 +111,9 @@ Fields merge from cluster default → namespace default → per-pool override. S
 
 The effective policy is a property of the `(pool[, role])`, not of each variant or workload — WVA scales the pool, and the optimizer distributes replicas across the pool's variants (see [Per-Pool Keying](#per-pool-keying-plus-an-optional-per-role-field)). WVA stays **read-only** on the `ScaledObject`/`HPA`: consistent with `deprecate-va-crd.md`, it never writes back to tenant-owned objects. The merged result is surfaced on demand by `kubectl get scalingpolicy` and `wva-config explain <pool>`, which pretty-prints the merged policy and its three sources — no manual traversal of the `HPA → … → ScalingPolicy` chain. The per-variant output remains the `wva_desired_replicas` metric, unchanged.
 
-### Quota: Deferred to the Dedicated Proposal
+### Quota: Single Surface, Schema in #1162
 
-Quota is a required feature, but **how** it is configured is being settled in the dedicated quota proposal (#1162, for issue #1002) — not here. This proposal does not pin down a `spec.quota` schema. It records only two constraints any quota surface must satisfy, and the position that `ScalingPolicy` is the intended single home (rather than yet another ConfigMap), since quota is a scaling *constraint* — the GPU budget the optimizer allocates within.
+Quota is a required feature, but its `spec.quota` schema is settled in the dedicated quota proposal (#1162, for issue #1002) — not here. The shared position is firm: quota is declared **directly on the cluster-default `ScalingPolicy`**, with no interim standalone quota ConfigMap — shipping one would reintroduce exactly the fragmentation this proposal removes. Quota is a scaling *constraint* (the GPU budget the optimizer allocates within), so it belongs on this single surface; #1162 owns its schema and the cluster-scoped enforcement.
 
 #### Quota & Deployment Scope
 
