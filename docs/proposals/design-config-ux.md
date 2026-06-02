@@ -10,7 +10,7 @@ An operator asking "what policy applies to model `granite-13b` in namespace `pro
 
 Validation is also uneven — though admission *timing* is no longer the real differentiator. Since `ValidatingAdmissionPolicy` went GA (K8s 1.30), ConfigMaps and annotations *can* be admission-validated in-process with CEL, no webhook needed. What a typed CRD adds over that is structure: natively typed fields (int, enum, required, defaulted), `kubectl explain` discoverability, and OpenAPI + CEL co-located on the schema. A `ValidatingAdmissionPolicy` over ConfigMap `data`/annotations validates opaque strings against a shape defined elsewhere — admission checks without the typing, discoverability, or defaulting. Absent such a policy today, ConfigMap typos surface in controller logs and annotation typos after creation.
 
-Anticipated growth makes this worse, not better. Issue #1002 will add another ConfigMap surface for quotas. PR #1052 already added per-analyzer thresholds. The companion VA CRD deprecation pushes *more* config into annotations. Without a deliberate shape, surface count grows monotonically.
+Anticipated growth makes this worse, not better. Issue #1002 will add another configuration surface for quotas. PR #1052 already added per-analyzer thresholds. The companion VA CRD deprecation pushes *more* config into annotations. Without a deliberate shape, surface count grows monotonically.
 
 This proposal introduces a single typed CRD as the source of truth for scaling policy, while leaving discovery on annotations (per the VA CRD deprecation) and infrastructure config on env vars / Kustomize. Three configuration domains, three surfaces, no overlap.
 
@@ -42,7 +42,7 @@ This split assumes a shared, cluster-scoped install. In a namespace-scoped insta
 
 Discovery is tenant-owned because the tenant deploying a model knows which model it is. Threshold tuning is tenant-owned because each tenant knows their own workload. Quota is cluster-admin-owned because allocation governance flows from above. Infrastructure is install-time because it doesn't change per-workload.
 
-**Single configuration surface.** The aim is that, after the VA CRD deprecation, `ScalingPolicy` is the *one* place a user configures WVA scaling. The only WVA-specific things left on the `ScaledObject`/`HPA` are the discovery label and per-workload identity annotations (e.g. `variant-cost`) — not policy. New configuration, including quota's eventual surface, belongs in `ScalingPolicy`, not in another ConfigMap.
+**Single configuration surface.** The aim is that, after the VA CRD deprecation, `ScalingPolicy` is the *one* place a user configures WVA scaling. The only WVA-specific things left on the `ScaledObject`/`HPA` are the discovery annotation (`llm-d.ai/managed`) and per-workload identity annotations (e.g. `variant-cost`) — not policy. New configuration, including quota's eventual surface, belongs in `ScalingPolicy`, not in another ConfigMap.
 
 ---
 
@@ -51,7 +51,7 @@ Discovery is tenant-owned because the tenant deploying a model knows which model
 1. A single **authoring** source of truth for scaling policy — one typed `ScalingPolicy` CRD, not six surfaces
 2. A single **inspectable effective policy** per `(pool[, role])` — every field resolves through one deterministic precedence (cluster default → namespace default → per-pool), inspectable via `wva-config explain` / `kubectl get scalingpolicy`
 3. Admission-time validation (OpenAPI + CEL) for every policy field
-4. Native K8s RBAC enforces the governance split between tenant-owned thresholds and cluster-admin-owned quota
+4. Native K8s RBAC enforces the governance split — tenant-owned namespace policy vs the cluster-admin-owned cluster default (and quota, once #1162 lands)
 5. Composes cleanly with the VA CRD deprecation and the throughput analyzer (#1052) without adding new schemas later
 
 ## Non-Goals
@@ -67,7 +67,7 @@ Discovery is tenant-owned because the tenant deploying a model knows which model
 
 ### One Namespaced CRD: `ScalingPolicy`
 
-A single namespaced CRD under `scaling.llm-d.ai/v1alpha1` carries every policy concern. The match key is `spec.inferencePoolRef` — a `LocalObjectReference` to the `InferencePool` (from the Gateway API inference extension) whose pods the policy applies to. WVA always runs alongside llm-d, which ships the inference extension, so `InferencePool` is always installed and watchable.
+A single namespaced CRD under `scaling.llm-d.ai/v1alpha1` carries every scaling-policy setting. The match key is `spec.inferencePoolRef` — a `LocalObjectReference` to the `InferencePool` (from the Gateway API inference extension) whose pods the policy applies to. WVA always runs alongside llm-d, which ships the inference extension, so `InferencePool` is always installed and watchable.
 
 Tenants never type model identifiers into a policy spec. `status.modelID` plays no part in resolution — matching is by pool. The controller derives it from the referenced pool and exposes it via a `+kubebuilder:printcolumn` (display-only) so `kubectl get scalingpolicy -n production` shows both the matched pool and the model.
 
@@ -218,7 +218,7 @@ The tool maps the cluster-default ConfigMap entries to a system-namespace `Scali
 - `wva-config migrate` CLI tool
 - Default samples in `config/samples/` use the CRD
 - Deprecation warning event emitted when WVA reads from a ConfigMap
-- `docs/user-guide/scaling-policy.md` describes the three-tier model and quota governance
+- `docs/user-guide/scaling-policy.md` describes the three-tier model (quota governance lands with #1162)
 
 **Success Criteria:** All sample and documentation paths use the CRD; CI tests pass with ConfigMaps absent.
 
@@ -275,6 +275,8 @@ S1 (this proposal) compared with the alternatives above. Each cell summarises th
 | Net new objects to install | 0 | 0 | 0 | 2 CRDs | 2 CRDs + annotations | 1 CRD | 1 CRD |
 
 S1 wins on the dimensions that the proposal's goals call out — admission-time validation, K8s-native RBAC, single kind to learn — while avoiding the selector engine S2 carries and the singleton bottleneck a Karpenter-style single-object design would impose. Where another option ties on a row, S1 ties; where S1 wins, it's on kind count, governance ergonomics, or absence of a separate annotation surface.
+
+> The **Per-GPU-type quota** row reflects S1's *capability* to host quota first-class, not current scope: quota's configuration surface is deferred to the dedicated quota proposal (#1162).
 
 ---
 
