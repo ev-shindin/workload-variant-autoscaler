@@ -42,7 +42,7 @@ Operator-declared YAML/ConfigMap, parsed into `QuotaLimiterEntries`, enforced vi
 | Scope | Cluster or namespace, both can coexist as separate entries |
 | Granularity | Per accelerator type (`H100`, `A100`, …); `-1` = unlimited |
 | Enforcement point | WVA scaling decision (per cycle, before requesting replicas) |
-| Operator UX | ConfigMap/YAML map-of-map shape as the **bootstrap** surface; the user-facing surface lands on the `ScalingPolicy` cluster default (see §6.1) |
+| Operator UX | Declared on the cluster-default `ScalingPolicy` (`spec.quota`) — the single config surface from #1194 (see §6.1); the prototype's ConfigMap is an internal/test detail, not a shipped surface |
 | Multi-tenancy | `default` key as per-namespace fallback (LimitRange-style) |
 | Failure mode | Decision capped at quota; emits `DecisionStep` with `limited by quota[…]` |
 | Dependencies | Zero new operators / CRDs / admission webhooks |
@@ -256,9 +256,9 @@ A2 is intentionally a separate, smaller PR — it has its own design questions (
 
 ### 6.1 Where the operator declares quota
 
-Option A above describes the cap as a ConfigMap/YAML — the shape WVA uses for config today. The config-UX proposal consolidates all WVA *policy* onto a single typed `ScalingPolicy` CRD after the VA CRD deprecation, specifically to avoid the configuration fragmentation that results from each feature adding its own ConfigMap. Quota is a scaling *constraint* — the GPU budget the optimizer allocates within — so its long-term home is that single surface (the cluster-default `ScalingPolicy`), not a standalone quota ConfigMap.
+Option A's prototype reads the cap from a ConfigMap, but that is **not** the proposed operator surface. The config-UX proposal consolidates all WVA *policy* onto a single typed `ScalingPolicy` CRD after the VA CRD deprecation, specifically to avoid the configuration fragmentation that results from each feature adding its own ConfigMap. Quota is a scaling *constraint* — the GPU budget the optimizer allocates within — so it belongs on that single surface.
 
-This proposal therefore treats the option-A ConfigMap as the **bootstrap surface** for the `QuotaLimiter` prototype, and defers the user-facing surface to land on the `ScalingPolicy` cluster default as #1194 matures. Both proposals share one rule: quota is authored in exactly one place, owned by the cluster admin.
+**Recommendation: quota is declared directly on the cluster-default `ScalingPolicy` (`spec.quota`), with no interim standalone quota ConfigMap.** The `QuotaLimiter` mechanism (§3.A) reads its caps from that object; the prototype's ConfigMap stays an internal/test detail, never a shipped operator surface. Shipping a quota ConfigMap first would introduce exactly the fragmentation #1194 exists to remove and that we would immediately deprecate — so quota lands on `ScalingPolicy` directly. This keeps the single-surface rule: quota is authored in exactly one place, owned by the cluster admin. The cost is sequencing — quota's operator surface is gated on the cluster-default `ScalingPolicy` from #1194 landing; the enforcement mechanism (§3.A) can be built and tested independently against the prototype ConfigMap in the meantime.
 
 ### 6.2 Deployment scope: quota is cluster-scoped
 
