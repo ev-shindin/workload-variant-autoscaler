@@ -186,10 +186,10 @@ metadata:
 
 | Strengths | Weaknesses |
 |---|---|
-| Zero new objects to learn. | `ResourceQuota` has no per-GPU-model granularity (see design-1002 §3.B). |
+| Zero new objects to learn. | `ResourceQuota` has no per-GPU-model granularity (see the quota proposal #1162, §3.B). |
 | K8s-native. | Cannot express analyzer thresholds, priorities, scale-to-zero retention, or anything WVA-specific. |
 
-**Verdict.** Necessary for the quota limiter problem (the quota proposal already covers this), but insufficient as a *policy* UX. Strictly orthogonal.
+**Verdict.** Necessary for the quota limiter problem (the quota proposal #1162 covers this), but insufficient as a *policy* UX. Strictly orthogonal.
 
 ### G′. Annotated `ResourceQuota` for per-GPU-type quotas
 
@@ -214,7 +214,7 @@ K8s-native, GitOps-native, no new CRD. Fails on K8s admission semantics:
 
 Per-GPU-type quotas at admission require DRA (`<deviceclass>.deviceclass.resource.k8s.io/devices`), K8s 1.34+, with KEP #4840 still maturing.
 
-**Verdict.** Rejected as a substitute. The correct composition is `ScalingPolicy.spec.quota` as the primary surface plus WVA reading `ResourceQuota` as a complementary input via design-1002's A2 (`ResourceQuotaReader`).
+**Verdict.** Rejected as a substitute. The quota *configuration surface* — whether `ScalingPolicy.spec.quota`, a ConfigMap, or WVA reading `ResourceQuota` via option A2 (`ResourceQuotaReader`) — is settled in the dedicated quota proposal (#1162); see decision 7 in §5.
 
 ### H. Helm values as the policy surface
 
@@ -278,13 +278,15 @@ The matrix below compares each shortlisted alternative against the dimensions th
 | GitOps merge isolation | partial | partial | ✅ per object | ✅ per object | ✅ per object | ❌ (singleton conflicts) | ✅ per object | ✅ per object |
 | Emergency pause | edit ConfigMap, wait | edit ConfigMap, wait | annotation edit | CRD edit | annotation edit | edit singleton, wait | CRD edit | CRD edit (`spec.paused`) |
 | Per-GPU-type quota | ❌ (out of scope) | ❌ | ❌ | ✅ (in CRD) | ✅ | ✅ | ✅ | ✅ |
-| Per-pool granularity (post-transition per-role) | ❌ | ❌ | partial (poolRef annotation) | partial | partial | partial | ✅ (selector) | ✅ (poolRef) |
+| Per-pool granularity (post-transition per-role) | ❌ | ❌ | partial (inferencePoolRef annotation) | partial | partial | partial | ✅ (selector) | ✅ (inferencePoolRef) |
 | Composes with VA CRD deprecation | yes | yes | yes | yes | yes | yes | yes | yes |
-| Composes with quota limiter (#1002) | bolt on a ConfigMap | section in unified ConfigMap | more annotations | first-class | first-class | first-class | first-class | first-class |
+| Composes with quota limiter (#1162) | bolt on a ConfigMap | section in unified ConfigMap | more annotations | first-class | first-class | first-class | first-class | first-class |
 | Composes with throughput analyzer (#1052) | new ConfigMap fields | new ConfigMap section | more annotations | typed | typed | typed | typed | typed |
 | Net new objects to install | 0 | 0 | 0 | 2 CRDs | 2 CRDs + annotations | 1 CRD | 1 CRD | 1 CRD |
 
 S1 is selected on the basis of: K8s-native RBAC for the governance split, single kind to learn, no selector engine, no annotation surface to maintain, no singleton bottleneck. Each dimension where another option matches S1, S1 ties; the dimensions where S1 wins outright are kind count (1 vs 2 for D/E) and absence of the singleton bottleneck (S0) or selector machinery (S2).
+
+> The quota rows above reflect S1's *capability* to host quota first-class, not current scope: quota's configuration surface is deferred to the dedicated quota proposal (#1162). See §5 decision 7.
 
 ---
 
@@ -313,24 +315,20 @@ The 2024-2026 trend is consistent: **typed CRDs for the steady-state policy, ann
 
 ## 5. Design decisions captured during analysis
 
-The proposal records the final design. The decisions below capture *why* — the rejected alternatives and the reasoning — so future reviewers don't relitigate them.
+The proposal records the final design. The decisions below capture *why* — and, where round-2 review changed a decision, the current position — so future reviewers don't relitigate them.
 
-1. **Match key is `spec.poolRef`, not `spec.modelID`.** The model identifier is derived from the referenced `InferencePool` and surfaced as `status.modelID` (read-only). Operators never type the model string into a policy spec; they author `poolRef`. Earlier drafts used `spec.modelID` with a DNS-safe slug rule for `metadata.name`; rejected once we accepted llm-d-as-stack and could rely on `InferencePool` being available.
+1. **Match key is `spec.inferencePoolRef`, not `spec.modelID`.** The model identifier is derived from the referenced `InferencePool` and surfaced as `status.modelID` (read-only, display-only — no part in resolution). Operators never type the model string into a policy spec; they author `inferencePoolRef`. Earlier drafts used `spec.modelID` with a DNS-safe slug rule for `metadata.name`; rejected once we accepted llm-d-as-stack and could rely on `InferencePool` being available.
 
-2. **Cluster default missing → controller refuses to start.** The cluster default is the only source of quota; falling back to hard-coded built-ins would hide quota policy behind invisible defaults.
+2. **An optional `spec.role` (`prefill | decode`) IS included** — reversing an earlier "no per-role field" stance. WVA scales the *pool*, not individual variants: variant cost/hardware/capacity differences are resolved by the optimizer, so they are optimizer inputs, not policy axes, and there is no generic per-variant field. Role is the one sub-pool axis carrying a policy difference the optimizer cannot infer (prefill vs decode). It is additive and temporary — redundant once per-role `InferencePool`s land.
 
-3. **`spec.quota` in non-cluster-default policies is rejected at admission via CEL, not silently ignored.** Silent ignores would let namespace owners set quota fields thinking they apply.
+3. **Effective policy is a property of the `(pool[, role])`, surfaced off-workload.** WVA stays read-only on `ScaledObject`/`HPA` (no annotation write-back), consistent with the VA CRD deprecation. The merged result is inspected via `wva-config explain` / `kubectl get scalingpolicy`; `ScalingPolicy.status` carries only the policy object's own conditions. An earlier draft wrote `effective-policy` annotations onto the workload; dropped, because policy is pool-scoped (not per-workload) and WVA must not mutate tenant-owned objects.
 
-4. **No `perNamespace[ns].exclude` field.** The existing namespace annotation `wva.llmd.ai/exclude` already opts a whole namespace out.
+4. **Cluster default is optional.** An earlier draft made it mandatory (refuse-to-start) because it was the only home for quota. With quota deferred (decision 7), an absent cluster default falls through to built-in threshold defaults; it becomes required only for installs that use quota.
 
-5. **`status.effectivePolicy` lives on the workload (`ScaledObject`/`HPA`), not on the `ScalingPolicy`.** Operators describe workloads when debugging.
+5. **CEL list-uniqueness rejects duplicate (`spec.inferencePoolRef.name`, `spec.role`) tuples at admission.** A pool carries at most one policy per role plus one role-agnostic policy. Feasible because the llm-d stack's K8s floor (1.32+ via the inference extension's "last three minors" policy) is well above CEL's 1.29 GA.
 
-6. **No `spec.role` or `spec.perRole` field.** Per-pool keying inherits per-role semantics for free once per-model-per-role `InferencePool`s become the norm.
+6. **List merge for `spec.analyzers[*]` is by `name`, not replace-wholesale.** Operators tune one analyzer at a time without redeclaring others; the typed, name-keyed shape mirrors EPP's `EndpointPickerConfig` plugin list.
 
-7. **No per-role quotas.** Cluster admins set namespace caps; the engine allocates within. Role differentiation is expressed via per-pool priority and `scaleBounds`.
+7. **Quota is deferred to the dedicated quota proposal (#1162).** The configuration surface (`spec.quota` vs ConfigMap vs core `ResourceQuota`), the cluster-default-mandatory question, per-role quotas, the `quota-editor` `ClusterRole` delegation, and the CEL field-restriction rule all move there. Shared position: quota is a scaling constraint, intrinsically cluster-scoped — a per-namespace WVA can't enforce a cluster aggregate and caps are a cluster-admin decision — so its eventual home is the single cluster-default `ScalingPolicy` surface, not another ConfigMap.
 
-8. **CEL list-uniqueness rejects duplicate `spec.poolRef` at admission.** Feasible because the llm-d stack's K8s floor (1.32+ via the inference extension's "last three minors" policy) is well above CEL's 1.30 GA threshold.
-
-9. **List merge for `spec.analyzers[*]` is by `name` field, not replace-wholesale.** Operators tune one analyzer at a time without inheriting responsibility for redeclaring others.
-
-10. **Delegated quota editing via `quota-editor` `ClusterRole`, not a separate CRD.** Expressible in standard K8s RBAC by scoping `update`/`patch` to `resourceNames: ["default"]`.
+8. **No `perNamespace[ns].exclude` field** (when quota lands): the existing namespace annotation `wva.llmd.ai/exclude` already opts a whole namespace out.
