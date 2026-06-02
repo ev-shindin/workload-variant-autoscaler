@@ -42,7 +42,7 @@ This split assumes a shared, cluster-scoped install. In a namespace-scoped insta
 
 Discovery is tenant-owned because the tenant deploying a model knows which model it is. Threshold tuning is tenant-owned because each tenant knows their own workload. Quota is cluster-admin-owned because allocation governance flows from above. Infrastructure is install-time because it doesn't change per-workload.
 
-**Single configuration surface.** The aim is that, after the VA CRD deprecation, `ScalingPolicy` is the *one* place a user configures WVA scaling. The only WVA-specific things left on the `ScaledObject`/`HPA` are the discovery annotation (`llm-d.ai/managed`) and per-workload identity annotations (e.g. `variant-cost`) — not policy. New configuration, including quota's eventual surface, belongs in `ScalingPolicy`, not in another ConfigMap.
+**Single configuration surface.** The aim is that, after the VA CRD deprecation, `ScalingPolicy` is the *one* place a user configures WVA scaling. The only WVA-specific things left on the `ScaledObject`/`HPA` are the discovery **label** (`llm-d.ai/managed`, a label not an annotation — per #1130) and the few per-workload annotations that aren't derivable (`variant-cost`, `role`) — not policy. (`model-id` is proposed for removal — derivable from the `InferencePool`.) New configuration, including quota's eventual surface, belongs in `ScalingPolicy`, not in another ConfigMap.
 
 ---
 
@@ -70,6 +70,8 @@ Discovery is tenant-owned because the tenant deploying a model knows which model
 A single namespaced CRD under `scaling.llm-d.ai/v1alpha1` carries every scaling-policy setting. The match key is `spec.inferencePoolRef` — a `LocalObjectReference` to the `InferencePool` (from the Gateway API inference extension) whose pods the policy applies to. WVA always runs alongside llm-d, which ships the inference extension, so `InferencePool` is always installed and watchable.
 
 Tenants never type model identifiers into a policy spec. `status.modelID` plays no part in resolution — matching is by pool. The controller derives it from the referenced pool and exposes it via a `+kubebuilder:printcolumn` (display-only) so `kubectl get scalingpolicy -n production` shows both the matched pool and the model.
+
+> Because the model is derivable from the `InferencePool` this way, the per-workload `llm-d.ai/model-id` annotation is itself redundant — proposed for removal, with WVA reading the pool instead. That further shrinks the workload's footprint to the discovery label plus the few annotations that are *not* derivable (e.g. `variant-cost`).
 
 ```yaml
 apiVersion: scaling.llm-d.ai/v1alpha1
@@ -159,8 +161,8 @@ Duplicate (`spec.inferencePoolRef.name`, `spec.role`) tuples are rejected at adm
 
 ## What Does NOT Change
 
-- Discovery via `ScaledObject`/`HPA` annotations (per the VA CRD deprecation)
-- Per-workload metadata annotations (`llm-d.ai/managed`, `llm-d.ai/model-id`, `llm-d.ai/variant-cost`, `llm-d.ai/role`)
+- Discovery via the `llm-d.ai/managed` **label** on `ScaledObject`/`HPA` (per the VA CRD deprecation; a label, not an annotation — see #1130)
+- Per-workload metadata annotations (`llm-d.ai/variant-cost`, `llm-d.ai/role`; `llm-d.ai/model-id` proposed for removal — derivable from the `InferencePool`)
 - Namespace-level controls (`wva.llmd.ai/config-enabled`, `wva.llmd.ai/exclude`)
 - Infrastructure configuration (Prometheus URL, TLS, leader election, log level — still in env vars + Kustomize overlays)
 - vLLM/EPP metric collection and Prometheus queries
