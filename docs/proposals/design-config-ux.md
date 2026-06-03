@@ -39,10 +39,10 @@ This split assumes a shared, cluster-scoped install. In a namespace-scoped insta
 |---|---|---|
 | Discovery (which workloads WVA manages) and per-workload identity | Annotations on `ScaledObject`/`HPA` | Tenant |
 | Scaling policy: thresholds, analyzers, scale-to-zero, priority | `ScalingPolicy` — per-pool & namespace tiers (the only new surface) | Tenant |
-| Cluster-wide policy: limiters, optimizer, quota (quota → #1162) | `ScalingPolicy` — cluster-default tier | Cluster admin |
+| Cluster-wide policy: limiters, quota (quota → #1162) | `ScalingPolicy` — cluster-default tier | Cluster admin |
 | Infrastructure: Prometheus URL, TLS, leader election, log level | Env vars + Kustomize overlays | Cluster admin (install-time) |
 
-Discovery and per-pool/namespace policy are tenant-owned because each tenant knows their own workloads. The cluster-default tier — limiters, optimizer, quota — is cluster-admin-owned because those are platform-wide. It is the **same `ScalingPolicy` CRD**; the tier decides the owner, and namespace RBAC enforces the split (cluster admins write the system namespace, tenants write their own). Infrastructure is install-time because it doesn't change per-workload.
+Discovery and per-pool/namespace policy are tenant-owned because each tenant knows their own workloads. The cluster-default tier — limiters and quota — is cluster-admin-owned because those are platform-wide. It is the **same `ScalingPolicy` CRD**; the tier decides the owner, and namespace RBAC enforces the split (cluster admins write the system namespace, tenants write their own). Infrastructure is install-time because it doesn't change per-workload.
 
 **Single configuration surface.** The aim is that `ScalingPolicy` is the *one* place a user configures WVA scaling. The only WVA-specific things left on the `ScaledObject`/`HPA` are the discovery **label** (`llm-d.ai/managed`, a label not an annotation — per #1130) and the few per-workload annotations that aren't derivable (`variant-cost`, `role`) — not policy. New configuration, including quota's eventual surface, belongs in `ScalingPolicy`, not in another ConfigMap.
 
@@ -113,7 +113,7 @@ spec:
 **Cardinality and tier.**
 - **`analyzers`** — a pluggable list (one or more), tenant-tunable at any tier.
 - **`limiters`** — a pluggable list that composes as a chain (e.g. physical GPU inventory + quota); instance-wide, so it lives on the **cluster-default** `ScalingPolicy` (a CEL rule keeps it off namespace/per-pool policies, the same way `spec.quota` is cluster-default-only).
-- **optimizer** — a single, **fixed** stage; not selected and not exposed in the schema today. Its behavior is internal: cost-minimizing when unconstrained, fair-sharing by `priority` when a limiter binds (the cost-aware/greedy-by-score split is an implementation detail, not a user choice). There is nothing to configure on it now; if real knobs emerge later, a `spec.optimizer` block can be added with no redesign.
+- **optimizer** — a single, **fixed** stage: one per WVA instance, not selected per pool. Its behavior is internal — cost-minimizing when unconstrained, fair-sharing by `priority` when a limiter binds (the cost-aware/greedy-by-score split is an implementation detail, not a user choice). Nothing to configure today; the schema leaves room for a `spec.optimizer` block later if tuning knobs are ever needed, with no redesign.
 
 Per-pool and namespace policies carry the tenant-tunable fields (analyzer thresholds, `priority`, `scaleToZero`).
 
@@ -131,11 +131,44 @@ For each workload, the controller resolves a policy via three deterministic look
 2. **Namespace default** — `ScalingPolicy` in the workload's namespace with `spec.inferencePoolRef` absent.
 3. **Cluster default** — `ScalingPolicy` in the system namespace (default `workload-variant-autoscaler-system`, configurable via `--system-namespace`) with `spec.inferencePoolRef` absent.
 
-Fields merge from cluster default → namespace default → per-pool override. Scalars: higher tier wins if set. Maps: overlay per key. Lists with a natural identifier (`spec.analyzers[*]` keyed by `name`): merge by name — lower-tier entries inherited unless the higher tier overrides them, higher-tier entries added when no lower-tier match exists. Lists without an identifier: replace wholesale. (`limiters` and `optimizer` live only on the cluster default, so they aren't merged across tiers.)
+Fields merge from cluster default → namespace default → per-pool override. Scalars: higher tier wins if set. Maps: overlay per key. Lists with a natural identifier (`spec.analyzers[*]` keyed by `name`): merge by name — lower-tier entries inherited unless the higher tier overrides them, higher-tier entries added when no lower-tier match exists. Lists without an identifier: replace wholesale. (`limiters` and `quota` live only on the cluster default, so they aren't merged across tiers.) In this schema the only mergeable list is `analyzers`, keyed by `name` — so a higher tier tuning one analyzer never silently drops the others; there is **no replace-wholesale list in the policy schema today** (the rule is the documented fallback for any future identifier-less list).
+
+A worked merge:
+
+```yaml
+# 1) cluster default  (ns: workload-variant-autoscaler-system; no inferencePoolRef)
+spec: { priority: 1.0, scaleToZero: { enabled: true },
+        analyzers: [ { type: saturation, parameters: { scaleUpThreshold: 0.85 } } ] }
+# 2) namespace default  (ns: production; no inferencePoolRef)
+spec: { analyzers: [ { type: saturation, parameters: { scaleUpThreshold: 0.90 } } ] }
+# 3) per-pool  (ns: production; inferencePoolRef: granite-premium-pool)
+spec: { inferencePoolRef: { name: granite-premium-pool }, priority: 2.0,
+        analyzers: [ { type: saturation, parameters: { scaleDownBoundary: 0.6 } } ] }
+```
+
+resolves to the effective policy, **published on the per-pool object's status**:
+
+```yaml
+status:
+  effectivePolicy:
+    priority: 2.0                   # per-pool overrides the cluster default
+    scaleToZero: { enabled: true }  # inherited from the cluster default
+    analyzers:
+      - type: saturation            # merged by name across all three tiers
+        parameters:
+          scaleUpThreshold: 0.90    # from the namespace default
+          scaleDownBoundary: 0.6    # from the per-pool policy
+  sources:                          # contributing objects, in precedence order
+    - workload-variant-autoscaler-system/default
+    - production/<namespace-default>
+    - production/granite-premium-priority
+```
+
+Publishing `status.effectivePolicy` and `status.sources` makes the merge **observable** — `kubectl get scalingpolicy <name> -o yaml` shows exactly what's in force and which tiers produced it, so operators aren't asked to trust an unseen algorithm.
 
 The namespace and cluster defaults double as **shareable scaling profiles**: common config defined once there applies across all pools in scope, and per-pool policies carry only the deltas — so sharing policy across pools needs no per-workload reference (an `HPA → ScalingPolicy` ref would instead put a WVA-specific field back on every workload). Sharing across an arbitrary *subset* of pools that doesn't align with namespace/cluster boundaries is the one case the tiers don't cover; if it's ever needed, a `labelSelector` on the `ScalingPolicy` (still policy→pools) is the extension — see Alternatives.
 
-The effective policy is a property of the **pool**, not of each variant or workload — WVA scales the pool, and the optimizer distributes replicas across the pool's variants (see [Per-Pool Keying and Roles](#per-pool-keying-and-roles)). WVA stays **read-only** on the `ScaledObject`/`HPA`: it never writes back to tenant-owned objects. The merged result is surfaced on demand by `kubectl get scalingpolicy` and `wva-config explain <pool>` (a proposed WVA CLI; see Migration), which pretty-prints the merged policy and its three sources — no manual traversal of the `HPA → … → ScalingPolicy` chain. The per-variant output remains the `wva_desired_replicas` metric, unchanged.
+The effective policy is a property of the **pool**, not of each variant or workload — WVA scales the pool, and the optimizer distributes replicas across the pool's variants (see [Per-Pool Keying and Roles](#per-pool-keying-and-roles)). WVA stays **read-only** on the `ScaledObject`/`HPA`: it never writes back to tenant-owned objects. The merged result is published on `status.effectivePolicy` (with `status.sources`), so `kubectl get scalingpolicy <name> -o yaml` shows it directly; `wva-config explain <pool>` (a proposed WVA CLI; see Migration) pretty-prints the same — no manual traversal of the `HPA → … → ScalingPolicy` chain. The per-variant output remains the `wva_desired_replicas` metric, unchanged.
 
 ### Quota: Single Surface, Schema in #1162
 
@@ -172,19 +205,29 @@ One policy per pool; the analyzer applies the per-role values. When per-role `In
 
 ### Conflict Detection and Bootstrap
 
-Two `ScalingPolicy` objects in the same namespace cannot target the same `spec.inferencePoolRef.name` — a pool carries at most one policy. A CEL `x-kubernetes-validations` uniqueness rule on `inferencePoolRef.name` rejects duplicates at admission. CEL `x-kubernetes-validations` went GA in K8s 1.29; the lowest K8s version supported elsewhere in the llm-d stack (1.32+ via the inference extension's "last three minors" policy) is well above that floor, so no controller-side fallback or admission webhook is needed.
+A pool carries at most one policy. **Cross-object uniqueness can't be a CEL `x-kubernetes-validations` rule** — those validate a single object against itself and can't see the other `ScalingPolicy` objects in the namespace. So the **controller** enforces it: when two policies target the same `inferencePoolRef.name`, it picks a deterministic winner (oldest `creationTimestamp`, ties broken by name), applies it, and sets a `Conflict` condition naming the winner on the rest (which are then ignored). No admission webhook is required. CEL *does* handle the **single-object** rules — `limiters` and `quota` permitted only on the cluster default — since those need no cross-object visibility; CEL `x-kubernetes-validations` is GA since K8s 1.29, well below the llm-d stack's 1.32+ floor.
 
 The cluster-default `ScalingPolicy` is **optional**. When absent, threshold/scale-to-zero resolution falls through to built-in defaults — there is no refuse-to-start. (When quota is later introduced, the cluster default becomes required *for installs that use quota*, and only then must be cluster-admin-owned and enforced by a cluster-scoped controller — see [Quota & Deployment Scope](#quota--deployment-scope).) Namespace defaults and per-pool overrides remain optional and fall through to the next tier normally when absent.
 
 ### Status Conditions
 
-`ScalingPolicy.status` carries conditions about the policy object itself (not per-workload state):
+`ScalingPolicy.status` carries the **resolved effective policy** for this object's scope (`status.effectivePolicy` + `status.sources`, shown in the merge example above) plus conditions:
 
 - **`Accepted`** — schema + CEL admission passed.
-- **`PoolResolved`** — `spec.inferencePoolRef` matched an `InferencePool` and `status.modelID` was derived; `False` with reason `PoolNotFound` otherwise.
+- **`PoolResolved`** — `spec.inferencePoolRef` matched an `InferencePool`; `False` with reason `PoolNotFound` otherwise.
 - **`InEffect`** — the policy is the resolved tier for at least one pool (`Superseded` otherwise).
+- **`Conflict`** — another policy in the namespace targets the same `inferencePoolRef.name` and won the deterministic tie-break; this one is ignored (see Conflict Detection).
 
-Duplicate `spec.inferencePoolRef.name` policies are rejected at admission by the uniqueness CEL rule, so they never reach status.
+`status.effectivePolicy` makes the merge observable; the `Conflict` condition surfaces duplicate-pool collisions that CEL cannot catch.
+
+### Forward Dependencies
+
+The core design — a namespaced CRD with three-tier name-based resolution and an observable `status.effectivePolicy` — stands on its own. Two referenced items are still in flight, and neither is load-bearing:
+
+- **Per-role `InferencePool`s** (the planned P/D direction). Interim: per-role config lives in the analyzer's `parameters`; if per-role pools never land, that `perRole` block simply stays — no redesign.
+- **The quota schema (#1162).** Quota is absent until #1162 lands; the CRD reserves nothing for it now. If #1162 changes shape, only the not-yet-present `spec.quota` is affected.
+
+If either future shifts, the residue is contained — an analyzer `perRole` block, or an absent quota field — not a change to the policy surface.
 
 ---
 
@@ -243,7 +286,8 @@ The tool maps the cluster-default ConfigMap entries to a system-namespace `Scali
 
 **Deliverables:**
 - `ScalingPolicy` CRD under `scaling.llm-d.ai/v1alpha1` with the full schema covering today's three policy ConfigMaps
-- CEL validation rules: `spec.inferencePoolRef.name` uniqueness within a namespace; `limiters`/`optimizer`/`quota` permitted only on the cluster default
+- CEL rules for single-object constraints (`limiters` and `quota` only on the cluster default); **controller-side** conflict detection for duplicate `inferencePoolRef` within a namespace (deterministic winner + `Conflict` status condition — cross-object uniqueness can't be CEL)
+- `status.effectivePolicy` + `status.sources` published per resolved policy (the observable merge result)
 - `PolicyResolver` performing the three-tier lookup; controller reads from CRDs if present, falls back to ConfigMaps otherwise
 - Per-pool effective-policy resolution surfaced via `kubectl get scalingpolicy` and a `wva-config explain <pool>` command (no write-back to `ScaledObject`/`HPA`)
 - `--system-namespace` controller flag (default `workload-variant-autoscaler-system`)

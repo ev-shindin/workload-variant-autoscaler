@@ -160,7 +160,7 @@ Same as D, plus ~5 annotations on `ScaledObject`/`HPA` for the most-changed knob
 | GitOps-friendly for steady-state; incident-friendly for overrides. | Two precedence rules to document. |
 | Discovery and policy decoupled. | More to test. |
 
-**Verdict.** Strong if compatibility with operator habits matters; carries permanent two-surface complexity to win one ergonomic property (faster emergency pause). The CRD's `spec.paused` field + a tight reconcile loop subsumes that ergonomic.
+**Verdict.** Strong if compatibility with operator habits matters; carries permanent two-surface complexity to win one ergonomic property (faster emergency pause). A tight reconcile loop subsumes that ergonomic without a separate annotation.
 
 ### F. `InferencePool` annotations (Gateway API inference extension)
 
@@ -276,7 +276,7 @@ The matrix below compares each shortlisted alternative against the dimensions th
 | K8s-native RBAC for governance | ❌ (ConfigMaps) | ❌ | ❌ | ✅ | ✅ | ❌ (single object) | ✅ | ✅ |
 | Cross-cutting changes | ConfigMap edit | ConfigMap edit | touch every `ScaledObject` | one CRD edit | one CRD edit | one map edit (bottleneck) | one selector edit | one Kustomize patch |
 | GitOps merge isolation | partial | partial | ✅ per object | ✅ per object | ✅ per object | ❌ (singleton conflicts) | ✅ per object | ✅ per object |
-| Emergency pause | edit ConfigMap, wait | edit ConfigMap, wait | annotation edit | CRD edit | annotation edit | edit singleton, wait | CRD edit | CRD edit (`spec.paused`) |
+| Emergency pause | edit ConfigMap, wait | edit ConfigMap, wait | annotation edit | CRD edit | annotation edit | edit singleton, wait | CRD edit | CRD edit |
 | Per-GPU-type quota | ❌ (out of scope) | ❌ | ❌ | ✅ (in CRD) | ✅ | ✅ | ✅ | ✅ |
 | Per-pool granularity (post-transition per-role) | ❌ | ❌ | partial (inferencePoolRef annotation) | partial | partial | partial | ✅ (selector) | ✅ (inferencePoolRef) |
 | Composes with VA CRD deprecation | yes | yes | yes | yes | yes | yes | yes | yes |
@@ -321,11 +321,11 @@ The proposal records the final design. The decisions below capture *why* — and
 
 2. **One `ScalingPolicy` per pool — no top-level `spec.role`.** WVA scales the *pool*, not individual variants: variant cost/hardware/capacity differences are resolved by the optimizer (optimizer inputs, not policy axes), so there is no per-variant field. The one sub-pool axis with a genuine policy difference is **role** (prefill vs decode), but those are *analyzer knobs* — expressed inside `spec.analyzers[*].parameters` (the v2 saturation analyzer already computes per-role), not a second policy object or a top-level field. It is transitional: the platform direction is a separate `InferencePool` per role, after which one policy per pool gives per-role policy for free. (Earlier drafts used a top-level `spec.role`; dropped per review.)
 
-3. **Effective policy is a property of the pool, surfaced off-workload.** WVA stays read-only on `ScaledObject`/`HPA` (no annotation write-back), consistent with the VA CRD deprecation. The merged result is inspected via `wva-config explain` / `kubectl get scalingpolicy`; `ScalingPolicy.status` carries only the policy object's own conditions. An earlier draft wrote `effective-policy` annotations onto the workload; dropped, because policy is pool-scoped (not per-workload) and WVA must not mutate tenant-owned objects.
+3. **Effective policy is a property of the pool, published on the CRD's status.** The merged result is written to `status.effectivePolicy` (with `status.sources`) on the resolved policy object, so `kubectl get scalingpolicy -o yaml` shows what's in force and which tiers produced it; `wva-config explain` pretty-prints the same. WVA stays read-only on `ScaledObject`/`HPA` (no annotation write-back). An earlier draft wrote `effective-policy` annotations onto the workload; dropped, because policy is pool-scoped (not per-workload) and WVA must not mutate tenant-owned objects — publishing on WVA's own CRD status avoids both, and makes the three-tier merge observable.
 
 4. **Cluster default is optional.** An earlier draft made it mandatory (refuse-to-start) because it was the only home for quota. With quota deferred (decision 7), an absent cluster default falls through to built-in threshold defaults; it becomes required only for installs that use quota.
 
-5. **CEL uniqueness rejects duplicate `spec.inferencePoolRef.name` at admission.** A pool carries at most one policy. Feasible because the llm-d stack's K8s floor (1.32+ via the inference extension's "last three minors" policy) is well above CEL's 1.29 GA.
+5. **Cross-object uniqueness is controller-enforced, not CEL.** CEL `x-kubernetes-validations` validates a single object against itself and can't see the other `ScalingPolicy` objects, so the controller handles duplicate `inferencePoolRef.name`: it picks a deterministic winner (oldest `creationTimestamp`, ties by name) and sets a `Conflict` status condition on the rest — no admission webhook. CEL still enforces the *single-object* rules (cluster-default-only fields); it's GA since K8s 1.29, below the stack's 1.32+ floor.
 
 6. **Pluggable parts follow EPP's `{type, name, parameters}` shape**, with per-plugin `parameters` as `x-kubernetes-preserve-unknown-fields` (validated at load), so a new analyzer or limiter plugs in with no CRD change. Cardinality: `analyzers` is a list (merged by `name` across tiers, tenant-tunable); `limiters` is a list that composes as a chain (instance-wide, cluster-default tier). The **optimizer is a single, fixed stage** — not selected and not in the schema; its mode is internal (cost-minimizing when unconstrained, fair-sharing by `priority` when a limiter binds — the cost-aware/greedy split is an implementation detail). Nothing to configure on it today; a `spec.optimizer` block can be added later if real knobs emerge.
 
