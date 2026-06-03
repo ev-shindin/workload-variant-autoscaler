@@ -263,6 +263,78 @@ var _ = Describe("CostAwareOptimizer", func() {
 			Expect(dm["mid"].TargetReplicas).To(Equal(2))
 			Expect(dm["cheap"].TargetReplicas).To(Equal(1))
 		})
+
+		It("should shed only the role with spare for disaggregated models", func() {
+			// Prefill is saturated (zero role spare) and is the more expensive role;
+			// decode has spare. Model-level SpareCapacity aggregates both roles, so a
+			// role-blind scale-down would trim the expensive prefill. Role-aware
+			// scale-down must leave the saturated prefill untouched and shed decode.
+			requests := []ModelScalingRequest{
+				{
+					ModelID:   "model-1",
+					Namespace: "default",
+					Result: &interfaces.AnalyzerResult{
+						SpareCapacity: 20000, // aggregate (decode's spare) — gates scale-down
+						VariantCapacities: []interfaces.VariantCapacity{
+							{VariantName: "prefill", Role: "prefill", Cost: 15.0, ReplicaCount: 2, PerReplicaCapacity: 10000},
+							{VariantName: "decode", Role: "decode", Cost: 5.0, ReplicaCount: 3, PerReplicaCapacity: 10000},
+						},
+						RoleCapacities: map[string]interfaces.RoleCapacity{
+							"prefill": {Role: "prefill", SpareCapacity: 0},
+							"decode":  {Role: "decode", SpareCapacity: 20000},
+						},
+					},
+					VariantStates: []interfaces.VariantReplicaState{
+						{VariantName: "prefill", Role: "prefill", CurrentReplicas: 2},
+						{VariantName: "decode", Role: "decode", CurrentReplicas: 3},
+					},
+				},
+			}
+
+			decisions := optimizer.Optimize(ctx, requests, nil)
+			dm := decisionMap(decisions)
+
+			// Prefill (saturated role) is never trimmed despite being most expensive.
+			Expect(dm["prefill"].TargetReplicas).To(Equal(2))
+			Expect(dm["prefill"].Action).To(Equal(interfaces.ActionNoChange))
+			// Decode sheds its own spare: floor(20000/10000)=2 → 3 - 2 = 1.
+			Expect(dm["decode"].TargetReplicas).To(Equal(1))
+			Expect(dm["decode"].Action).To(Equal(interfaces.ActionScaleDown))
+		})
+
+		It("should shed each role by its own spare when both have slack", func() {
+			// Both roles have spare, but different amounts. Each role must shed by
+			// its own per-role spare, not the aggregate.
+			requests := []ModelScalingRequest{
+				{
+					ModelID:   "model-1",
+					Namespace: "default",
+					Result: &interfaces.AnalyzerResult{
+						SpareCapacity: 30000, // aggregate — gates scale-down
+						VariantCapacities: []interfaces.VariantCapacity{
+							{VariantName: "prefill", Role: "prefill", Cost: 5.0, ReplicaCount: 3, PerReplicaCapacity: 10000},
+							{VariantName: "decode", Role: "decode", Cost: 5.0, ReplicaCount: 3, PerReplicaCapacity: 10000},
+						},
+						RoleCapacities: map[string]interfaces.RoleCapacity{
+							"prefill": {Role: "prefill", SpareCapacity: 10000}, // 1 replica
+							"decode":  {Role: "decode", SpareCapacity: 20000},  // 2 replicas
+						},
+					},
+					VariantStates: []interfaces.VariantReplicaState{
+						{VariantName: "prefill", Role: "prefill", CurrentReplicas: 3},
+						{VariantName: "decode", Role: "decode", CurrentReplicas: 3},
+					},
+				},
+			}
+
+			decisions := optimizer.Optimize(ctx, requests, nil)
+			dm := decisionMap(decisions)
+
+			// prefill sheds floor(10000/10000)=1 → 3 - 1 = 2.
+			Expect(dm["prefill"].TargetReplicas).To(Equal(2))
+			// decode sheds floor(20000/10000)=2 → 3 - 2 = 1.
+			Expect(dm["decode"].TargetReplicas).To(Equal(1))
+		})
 	})
 
 	Context("Steady State", func() {

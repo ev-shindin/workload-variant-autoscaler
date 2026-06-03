@@ -121,29 +121,58 @@ func costAwareScaleUp(
 	}
 }
 
-// costAwareScaleDown removes replicas from the most expensive variant.
-// Sorts by absolute cost descending, removes from most expensive first.
-// Respects minReplicas per variant — will not scale below the annotation floor.
-// The cheapest variant is protected at min 1 replica only when no other variant
-// has replicas — this prevents scale-down deadlocks where the expensive variant's
-// per-replica capacity exceeds spare but cheaper replicas could be removed.
+// costAwareScaleDown removes replicas to shed spare capacity, most-expensive
+// variant first, respecting minReplicas.
+//
+// For disaggregated (prefill/decode) models it sheds each role independently
+// against that role's own spare. Prefill and decode capacity are not fungible, so
+// removing by the model-level SpareCapacity — which aggregates all roles — would
+// let a role with slack drive removal of replicas from a saturated role (e.g.
+// trimming prefill because decode has spare). RoleCapacities is non-nil only when
+// disaggregation is active; non-disaggregated models keep the model-level shed.
 func costAwareScaleDown(
 	ctx context.Context,
 	result *interfaces.AnalyzerResult,
 	targets map[string]int,
 	stateMap ...map[string]interfaces.VariantReplicaState,
 ) {
-	logger := ctrl.LoggerFrom(ctx)
-
-	sorted := sortByCostDesc(result.VariantCapacities)
-	cheapest := findCheapestVariant(result.VariantCapacities)
-	remaining := result.SpareCapacity
-
-	// Build state lookup if provided
 	var states map[string]interfaces.VariantReplicaState
 	if len(stateMap) > 0 {
 		states = stateMap[0]
 	}
+
+	if len(result.RoleCapacities) > 0 {
+		// Each role owns a disjoint set of variants and sheds against its own
+		// spare, so the map's iteration order does not affect the outcome.
+		for role, rc := range result.RoleCapacities {
+			if rc.SpareCapacity <= 0 {
+				continue // saturated or under-supplied role — never trim it
+			}
+			scaleDownVariantSet(ctx, variantsForRole(result.VariantCapacities, role), rc.SpareCapacity, targets, states)
+		}
+		return
+	}
+
+	scaleDownVariantSet(ctx, result.VariantCapacities, result.SpareCapacity, targets, states)
+}
+
+// scaleDownVariantSet removes replicas from the given variant set, most-expensive
+// first, until `spare` capacity is shed or each variant's minReplicas floor is
+// reached. The cheapest variant in the set is protected at one replica when it
+// would otherwise be the last variant with replicas in the set — preventing a
+// scale-to-zero deadlock.
+func scaleDownVariantSet(
+	ctx context.Context,
+	variants []interfaces.VariantCapacity,
+	spare float64,
+	targets map[string]int,
+	states map[string]interfaces.VariantReplicaState,
+) {
+	logger := ctrl.LoggerFrom(ctx)
+
+	sorted := sortByCostDesc(variants)
+	cheapest := findCheapestVariant(variants)
+	remaining := spare
 
 	for _, vc := range sorted {
 		if remaining <= 0 {
@@ -164,10 +193,10 @@ func costAwareScaleDown(
 		}
 		if vc.VariantName == cheapest {
 			// Protect cheapest at 1 only if it's the last variant with replicas
-			// and no higher annotation min is set
+			// in the set and no higher annotation min is set
 			otherHasReplicas := false
-			for name, t := range targets {
-				if name != cheapest && t > 0 {
+			for _, other := range variants {
+				if other.VariantName != cheapest && targets[other.VariantName] > 0 {
 					otherHasReplicas = true
 					break
 				}
@@ -198,6 +227,24 @@ func costAwareScaleDown(
 			"removed", replicasToRemove,
 			"cost", vc.Cost)
 	}
+}
+
+// variantsForRole returns the capacities whose role matches exactly (an empty
+// role is treated as "both"). Unlike filterVariantCapacitiesByRole, which treats
+// "both" as a wildcard for scale-up allocation, this matches the role exactly so
+// per-role scale-down operates on disjoint variant sets.
+func variantsForRole(capacities []interfaces.VariantCapacity, role string) []interfaces.VariantCapacity {
+	out := make([]interfaces.VariantCapacity, 0, len(capacities))
+	for _, vc := range capacities {
+		r := vc.Role
+		if r == "" {
+			r = interfaces.RoleBoth
+		}
+		if r == role {
+			out = append(out, vc)
+		}
+	}
+	return out
 }
 
 // buildStateMap creates a lookup map from variant name to VariantReplicaState.
