@@ -4,25 +4,25 @@
 
 ## Problem Statement
 
-WVA configuration is spread across six layers: four ConfigMaps (`wva-variantautoscaling-config`, `wva-saturation-scaling-config`, `wva-queueing-model-config`, `wva-model-scale-to-zero-config`), the `VariantAutoscaling` CRD spec, annotations on `ScaledObject`/`HPA`/Namespace, ~25 environment variables, Kustomize overlays, and implicit surfaces like hardcoded `ServiceMonitor` names. Each surface was added for a good reason at the time. The net result is roughly 60 distinct configuration knobs scattered across six locations, with no single way to discover, validate, or override them.
+WVA configuration is spread across six layers: four ConfigMaps (`wva-variantautoscaling-config`, `wva-saturation-scaling-config`, `wva-queueing-model-config`, `wva-model-scale-to-zero-config`), the `VariantAutoscaling` CRD spec, annotations on `ScaledObject`/`HPA`/Namespace, ~25 environment variables, Kustomize overlays, and implicit surfaces like hardcoded `ServiceMonitor` names — roughly 60 knobs across six locations.
+
+These knobs are **heterogeneous and rightly live in different places**: some are per-controller and install-time (e.g. Prometheus base URL — never overridden at a finer grain), others are **per-pool scaling policy** that's frequently tuned (e.g. the KV-cache threshold — a strong desire to override it per pool). This proposal does **not** seek to unify all 60 or give them one override path. The problem it targets is narrower: the **scaling-policy** knobs — roughly 15–20 parameters (saturation thresholds, analyzer selection and weights, scale-to-zero, queueing-model SLO targets, scale bounds), not the full 60 — are themselves split across three of those ConfigMaps (`wva-saturation-scaling-config`, `wva-queueing-model-config`, `wva-model-scale-to-zero-config`), the VA spec, and annotations, with inconsistent override semantics and validation. The rest (infrastructure env vars/flags, discovery) stay where they are.
 
 An operator asking "what policy applies to model `granite-13b` in namespace `prod`?" must inspect a global ConfigMap, a possible namespace-local override of the same ConfigMap, a separate scale-to-zero ConfigMap, the queueing-model ConfigMap, annotations on the `ScaledObject`, fields on the VA CRD, and environment variables on the controller. No single `kubectl` command returns the effective policy.
 
-Validation is also uneven — though admission *timing* is no longer the real differentiator. Since `ValidatingAdmissionPolicy` went GA (K8s 1.30), ConfigMaps and annotations *can* be admission-validated in-process with CEL, no webhook needed. What a typed CRD adds over that is structure: natively typed fields (int, enum, required, defaulted), `kubectl explain` discoverability, and OpenAPI + CEL co-located on the schema. A `ValidatingAdmissionPolicy` over ConfigMap `data`/annotations validates opaque strings against a shape defined elsewhere — admission checks without the typing, discoverability, or defaulting. Absent such a policy today, ConfigMap typos surface in controller logs and annotation typos after creation.
+Validation is a gap today, but not a differentiator. The policy ConfigMaps and annotations currently have no admission validation, so a bad threshold or a typo'd key is caught late — in controller logs at runtime, or (for some fields) silently defaulted, never rejected at `kubectl apply`. That gap is closeable either way: ConfigMaps and annotations *can* be admission-validated with a `ValidatingAdmissionPolicy` (GA in K8s 1.30, CEL, no webhook). The CRD's actual edge is **structure**, not validation — typed and defaulted fields, `kubectl explain` discoverability, OpenAPI + CEL co-located on the schema — plus collapsing the scattered policy surfaces into one (a `ValidatingAdmissionPolicy` closes the validation gap but leaves the sprawl).
 
-Anticipated growth makes this worse, not better. Issue #1002 will add another configuration surface for quotas. PR #1052 already added per-analyzer thresholds. The companion VA CRD deprecation pushes *more* config into annotations. Without a deliberate shape, surface count grows monotonically.
+Anticipated growth makes this worse: absent a deliberate shape, each new feature tends to land as **yet another ConfigMap** — a genuinely new surface (quota, #1002, is next in line) — and that is the trend this proposal interrupts. Adding *keys* (ConfigMap fields or annotations) doesn't add a surface; a new ConfigMap does. (PR #1052, for instance, added per-analyzer thresholds to the *existing* saturation ConfigMap — more knobs, same surface.)
 
-This proposal introduces a single typed CRD as the source of truth for scaling policy, while leaving discovery on annotations (per the VA CRD deprecation) and infrastructure config on env vars / Kustomize. Three configuration domains, three surfaces, no overlap.
+This proposal introduces a single typed CRD as the source of truth for scaling policy, while leaving discovery on annotations and infrastructure config on env vars / Kustomize. Three configuration domains, three surfaces, no overlap.
 
-The day-1 value stands on its own, independent of quota (deferred to #1162): the four policy ConfigMaps collapse into one typed `ScalingPolicy` CRD — admission-validated (OpenAPI + CEL), discoverable via `kubectl explain`, resolved through a single three-tier precedence — replacing scattered, parse-time-validated maps with one inspectable surface.
-
-> The sprawl above is independent of the VA CRD deprecation. The companion `docs/proposals/deprecate-va-crd.md` moves *discovery* to annotations on `ScaledObject`/`HPA` but not *policy*; this proposal picks up policy where that leaves off. The deprecation only adds urgency, by pushing yet more config into annotations.
+The day-1 value stands on its own, independent of quota (deferred to #1162): the three policy ConfigMaps collapse into one typed `ScalingPolicy` CRD — admission-validated (OpenAPI + CEL), discoverable via `kubectl explain`, resolved through a single three-tier precedence — replacing scattered, parse-time-validated maps with one inspectable surface.
 
 ---
 
 ## Design Philosophy
 
-Three configuration domains, three surfaces. Each surface has one purpose, one owner, one precedence rule. (These *domains* — what kind of config — are distinct from the resolution *tiers* (cluster / namespace / pool) introduced below.)
+Three configuration domains across three surfaces — discovery annotations, the `ScalingPolicy` CRD, and infrastructure (env vars / Kustomize). Each surface has one purpose and one precedence rule; on the `ScalingPolicy` CRD the resolution *tier* decides the owner (tenant at the namespace/pool tiers, cluster admin at the cluster default). (Domains — *what kind* of config — are distinct from the resolution tiers introduced below.)
 
 ### Personas
 
@@ -44,23 +44,24 @@ This split assumes a shared, cluster-scoped install. In a namespace-scoped insta
 
 Discovery and per-pool/namespace policy are tenant-owned because each tenant knows their own workloads. The cluster-default tier — limiters, optimizer, quota — is cluster-admin-owned because those are platform-wide. It is the **same `ScalingPolicy` CRD**; the tier decides the owner, and namespace RBAC enforces the split (cluster admins write the system namespace, tenants write their own). Infrastructure is install-time because it doesn't change per-workload.
 
-**Single configuration surface.** The aim is that, after the VA CRD deprecation, `ScalingPolicy` is the *one* place a user configures WVA scaling. The only WVA-specific things left on the `ScaledObject`/`HPA` are the discovery **label** (`llm-d.ai/managed`, a label not an annotation — per #1130) and the few per-workload annotations that aren't derivable (`variant-cost`, `role`) — not policy. New configuration, including quota's eventual surface, belongs in `ScalingPolicy`, not in another ConfigMap.
+**Single configuration surface.** The aim is that `ScalingPolicy` is the *one* place a user configures WVA scaling. The only WVA-specific things left on the `ScaledObject`/`HPA` are the discovery **label** (`llm-d.ai/managed`, a label not an annotation — per #1130) and the few per-workload annotations that aren't derivable (`variant-cost`, `role`) — not policy. New configuration, including quota's eventual surface, belongs in `ScalingPolicy`, not in another ConfigMap.
 
 ---
 
 ## Goals
 
-1. A single **authoring** source of truth for scaling policy — one place to define it, not six surfaces
+1. A single **authoring** source of truth for scaling policy — one place to define it, instead of three policy ConfigMaps + the VA spec + annotations
 2. A single **inspectable effective policy** for any workload — one command returns what's in force (the precedence rule and tooling are described in Proposed Solution)
-3. Config errors are caught at `kubectl apply`, not in controller logs at runtime — every common field is admission-validated (via OpenAPI + CEL); extensible analyzer/limiter parameters validate at load (see [Schema](#schema-scaling-engine-configuration))
+3. Config errors are caught at `kubectl apply`, not in controller logs at runtime — fields are natively typed and admission-validated (OpenAPI + CEL on the schema), not opaque strings; extensible analyzer/limiter parameters validate at load (see [Schema](#schema-scaling-engine-configuration))
 4. A tenant cannot change another namespace's policy (nor, once quota lands per #1162, raise their own GPU cap) — the governance split is enforced by native K8s RBAC, with no custom admission code
-5. New analyzers and limiters (e.g. the throughput analyzer, #1052) and the VA CRD deprecation compose without a schema redesign
+5. New analyzers and limiters (e.g. the throughput analyzer, #1052) compose without a schema redesign
 
 ## Non-Goals
 
 - Replacing infrastructure config (Prometheus URL, TLS, leader election) — those stay in env vars / Kustomize
-- Replacing variant-discovery annotations from the VA CRD deprecation
+- Replacing the discovery annotations on `ScaledObject`/`HPA` — those stay
 - Removing ConfigMaps in one shot — a non-breaking phased rollout is part of the plan
+- A single override or validation mechanism for *all* config — the 60 knobs are heterogeneous (per-controller vs per-pool), so each domain keeps its appropriate surface and validation: CRD admission for policy, startup/env validation for infrastructure. The aim is one surface *per concern*, not one surface for everything
 - Multi-cluster federation, custom analyzer authoring UX, observability tuning — out of scope
 
 ---
@@ -134,7 +135,7 @@ Fields merge from cluster default → namespace default → per-pool override. S
 
 The namespace and cluster defaults double as **shareable scaling profiles**: common config defined once there applies across all pools in scope, and per-pool policies carry only the deltas — so sharing policy across pools needs no per-workload reference (an `HPA → ScalingPolicy` ref would instead put a WVA-specific field back on every workload). Sharing across an arbitrary *subset* of pools that doesn't align with namespace/cluster boundaries is the one case the tiers don't cover; if it's ever needed, a `labelSelector` on the `ScalingPolicy` (still policy→pools) is the extension — see Alternatives.
 
-The effective policy is a property of the **pool**, not of each variant or workload — WVA scales the pool, and the optimizer distributes replicas across the pool's variants (see [Per-Pool Keying and Roles](#per-pool-keying-and-roles)). WVA stays **read-only** on the `ScaledObject`/`HPA`: consistent with `deprecate-va-crd.md`, it never writes back to tenant-owned objects. The merged result is surfaced on demand by `kubectl get scalingpolicy` and `wva-config explain <pool>` (a proposed WVA CLI; see Migration), which pretty-prints the merged policy and its three sources — no manual traversal of the `HPA → … → ScalingPolicy` chain. The per-variant output remains the `wva_desired_replicas` metric, unchanged.
+The effective policy is a property of the **pool**, not of each variant or workload — WVA scales the pool, and the optimizer distributes replicas across the pool's variants (see [Per-Pool Keying and Roles](#per-pool-keying-and-roles)). WVA stays **read-only** on the `ScaledObject`/`HPA`: it never writes back to tenant-owned objects. The merged result is surfaced on demand by `kubectl get scalingpolicy` and `wva-config explain <pool>` (a proposed WVA CLI; see Migration), which pretty-prints the merged policy and its three sources — no manual traversal of the `HPA → … → ScalingPolicy` chain. The per-variant output remains the `wva_desired_replicas` metric, unchanged.
 
 ### Quota: Single Surface, Schema in #1162
 
@@ -189,8 +190,8 @@ Duplicate `spec.inferencePoolRef.name` policies are rejected at admission by the
 
 ## What Does NOT Change
 
-- Discovery via the `llm-d.ai/managed` **label** on `ScaledObject`/`HPA` (per the VA CRD deprecation; a label, not an annotation — see #1130)
-- Per-workload identity annotations (`llm-d.ai/variant-cost`, `llm-d.ai/role`) — `model-id` is the one exception, proposed for removal (see [Relationship to the VA CRD Deprecation](#relationship-to-the-va-crd-deprecation))
+- Discovery via the `llm-d.ai/managed` **label** on `ScaledObject`/`HPA` (a label, not an annotation — see #1130)
+- Per-workload identity annotations (`llm-d.ai/variant-cost`, `llm-d.ai/role`)
 - Namespace-level controls (`wva.llmd.ai/config-enabled`, `wva.llmd.ai/exclude`)
 - Infrastructure configuration (Prometheus URL, TLS, leader election, log level — still in env vars + Kustomize overlays)
 - vLLM/EPP metric collection and Prometheus queries
@@ -215,11 +216,11 @@ This proposal owns *policy*; the VA CRD deprecation (#1092) owns *discovery* and
 
 | Before | After |
 |---|---|
-| 4 ConfigMaps (`wva-*-config`) | 1+ `ScalingPolicy` objects |
+| 3 policy ConfigMaps (saturation, queueing-model, scale-to-zero) | 1+ `ScalingPolicy` objects |
 | Per-model overrides via `{modelID}#{namespace}` map keys | Per-pool `ScalingPolicy` objects, matched by `spec.inferencePoolRef` |
 | Threshold typos surface in controller logs | Threshold typos rejected at `kubectl apply` |
 | Quota planned as a separate ConfigMap (#1002) | Deferred to the dedicated quota proposal (#1162) |
-| Discoverability: read four ConfigMap YAMLs | `kubectl get scalingpolicy` / `wva-config explain <pool>` |
+| Discoverability: read three policy ConfigMaps | `kubectl get scalingpolicy` / `wva-config explain <pool>` |
 
 ### Migration Tool
 
@@ -274,9 +275,9 @@ The tool maps the cluster-default ConfigMap entries to a system-namespace `Scali
 
 ## Alternatives Considered
 
-1. **Status quo (4 ConfigMaps + CRD spec + annotations + env vars + Kustomize).** Defensible until the surface count exceeds operators' working memory. At six layers, the cumulative discoverability and validation cost outweighs the migration cost.
+1. **Status quo (4 ConfigMaps + CRD spec + annotations + env vars + Kustomize).** Defensible until the surface count exceeds operators' working memory. At six layers, the cumulative discoverability cost outweighs the migration cost.
 
-2. **Collapse the four ConfigMaps into one.** Cheap. Doesn't address validation timing or schema discoverability. Strictly worse than this proposal on every dimension except "ConfigMaps already exist."
+2. **Collapse the three policy ConfigMaps into one.** Cheap. Doesn't address validation timing or schema discoverability. Strictly worse than this proposal on every dimension except "ConfigMaps already exist."
 
 3. **Keep the ConfigMaps and add a `ValidatingAdmissionPolicy` for validation.** Closes the admission-validation gap without a new CRD — `ValidatingAdmissionPolicy` (GA in K8s 1.30) enforces CEL rules on ConfigMap `data` and annotations in-process, no webhook. But it leaves every other problem untouched: values stay opaque strings (no typing, no defaulting, no `kubectl explain`); the rules live in separate policy/binding objects that re-encode the ConfigMap shape by hand; and the six-surface sprawl and discoverability gap — the *real* problem — are unchanged. It buys admission timing at the cost of maintaining a parallel, untyped schema in CEL.
 
@@ -302,9 +303,9 @@ S1 (this proposal) compared with the alternatives above. Each cell summarises th
 
 | Property | A: status quo | B: one ConfigMap | C: flat annotations | D: two CRDs | E: D + annotations | S2: cluster CRD + selectors | **S1: this proposal** |
 |---|---|---|---|---|---|---|---|
-| Admission-time validation | ❌ | ❌ | ❌ | ✅ | partial | ✅ | ✅ |
+| Native typed + validated schema | ❌ | ❌ | ❌ | ✅ | partial | ✅ | ✅ |
 | Single source of truth | ❌ (6 layers) | partial | ✅ per workload | ✅ per scope | ✅ with precedence | ✅ | ✅ |
-| Kinds to learn for policy | 4 ConfigMaps | 1 ConfigMap | 0 (annotations only) | 2 CRDs | 2 CRDs + annotations | 1 CRD | 1 CRD |
+| Kinds to learn for policy | 3 ConfigMaps | 1 ConfigMap | 0 (annotations only) | 2 CRDs | 2 CRDs + annotations | 1 CRD | 1 CRD |
 | `kubectl explain` for policy | partial | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ |
 | K8s-native RBAC governance split | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ |
 | Cross-cutting changes | ConfigMap edit | ConfigMap edit | every `ScaledObject` | one CRD edit | one CRD edit | one selector edit | one Kustomize patch |
@@ -337,6 +338,6 @@ Three patterns recur across the peer set:
 
 1. **Two layers is the dominant shape.** Knative, KServe, and Kueue all run a cluster-defaulting layer plus a per-workload override layer. Single-layer designs (HPA, KEDA, AWS App Auto Scaling) force per-workload boilerplate.
 2. **Typed CRDs carry the heavy schema; annotations cover the hot knobs.** Knative is the closest analog to WVA's mix of analyzer thresholds and emergency overrides. The Knative community now actively *resists* growing the annotation list because each new annotation is a stringly-typed concept.
-3. **Discovery and policy are separate surfaces.** KEDA uses `ScaledObject` for both — the design WVA's VA CRD deprecation moves *toward*. Knative/KServe split discovery (`Service`/`InferenceService`) from policy (annotations + ConfigMap). The split shows up positively in retrospective analyses.
+3. **Discovery and policy are separate surfaces.** KEDA uses `ScaledObject` for both discovery and scaler config; Knative/KServe split discovery (`Service`/`InferenceService`) from policy (annotations + ConfigMap). The split shows up positively in retrospective analyses.
 
 The 2024-2026 direction is consistent: **typed CRDs for steady-state policy, annotations as a small escape valve, install-time config for infrastructure**. WVA's design tracks that direction with one departure — name-based three-tier lookup instead of selectors, because WVA's policy granularity is namespace-shaped not cluster-shaped, so selectors are unnecessary complexity.
