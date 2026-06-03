@@ -69,9 +69,7 @@ Discovery and per-pool/namespace policy are tenant-owned because each tenant kno
 
 ### One Namespaced CRD: `ScalingPolicy`
 
-A single namespaced CRD under `scaling.llm-d.ai/v1alpha1` carries every scaling-policy setting. The match key is `spec.inferencePoolRef` — a `LocalObjectReference` to the `InferencePool` (defined by the Gateway API Inference Extension, `gateway-api-inference-extension`) whose pods the policy applies to. WVA runs as part of the llm-d stack, which ships the inference extension, so `InferencePool` is available to watch.
-
-Tenants never type model identifiers into a policy spec. `status.modelID` plays no part in resolution — matching is by pool. The WVA controller derives it from the referenced pool and exposes it via a `+kubebuilder:printcolumn` (display-only) so `kubectl get scalingpolicy -n production` shows both the matched pool and the model.
+A single namespaced CRD under `scaling.llm-d.ai/v1alpha1` carries every scaling-policy setting. The match key is `spec.inferencePoolRef` — a `LocalObjectReference` to the `InferencePool` (defined by the Gateway API Inference Extension, `gateway-api-inference-extension`) whose pods the policy applies to. The policy points at the pool, so the workload's `ScaledObject`/`HPA` carries no WVA-specific reference — consistent with the single-surface goal.
 
 ```yaml
 apiVersion: scaling.llm-d.ai/v1alpha1
@@ -89,8 +87,6 @@ spec:
     - type: saturation
       parameters:
         scaleUpThreshold: 0.95
-status:
-  modelID: ibm/granite-13b            # derived by controller
 ```
 
 The WVA controller discovers which `InferencePool` a workload's pods belong to by watching `InferencePool` objects (from the Gateway API Inference Extension, `gateway-api-inference-extension`, which defines `InferencePool`) and matching their `spec.selector` against the workload's pod template labels. Tenants do not author the pool-to-workload mapping; the controller derives it from the inference-extension API.
@@ -135,6 +131,8 @@ For each workload, the controller resolves a policy via three deterministic look
 3. **Cluster default** — `ScalingPolicy` in the system namespace (default `workload-variant-autoscaler-system`, configurable via `--system-namespace`) with `spec.inferencePoolRef` absent.
 
 Fields merge from cluster default → namespace default → per-pool override. Scalars: higher tier wins if set. Maps: overlay per key. Lists with a natural identifier (`spec.analyzers[*]` keyed by `name`): merge by name — lower-tier entries inherited unless the higher tier overrides them, higher-tier entries added when no lower-tier match exists. Lists without an identifier: replace wholesale. (`limiters` and `optimizer` live only on the cluster default, so they aren't merged across tiers.)
+
+The namespace and cluster defaults double as **shareable scaling profiles**: common config defined once there applies across all pools in scope, and per-pool policies carry only the deltas — so sharing policy across pools needs no per-workload reference (an `HPA → ScalingPolicy` ref would instead put a WVA-specific field back on every workload). Sharing across an arbitrary *subset* of pools that doesn't align with namespace/cluster boundaries is the one case the tiers don't cover; if it's ever needed, a `labelSelector` on the `ScalingPolicy` (still policy→pools) is the extension — see Alternatives.
 
 The effective policy is a property of the **pool**, not of each variant or workload — WVA scales the pool, and the optimizer distributes replicas across the pool's variants (see [Per-Pool Keying and Roles](#per-pool-keying-and-roles)). WVA stays **read-only** on the `ScaledObject`/`HPA`: consistent with `deprecate-va-crd.md`, it never writes back to tenant-owned objects. The merged result is surfaced on demand by `kubectl get scalingpolicy` and `wva-config explain <pool>` (a proposed WVA CLI; see Migration), which pretty-prints the merged policy and its three sources — no manual traversal of the `HPA → … → ScalingPolicy` chain. The per-variant output remains the `wva_desired_replicas` metric, unchanged.
 
