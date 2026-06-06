@@ -20,7 +20,7 @@ This proposal evaluates the alternatives — including native Kubernetes primiti
 - Cap GPUs per accelerator type at cluster and/or namespace scope, declared by the operator.
 - Enforce the cap at scaling-decision time so WVA never *requests* more replicas than allowed. Precisely, the guarantee is: **WVA never sets a desired replica count whose cumulative per-type GPU request would exceed the cap**, so WVA's own scaling decisions never create quota-exhaustion `Pending` pods. It is *not* a guarantee that pods never go `Pending` for non-quota reasons (another tenant consuming shared capacity, or physical exhaustion below the quota) — `min(physical, quota)` bounds those but cannot eliminate them.
 - Compose cleanly with the existing `TypeInventory` so physical capacity remains an upper bound (sub-issue #1003). `TypeInventory` is re-read from node discovery each cycle, so `min(physical, quota)` tracks node add/drain automatically — the quota only ever lowers the live physical bound.
-- Support an explicit "unlimited" sentinel and an "exclude this namespace" affordance for system tenants. An excluded namespace is *not capped*, but its GPU usage still counts against physical capacity, by mechanism: `TypeInventory` computes `Available = allocatable − Used` (`type_inventory.go`), and `Used` comes from `DiscoverUsage`, which sums GPU requests across **all** pods cluster-wide with no namespace filter (`k8s_with_gpu_operator.go`) — so an excluded namespace's pods reduce available physical and the cluster aggregate cannot overcommit. (Exclusion removes the *cap*, not the *accounting*. This holds wherever physical discovery is available; in quota-only mode — no readable nodes/pods, per §1 — quota is the sole bound by design, so there is no physical figure to overcommit against.)
+- Support an explicit "unlimited" sentinel and an "exclude this namespace" affordance for system tenants. An excluded namespace is *not capped*, but its GPU usage still counts against physical capacity — exclusion removes the *cap*, not the *accounting*, so the cluster aggregate cannot overcommit (mechanism in §3.A).
 - Work on any conformant Kubernetes distribution — no OpenShift-only or vendor-only dependencies.
 - Provide a clear DecisionStep trace when the cap binds.
 
@@ -50,7 +50,9 @@ Operator-declared YAML/ConfigMap, parsed into `QuotaLimiterEntries`, enforced vi
 | Dependencies | Zero new operators / CRDs / admission webhooks |
 | Status | Prototype on `feat/quota-limiter`, 8 commits, 50+ Ginkgo specs |
 
-**Within a cycle, quota is a snapshot.** WVA reads the cap **once at the start of each optimize cycle** and decrements it in memory as it allocates across models, so every model in that cycle draws from one consistent budget — two models cannot both claim the last GPU. It does **not** re-read quota from the API between per-model decisions within a cycle (that would be racy and order-dependent); the next cycle re-reads the fresh cap. This is the same per-cycle snapshot discipline `TypeInventory` already uses for physical capacity.
+**Within a cycle, quota is a snapshot.** WVA reads the cap **once at the start of each optimize cycle** and decrements it in memory as it allocates across models, so every model in that cycle draws from one consistent budget — two models cannot both claim the last GPU. It does **not** re-read quota from the API between per-model decisions within a cycle (that would be racy and order-dependent); the next cycle re-reads the fresh cap. This is the same per-cycle snapshot discipline `TypeInventory` already uses for physical capacity. When a cluster aggregate spans namespaces, the *order* in which models draw it down within the cycle is the contention case discussed in §6.3.
+
+**Physical accounting (and excluded namespaces).** The physical bound the quota composes with is `Available = allocatable − Used`, where `Used` comes from `DiscoverUsage` (`k8s_with_gpu_operator.go`) — a sum of GPU requests across **all** pods cluster-wide, with no namespace filter. So a namespace *excluded* from the quota still has its pods counted against available physical, and the cluster aggregate cannot overcommit. This holds wherever physical discovery is available; in quota-only mode (no readable nodes/pods, §1) quota is the sole bound by design, so there is no physical figure to overcommit against.
 
 ### A2. WVA `ResourceQuotaReader` (WVA consumes K8s-native `ResourceQuota`)
 
@@ -212,7 +214,7 @@ Use the existing autoscaler's `maxReplicas` as a per-variant cap.
 - **Requirement 5, decision-time enforcement, is not invented — it is #1002's own framing clause made measurable.** #1002 asks for caps *"enforced by the WVA scaling pipeline"* (§1); a cap enforced at *pod admission* (by the kube-apiserver) is by definition **not** enforced by the WVA pipeline. The anticipated-capacity trap (§3.D) is what that distinction costs in practice.
 - **Requirement 6, works on any conformant K8s,** is the portability bar this project holds for every feature (no OS-vendor or K8s-version binding).
 
-The grid scores every concrete option against both groups (✅ satisfies, ~ partial, ❌ fails):
+The grid below re-projects the decision-relevant rows of the §4 matrix into #1002's acceptance framing — §4 is the full capability comparison; this is the *verdict against the criteria*. It scores every concrete option against both groups (✅ satisfies, ~ partial, ❌ fails):
 
 | Requirement | A | A2 | B | B2 | C | D | H |
 |---|:--:|:--:|:--:|:--:|:--:|:--:|:--:|
