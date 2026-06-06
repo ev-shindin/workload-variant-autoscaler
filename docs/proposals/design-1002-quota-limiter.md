@@ -18,9 +18,9 @@ This proposal evaluates the alternatives — including native Kubernetes primiti
 
 **Goals.**
 - Cap GPUs per accelerator type at cluster and/or namespace scope, declared by the operator.
-- Enforce the cap at scaling-decision time so WVA never *requests* more replicas than allowed.
+- Enforce the cap at scaling-decision time so WVA never *requests* more replicas than allowed. Precisely, the guarantee is: **WVA never sets a desired replica count whose cumulative per-type GPU request would exceed the cap**, so WVA's own scaling decisions never create quota-exhaustion `Pending` pods. It is *not* a guarantee that pods never go `Pending` for non-quota reasons (another tenant consuming shared capacity, or physical exhaustion below the quota) — `min(physical, quota)` bounds those but cannot eliminate them.
 - Compose cleanly with the existing `TypeInventory` so physical capacity remains an upper bound (sub-issue #1003). `TypeInventory` is re-read from node discovery each cycle, so `min(physical, quota)` tracks node add/drain automatically — the quota only ever lowers the live physical bound.
-- Support an explicit "unlimited" sentinel and an "exclude this namespace" affordance for system tenants. An excluded namespace is *not capped*, but its GPU usage still counts against physical capacity (exclusion removes the cap, not the accounting), so the cluster aggregate cannot overcommit.
+- Support an explicit "unlimited" sentinel and an "exclude this namespace" affordance for system tenants. An excluded namespace is *not capped*, but its GPU usage still counts against physical capacity, by mechanism: `TypeInventory` computes `Available = allocatable − Used` (`type_inventory.go`), and `Used` comes from `DiscoverUsage`, which sums GPU requests across **all** pods cluster-wide with no namespace filter (`k8s_with_gpu_operator.go`) — so an excluded namespace's pods reduce available physical and the cluster aggregate cannot overcommit. (Exclusion removes the *cap*, not the *accounting*. This holds wherever physical discovery is available; in quota-only mode — no readable nodes/pods, per §1 — quota is the sole bound by design, so there is no physical figure to overcommit against.)
 - Work on any conformant Kubernetes distribution — no OpenShift-only or vendor-only dependencies.
 - Provide a clear DecisionStep trace when the cap binds.
 
@@ -49,6 +49,8 @@ Operator-declared YAML/ConfigMap, parsed into `QuotaLimiterEntries`, enforced vi
 | Failure mode | Decision capped at quota; emits `DecisionStep` with `limited by quota[…]` |
 | Dependencies | Zero new operators / CRDs / admission webhooks |
 | Status | Prototype on `feat/quota-limiter`, 8 commits, 50+ Ginkgo specs |
+
+**Within a cycle, quota is a snapshot.** WVA reads the cap **once at the start of each optimize cycle** and decrements it in memory as it allocates across models, so every model in that cycle draws from one consistent budget — two models cannot both claim the last GPU. It does **not** re-read quota from the API between per-model decisions within a cycle (that would be racy and order-dependent); the next cycle re-reads the fresh cap. This is the same per-cycle snapshot discipline `TypeInventory` already uses for physical capacity.
 
 ### A2. WVA `ResourceQuotaReader` (WVA consumes K8s-native `ResourceQuota`)
 
@@ -122,7 +124,7 @@ Per-model quotas drop out naturally if the admin defines a `DeviceClass` per mod
 | Works alongside the existing device plugin via the Extended-Resource ↔ DRA bridge (alpha). | Operator burden: author DeviceClasses, run a DRA driver, manage `ResourceClaim` lifecycle. |
 | | Same observability gap as B — quota violations appear as pod-admission failures, not in WVA's decision trace. |
 
-**Verdict:** The right long-term direction for K8s-native per-GPU-type quotas, but not a substitute for #1002 in the WVA decision pipeline today. WVA should plan to integrate with DRA in a future phase (read DeviceClass-scoped quotas as additional chain inputs, alongside any `ResourceQuotaReader`).
+**Verdict:** The right long-term direction for K8s-native per-GPU-type quotas, but not a substitute for #1002 in the WVA decision pipeline today. WVA should plan to integrate with DRA in a future phase (read DeviceClass-scoped quotas as additional chain inputs, alongside any `ResourceQuotaReader`). It is kept as a full option here — rather than dropped to a footnote — because it is the K8s-native per-type path reviewers will ask about and the basis for the future DRA `ConstraintProvider` named in §5; the recommendation explains why it is not the *current* mechanism.
 
 ### C. OpenShift `ClusterResourceQuota`
 
@@ -146,19 +148,11 @@ OpenShift adds `ClusterResourceQuota` (CRQ) on top of `ResourceQuota`. Selects n
 | Cohort fair-share and borrowing — far richer than what #1002 asks for. | Adds a new controller, new CRDs, new admission webhook. Operational overhead. |
 | Designed for AI/ML workloads. | Kueue inserts an admission gate between "WVA decides scale" and "K8s schedules pod," so WVA's requested replica count and what actually runs diverge — the basis of the anticipated-capacity trap (Verdict). |
 
-**Verdict:** Not the enforcement mechanism for #1002, but the right *source* to read where it is deployed. Because Kueue enforces at admission, using it alone produces the **anticipated-capacity trap**: replicas WVA requested beyond quota sit `Pending` (gated by Kueue), WVA folds them into `anticipatedSupply` (`saturation_v2/analyzer.go` counts `ready + pending` as incoming capacity), so `requiredCapacity` is suppressed and the optimizer won't scale a sibling variant on a different `ResourceFlavor` that could serve the same `InferencePool` — the pool stays under-served while WVA believes it is converging. The fix is decision-time enforcement: WVA *reads* Kueue's `ResourceFlavor`/`ClusterQueue` quota as a `ConstraintProvider` (the same reader family as A2's `ResourceQuotaReader`) and caps the request, so it never asks for replicas Kueue would gate. Where an org already runs Kueue, that reader reuses its per-GPU-type quota directly; where it does not, Option A provides the same cap with no new operator.
+**Verdict:** Not the enforcement mechanism for #1002, but the right *source* to read where it is deployed. Because Kueue enforces at admission, using it alone produces the **anticipated-capacity trap**: replicas WVA requested beyond quota sit `Pending` (gated by Kueue), WVA folds them into `anticipatedSupply` — `saturation_v2/analyzer.go:97` computes `anticipatedCapacity = (ReplicaCount + PendingReplicas) × PerReplicaCapacity`, and `:119` sets `requiredCapacity = totalDemand/ScaleUpThreshold − totalAnticipatedSupply`. Because a gated pod is *created* (phase `Pending`) it counts in `PendingReplicas`, so `requiredCapacity` is suppressed and the optimizer won't scale a sibling variant on a different `ResourceFlavor` that could serve the same `InferencePool` — the pool stays under-served while WVA believes it is converging. The fix is decision-time enforcement: WVA *reads* Kueue's `ResourceFlavor`/`ClusterQueue` quota as a `ConstraintProvider` (the same reader family as A2's `ResourceQuotaReader`) and caps the request, so it never asks for replicas Kueue would gate. Where an org already runs Kueue, that reader reuses its per-GPU-type quota directly; where it does not, Option A provides the same cap with no new operator.
 
 ### E. Hierarchical Namespaces (HNC) / Capsule
 
-Multi-tenancy frameworks that nest namespaces or wrap them in a `Tenant` CRD with inherited quotas.
-
-| Strengths | Weaknesses |
-|---|---|
-| Solves multi-tenancy at the platform layer, not just for GPUs. | Heavy: add a tenancy operator, retrain operators on a new namespace model. |
-| Inheritance is a clean mental model for nested teams. | Still uses `ResourceQuota` underneath — inherits its per-GPU-type limitation. |
-| Useful when an org already runs HNC/Capsule. | Forces a tenancy model on orgs that don't want one. |
-
-**Verdict:** Orthogonal. If an org already runs HNC, our `QuotaLimiter` should integrate cleanly with it (read effective `ResourceQuota` per namespace). But mandating it is wrong.
+**Orthogonal — not a substitute, omitted from the matrix.** Tenancy frameworks that nest namespaces and inherit `ResourceQuota`; they still rely on `ResourceQuota` underneath, so they inherit its single-counter per-type gap and admission-time enforcement. Where an org runs HNC/Capsule, A's per-namespace caps integrate with the inherited quotas (read the effective `ResourceQuota` per namespace); mandating a tenancy model on orgs that don't want one is out of scope.
 
 ### F. Custom validating admission webhook
 
@@ -174,14 +168,7 @@ A separate webhook that observes scaling-related operations (VA status patches, 
 
 ### G. GPU operator-level partitioning (NVIDIA MIG, time-slicing)
 
-Configure NVIDIA's GPU Operator to expose MIG slices or time-shared GPUs as multiple "virtual GPUs."
-
-| Strengths | Weaknesses |
-|---|---|
-| Physical partitioning — the most defensible cap there is. | Granularity is per-physical-GPU (MIG profile choice), not per-tenant. |
-| Composes with all the above (just changes what "1 GPU" means). | Doesn't help with "team-a may use 8 H100s." That's still a policy decision on top. |
-
-**Verdict:** Orthogonal. MIG defines what a "GPU" is; `QuotaLimiter` allocates GPUs. Both can coexist.
+**Orthogonal — not a substitute, omitted from the matrix.** MIG/time-slicing define *what counts as one GPU* (physical/temporal partitioning); they do not express *who may use how many*. They compose with A (A allocates whatever the node advertises as a GPU) but cannot answer "team-a ≤ 8× H100." Listed only to disclaim the common conflation of partitioning with quota.
 
 ### H. HPA / KEDA `maxReplicas`
 
@@ -196,42 +183,64 @@ Use the existing autoscaler's `maxReplicas` as a per-variant cap.
 
 ## 4. Comparison matrix
 
-| Property | A. WVA `QuotaLimiter` | A2. `ResourceQuotaReader` | B. Classic `ResourceQuota` alone | B2. DRA (K8s 1.34+) | C. OpenShift CRQ | D. Kueue | F. Webhook | H. HPA `maxReplicas` |
-|---|---|---|---|---|---|---|---|---|
-| Per-GPU-type granularity | ✅ | ❌ | ❌ | ✅ (per-DeviceClass) | ❌ | ✅ (per-`ResourceFlavor`) | depends | ❌ |
-| Cluster scope | ✅ | ❌ | ❌ | ❌ (namespace) | ✅ | ✅ (`ClusterQueue`) | depends | ❌ |
-| Namespace scope | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ (`LocalQueue`) | depends | ❌ |
-| Enforced at decision time (not pod admission) | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ (admission) | depends | ✅ |
-| Works on any conformant K8s | ✅ | ✅ | ✅ | ❌ (needs ≥1.34 + driver) | ❌ (OCP-only) | ✅ | ✅ | ✅ |
-| Zero new operators / CRDs | ✅ | ✅ | ✅ | ❌ (DRA driver) | ✅ | ❌ | ❌ | ✅ |
-| Surfaces in WVA decision trace | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
-| K8s-native operator UX | ❌ (new YAML) | ✅ | ✅ | ✅ | ✅ (OCP) | partial | n/a | ✅ |
-| Cross-variant budget sharing | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | depends | ❌ |
-| Exclude/bypass list | ✅ | ❌ | ❌ | ❌ | ❌ | partial (priority classes) | depends | n/a |
-| Quota enforcement maturity | prototype | not yet | mature | basic in 1.34; #4840 WIP | mature | mature | varies | mature |
+| Property | A. WVA `QuotaLimiter` | A2. `ResourceQuotaReader` | B. Classic `ResourceQuota` alone | B2. DRA (K8s 1.34+) | C. OpenShift CRQ | D. Kueue | H. HPA `maxReplicas` |
+|---|---|---|---|---|---|---|---|
+| Per-GPU-type granularity | ✅ | ❌ | ❌ | ✅ (per-DeviceClass) | ❌ | ✅ (per-`ResourceFlavor`) | ❌ |
+| Cluster scope | ✅ | ❌ | ❌ | ❌ (namespace) | ✅ | ✅ (`ClusterQueue`) | ❌ |
+| Namespace scope | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ (`LocalQueue`) | ❌ |
+| Enforced at decision time (not pod admission) | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ (admission) | ✅ |
+| Works on any conformant K8s | ✅ | ✅ | ✅ | ❌ (needs ≥1.34 + driver) | ❌ (OCP-only) | ✅ | ✅ |
+| Zero new operators / CRDs | ✅ | ✅ | ✅ | ❌ (DRA driver) | ✅ | ❌ | ✅ |
+| Surfaces in WVA decision trace | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ |
+| K8s-native operator UX | ❌ (new YAML) | ✅ | ✅ | ✅ | ✅ (OCP) | partial | ✅ |
+| Cross-variant budget sharing | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| Exclude/bypass list | ✅ | ❌ | ❌ | ❌ | ❌ | partial (priority classes) | n/a |
+| Quota enforcement maturity | prototype | not yet | mature | basic in 1.34; #4840 WIP | mature | mature | mature |
+
+(Option F, a custom admission webhook, is omitted: a webhook is arbitrary admission logic whose capability depends entirely on implementation, so it has no fixed profile to tabulate — see §3.F for why it is rejected on operational grounds. E and G are orthogonal mechanisms, also omitted.)
 
 ## 5. Recommendation
 
-**Adopt option A (WVA-internal `QuotaLimiter`) as the simple, universal baseline, and the K8s-native *readers* — A2 (`ResourceQuotaReader`) now, a `KueueReader`/DRA reader later — as additive reuse layered on top.** A resolves #1002 on any cluster with zero dependencies; A2 ships as its own smaller fast-follow PR and reuses an existing `ResourceQuota` where the admin already declares one.
+**Adopt option A (WVA-internal `QuotaLimiter`) as the simple, universal baseline, and the K8s-native *readers* — A2 (`ResourceQuotaReader`) now, a `KueueReader`/DRA reader later — as additive reuse layered on top.** A resolves #1002 on any cluster with zero runtime dependencies (no new operators, CRDs, or webhooks); A2 ships as its own smaller fast-follow PR and reuses an existing `ResourceQuota` where the admin already declares one.
 
 ### Why A is the resolution of #1002
 
-A is the only candidate in §3 that meets #1002 on **every dimension that matters** — per-GPU-type granularity, cluster + namespace scope and their coexistence, a bypass-list for system tenants, *and* the load-bearing properties detailed below. Each other option fails at least one:
+#### Per-criterion breakdown
 
-- **A2 (`ResourceQuotaReader`)** is namespace-only and per-extended-resource-only — it inherits the single-counter limitation of `requests.nvidia.com/gpu`, so it cannot express `{H100: 8, A100: 4}` in a single namespace. The heterogeneous-cluster case (#1018) is out of reach. A2 covers a different operator persona; it does not close #1002.
-- **B (classic `ResourceQuota` alone)** has the same per-GPU-model gap as A2 plus admission-time enforcement, which leaves WVA blind to the cap and produces stuck rollouts instead of clean `LimitedBy` traces.
-- **B2 (DRA)** closes the per-GPU-model gap via per-`DeviceClass` quotas, but is GA only on K8s ≥ 1.34, enforces at admission time, and has unresolved quota mechanics ([KEP #4840](https://github.com/kubernetes/enhancements/issues/4840)).
-- **C (OpenShift `ClusterResourceQuota`)** adds cluster scope but is OCP-only and inherits the per-GPU-model gap.
-- **D (Kueue)** has the right granularity via `ResourceFlavor`, but enforces at *admission* — used alone it triggers the anticipated-capacity trap (§3.D). The fit is a `KueueReader` `ConstraintProvider` (sibling of A2) that reads its quota into the chain, not Kueue as the scaler.
-- **F (admission webhook)** adds operational complexity without a clear advantage over an in-process limiter.
-- **E (HNC/Capsule)**, **G (MIG/time-slicing)**, and **H (HPA `maxReplicas`)** are orthogonal — they compose with A rather than substituting for it.
+#1002 defines **four enumerated acceptance criteria**: (1) per-GPU-type cap at **cluster** scope; (2) per-GPU-type cap at **namespace** scope; (3) cluster **+** namespace **coexistence**; (4) a **bypass/exclude** list for system tenants. Two further **architectural requirements** decide the outcome; they are scored in a separate block below — not to silently expand #1002's list, but because:
 
-The load-bearing properties that make A the right primary mechanism for #1002 are:
+- **Requirement 5, decision-time enforcement, is not invented — it is #1002's own framing clause made measurable.** #1002 asks for caps *"enforced by the WVA scaling pipeline"* (§1); a cap enforced at *pod admission* (by the kube-apiserver) is by definition **not** enforced by the WVA pipeline. The anticipated-capacity trap (§3.D) is what that distinction costs in practice.
+- **Requirement 6, works on any conformant K8s,** is the portability bar this project holds for every feature (no OS-vendor or K8s-version binding).
 
-1. **Per-GPU-type granularity** on any conformant K8s version, without an OS-vendor binding or a K8s-version floor.
-2. **Decision-time enforcement** — WVA never asks for more replicas than allowed, so operators see capped scaling decisions in the controller's trace rather than pods stuck at admission. Admission-time enforcement is *not* equivalent, and it fails in one of two ways depending on the mechanism. Classic `ResourceQuota` and DRA **reject** the over-quota pod at creation, so the rollout stalls below desired and WVA stays blind to the cap. Kueue instead **gates** the pods — created, then held `Pending` by a scheduling gate — and WVA folds those held pods into `anticipatedSupply` (it counts `ready + pending` as incoming capacity), so `requiredCapacity` is suppressed and a sibling variant that could serve the same `InferencePool` is never scaled: the **anticipated-capacity trap** (§3.D). Reading the cap at decision time avoids both — and this property is shared by A *and* the readers (A2, a future `KueueReader`); the load-bearing requirement is that the cap binds in WVA's decision loop, wherever it is sourced, not at pod admission.
-3. **`DecisionStep` observability** — the limiter emits `limited by quota[scope=…, type=…]` directly into WVA's per-cycle trace, fitting the observability work in #913 / #915.
-4. **Composable** — A implements the existing `Inventory` interface, so the limiter chain (#1003) composes it with `TypeInventory` and any K8s-native readers (`ResourceQuotaReader` A2, a future `KueueReader`, later DRA) via `min(physical, wva-quota, k8s-native-quota)` with no schema change. There is no "conflict" between sources: the tightest cap binds, and the `DecisionStep` names which one (`limited by quota[…]` vs `limited by resourceQuota[…]`).
+The grid scores every concrete option against both groups (✅ satisfies, ~ partial, ❌ fails):
+
+| Requirement | A | A2 | B | B2 | C | D | H |
+|---|:--:|:--:|:--:|:--:|:--:|:--:|:--:|
+| *— #1002 acceptance criteria —* | | | | | | | |
+| 1. Per-GPU-type @ **cluster** scope | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ |
+| 2. Per-GPU-type @ **namespace** scope | ✅ | ❌ | ❌ | ✅ | ❌ | ✅ | ❌ |
+| 3. Cluster **+** namespace coexistence | ✅ | ❌ | ❌ | ❌ | ~ | ✅ | ❌ |
+| 4. Exclude/bypass for system tenants | ✅ | ❌ | ❌ | ❌ | ❌ | ~ | n/a |
+| *— WVA pipeline requirements (not in #1002) —* | | | | | | | |
+| 5. Decision-time enforcement (not admission) | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ |
+| 6. Works on any conformant K8s | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ✅ |
+
+**A is the only column with ✅ in every row.** Reading the failures off the grid:
+
+- **A2 (`ResourceQuotaReader`) / B (`ResourceQuota` alone)** — a single `requests.nvidia.com/gpu` counter, namespace-only: no per-GPU-type (1, 2), no cluster scope (1, 3), no exclude (4). A2 cannot express `{H100: 8, A100: 4}` in one namespace, so the heterogeneous case (#1018) is out of reach. But A2 *does* clear both WVA requirements (5, 6) — which is exactly why it is a useful **reader** for the homogeneous / single-counter persona, not a dead end.
+- **B2 (DRA)** — per-`DeviceClass` quota gives per-type at the namespace level (2 ✅), but `ResourceQuota` is namespace-only, so no cluster aggregate (1, 3 ❌) and no exclude (4 ❌); and it fails *both* WVA requirements — admission-time enforcement (5 ❌) and K8s ≥ 1.34 only (6 ❌). [KEP #4840](https://github.com/kubernetes/enhancements/issues/4840) is still WIP.
+- **C (OpenShift `ClusterResourceQuota`)** — cluster aggregate (3 ~, paired with `ResourceQuota`) but single-counter, so no per-type (1, 2 ❌), no exclude (4 ❌); admission-time (5 ❌), OCP-only (6 ❌).
+- **D (Kueue)** — **the closest of any alternative**: it meets criteria 1–3 (`ClusterQueue`/`LocalQueue` + `ResourceFlavor`) and approximates 4. It is **requirement 5** that disqualifies it as the scaler — it enforces at admission, triggering the anticipated-capacity trap (§3.D). The fit is therefore a `KueueReader` `ConstraintProvider` (sibling of A2) that reads its quota into WVA's decision loop, not Kueue as the scaler.
+- **H (HPA `maxReplicas`)** — a per-variant cap, not per-type: fails 1–3; exclude n/a. It clears 5 and 6 but cannot express type-level budget.
+- **F (admission webhook)**, **E (HNC/Capsule)**, **G (MIG/time-slicing)** — omitted from the grid: F is arbitrary admission logic with no fixed profile and fails requirement 5; E/G are orthogonal (tenancy / physical partitioning). See §3.
+
+In short: D is the lone alternative that clears criteria 1–3 (and approximates 4), and its only outright ❌ is **requirement 5** (the trap); A2 clears both requirements but not the per-type criteria (a future `KueueReader`/DRA reader clears those too, but ships later). A clears every row — which is the whole grid, not an assertion.
+
+Beyond the grid, three points carry the recommendation:
+
+1. **Decision-time enforcement (row 5), in depth.** WVA never asks for more replicas than allowed, so operators see capped scaling decisions in the controller's trace rather than pods stuck at admission. Admission-time enforcement is *not* equivalent: classic `ResourceQuota` and DRA **reject** the over-quota pod at creation (the rollout stalls below desired, WVA stays blind to the cap), while Kueue **gates** it `Pending` and triggers the anticipated-capacity trap (mechanics in §3.D). Reading the cap at decision time avoids both — and this property is shared by A *and* the readers (A2, a future `KueueReader`); the load-bearing requirement is that the cap binds in WVA's decision loop, wherever it is sourced, not at pod admission.
+2. **`DecisionStep` observability** (not scored in the grid) — the limiter emits `limited by quota[scope=…, type=…]` directly into WVA's per-cycle trace, fitting the observability work in #913 / #915.
+3. **Composable** (not scored in the grid) — A implements the existing `Inventory` interface, so the limiter chain (#1003) composes it with `TypeInventory` and any K8s-native readers (`ResourceQuotaReader` A2, a future `KueueReader`, later DRA) via `min(physical, wva-quota, k8s-native-quota)` with no schema change. There is no "conflict" between sources: the tightest cap binds, and the `DecisionStep` names which one (`limited by quota[…]` vs `limited by resourceQuota[…]`).
 
 The design's shape is **start simple and universal, then layer reuse.** A assumes no particular quota system — it works on any conformant cluster, day one, with zero dependencies. The readers then add ecosystem-specific value: where GPUs are already governed by `ResourceQuota` (A2), Kueue (`KueueReader`), or DRA, WVA reads that source through the same chain (`min(physical, …)`) so the operator never redeclares the cap. A is the foundation everyone gets; the readers are progressive enhancements for whatever quota system you already run.
 
@@ -253,11 +262,23 @@ The platform-admin persona — administrators who already govern the cluster wit
 
 A2 reuses the same `ConstraintProvider` plumbing A introduces, so the two compose via the limiter chain (#1003) as `min(physical, wva-quota, resource-quota)` without redesign.
 
+### How A and A2 compose (different granularities, same enforcement layer)
+
+A and A2 express caps at **different granularities** — A is per-GPU-type (`{H100: 8, A100: 4}`), A2 is a single per-extended-resource counter (`requests.nvidia.com/gpu: 10`). They are not in conflict, because they constrain different things and **both bind at the same point** (WVA's decision loop), so the chain just applies the tightest applicable bound:
+
+- A2's counter is an **aggregate ceiling** on the sum across all types in a namespace: `Σ_type alloc[type, ns] ≤ A2[ns]`.
+- A's caps are **per-type ceilings**: `alloc[type, ns] ≤ A[type, ns]`.
+- Both hold simultaneously: for each type the chain takes `min(physical[type], A[type, ns])`, and the per-namespace sum is *additionally* clamped by `A2[ns]`. The `DecisionStep` names whichever bound actually capped the decision (`limited by quota[type=H100]` vs `limited by resourceQuota[ns=…]`).
+
+Concretely: a namespace with `A = {H100: 8, A100: 4}` and a pre-existing `ResourceQuota` of `requests.nvidia.com/gpu: 10` (read via A2) is held to **8 H100 plus at most 2 A100** — once 8 H100 are allocated, only 2 of the 10-GPU aggregate remain. The per-type cap and the aggregate ceiling each do work the other cannot, so they coexist cleanly; an operator may also run just one. (The aggregate actually available to WVA is `ResourceQuota.hard` *minus* GPUs already consumed by non-WVA workloads in the namespace; reconciling `status.used` against WVA's own per-cycle usage is the A2 design question called out in the scope split — the `10` here is the simplifying case where WVA is the only consumer.)
+
+**The reason they compose is the enforcement layer, not the granularity.** A and A2 both enforce at *decision time*, so both can be a term in the same `min()`. Option B carries the *same single-counter granularity as A2* yet does **not** compose this way, because it binds at *admission* — WVA never sees it in the chain, and the two enforcement points diverge (WVA scales, the API server rejects). That admission-vs-decision distinction — even though #1002 did not list it as an explicit acceptance criterion — is the property that actually determines whether a cap can join WVA's decision loop at all. It is the dividing line in the §4 matrix row "enforced at decision time," and the failure it prevents is the anticipated-capacity trap (§3.D).
+
 ### Scope split
 
 | Feature | Issue | Implementation status | Closes |
 |---|---|---|---|
-| **A — `QuotaLimiter`** | #1002 (this proposal) | Prototype on `feat/quota-limiter`; 8 commits, 50+ Ginkgo specs | All four acceptance bullets of #1002 |
+| **A — `QuotaLimiter`** | #1002 (this proposal) | Prototype (see §3.A) | All four acceptance criteria of #1002 |
 | **A2 — `ResourceQuotaReader`** | New issue, to be filed alongside merging A | Not yet started; estimated ~300 lines (informer + `ConstraintProvider`) | Platform-admin-persona need; not part of #1002 |
 | **`KueueReader`** (future) | New issue, where Kueue is deployed | Not started; a `ConstraintProvider` reading `ResourceFlavor`/`ClusterQueue` nominal quota | Reuses existing Kueue per-GPU-type quota; same chain as A2 |
 
@@ -283,4 +304,55 @@ Quota enforcement is intrinsically **cluster-scoped**, which constrains how WVA 
 - **Ownership.** Per-namespace caps are a cluster-admin decision; a tenant must not be able to raise their own. A per-namespace deployment would place the quota config in the tenant's namespace/hands.
 
 So cluster-scoped quota (the cluster-scope half of #1002) requires a cluster-scoped WVA controller and a cluster-admin-owned surface. A namespace-scoped WVA can still enforce a namespace-local cap it is given, but cannot own or arbitrate the cluster aggregate. This matches the persona split in #1194: thresholds/scale-to-zero are tenant-owned and namespace-local; quota is cluster-admin-owned and cluster-scoped.
+
+### 6.3 Worked examples
+
+The four declaration shapes and the resulting behavior. The YAML below shows an **illustrative** shape to make behavior concrete — the normative schema is owned by #1194 (§6.1), and `spec.quota` and the prototype ConfigMap are shape-equivalent.
+
+**Cluster-only.** One cluster aggregate, no per-namespace caps:
+
+```yaml
+spec:
+  quota:
+    cluster:
+      H100: 16          # WVA's total H100 across all namespaces ≤ 16
+      A100: -1          # unlimited
+```
+Behavior: every namespace draws from the shared 16× H100; the optimizer's cluster-wide H100 allocation across all VAs is capped at 16. No per-tenant isolation.
+
+**Namespace-only.** Independent per-namespace caps, no cluster aggregate:
+
+```yaml
+spec:
+  quota:
+    namespaces:
+      team-a: { H100: 8 }
+      team-b: { H100: 4 }
+```
+Behavior: `team-a ≤ 8`, `team-b ≤ 4`, enforced independently. The cluster total is bounded only by physical capacity (`min(physical, per-ns cap)` per namespace), so the sum of namespace caps *may* exceed physical — physical inventory then binds and the `DecisionStep` says `limited by inventory`.
+
+**Cluster + namespace simultaneously.** Per-tenant caps *under* a cluster ceiling:
+
+```yaml
+spec:
+  quota:
+    cluster:    { H100: 16 }
+    namespaces:
+      team-a:   { H100: 8 }
+      team-b:   { H100: 8 }
+```
+Behavior: each namespace is held to its own cap (8 each) **and** the sum across namespaces is clamped to the cluster ceiling (16). Here `8 + 8 = 16`, so both can run full; if a third namespace also wanted H100 it would get 0 (the cluster aggregate is exhausted), and its trace reads `limited by quota[scope=cluster, type=H100]`.
+
+**Namespace cap exceeds the cluster cap.** `min` always binds — the looser cap can never raise the tighter:
+
+```yaml
+spec:
+  quota:
+    cluster:    { H100: 16 }
+    namespaces:
+      team-a:   { H100: 20 }   # > cluster
+```
+Behavior: `team-a` is effectively held to **16** (the cluster aggregate), not 20 — `min(physical, ns-cap, remaining cluster aggregate)`. The namespace cap above the cluster cap is silently clamped (the cluster ceiling is the outer bound), and admission of the `ScalingPolicy` emits a **validation warning** that `team-a.H100 (20) > cluster.H100 (16)` so the operator knows the namespace cap is dead weight above the ceiling.
+
+**When namespace caps oversubscribe the cluster cap.** If `Σ namespace caps > cluster cap` and demand is high enough to hit the ceiling, the quota limiter still enforces both bounds (`min(ns-cap, remaining cluster aggregate)`), but it does **not** decide *which* namespace wins the contested GPUs. That is the optimizer's existing allocation order; priority-weighted redistribution under contention is the concern of the separate rescale proposal (it *consumes* this budget, it does not *set* it). The examples above use non-oversubscribed caps to isolate the quota mechanic from the contention policy.
 
