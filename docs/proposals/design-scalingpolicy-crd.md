@@ -33,7 +33,7 @@ The policy **points at the pool**; the pool's workloads carry no reference back 
 
 ## 2. Relationship to the HPA / ScaledObject (review question 1)
 
-**They own different things: WVA owns the scaling decision, the HPA owns actuation. `ScalingPolicy` configures the decision; the HPA actuates it by reading WVA's `wva_desired_replicas` metric. Neither the policy nor the HPA references the other's *config*. WVA reads the HPA/`ScaledObject` to identify the workloads it manages, but the *mechanism* (the #1130 label) is the **VA-deprecation proposal's** — a separate, forthcoming proposal, *not* #1194 — and this CRD's shape does not depend on it.**
+**They own different things:** WVA owns the scaling decision, the HPA owns actuation. `ScalingPolicy` configures the decision; the HPA actuates it by reading WVA's `wva_desired_replicas` metric. Neither the policy nor the HPA references the other's *config*. WVA reads the HPA/`ScaledObject` to identify the workloads it manages, but the *mechanism* (the #1130 label) is the **VA-deprecation proposal's** — and this CRD's shape does not depend on it.**
 
 | | Owns | Reads | Writes |
 |---|---|---|---|
