@@ -144,6 +144,9 @@ func costAwareScaleDown(
 	if len(result.RoleCapacities) > 0 {
 		// Each role owns a disjoint set of variants and sheds against its own
 		// spare, so the map's iteration order does not affect the outcome.
+		// Assumes RoleCapacities keys partition VariantCapacities by role
+		// (one role per variant; no overlap); mixed-role configurations would
+		// break disjointness.
 		for role, rc := range result.RoleCapacities {
 			if rc.SpareCapacity <= 0 {
 				continue // saturated or under-supplied role — never trim it
