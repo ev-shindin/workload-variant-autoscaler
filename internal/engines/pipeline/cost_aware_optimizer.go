@@ -161,9 +161,9 @@ func costAwareScaleDown(
 
 // scaleDownVariantSet removes replicas from the given variant set, most-expensive
 // first, until `spare` capacity is shed or each variant's minReplicas floor is
-// reached. The cheapest variant in the set is protected at one replica when it
-// would otherwise be the last variant with replicas in the set — preventing a
-// scale-to-zero deadlock.
+// reached. The cheapest variant — last in the cost-descending order — is protected
+// at one replica when it would otherwise be the last variant with replicas in the
+// set, preventing a scale-to-zero deadlock.
 func scaleDownVariantSet(
 	ctx context.Context,
 	variants []interfaces.VariantCapacity,
@@ -174,10 +174,9 @@ func scaleDownVariantSet(
 	logger := ctrl.LoggerFrom(ctx)
 
 	sorted := sortByCostDesc(variants)
-	cheapest := findCheapestVariant(variants)
 	remaining := spare
 
-	for _, vc := range sorted {
+	for i, vc := range sorted {
 		if remaining <= 0 {
 			break
 		}
@@ -187,49 +186,54 @@ func scaleDownVariantSet(
 
 		current := targets[vc.VariantName]
 
-		// Determine minReplicas: annotation floor takes priority, then cheapest-variant logic
+		// Annotation floor caps removal.
 		minReplicas := 0
 		if states != nil {
 			if state, ok := states[vc.VariantName]; ok && state.MinReplicas != nil {
 				minReplicas = *state.MinReplicas
 			}
 		}
-		if vc.VariantName == cheapest {
-			// Protect cheapest at 1 only if it's the last variant with replicas
-			// in the set and no higher annotation min is set
-			otherHasReplicas := false
-			for _, other := range variants {
-				if other.VariantName != cheapest && targets[other.VariantName] > 0 {
-					otherHasReplicas = true
-					break
-				}
-			}
-			if !otherHasReplicas && minReplicas < 1 {
-				minReplicas = 1
-			}
-		}
-
 		removable := current - minReplicas
 		if removable <= 0 {
 			continue
 		}
 
-		replicasToRemove := int(math.Floor(remaining / vc.PerReplicaCapacity))
-		if replicasToRemove > removable {
-			replicasToRemove = removable
+		toRemove := int(math.Floor(remaining / vc.PerReplicaCapacity))
+		if toRemove > removable {
+			toRemove = removable
 		}
-		if replicasToRemove <= 0 {
+
+		// Protect the cheapest variant (last in cost-descending order) at one
+		// replica when removing toRemove would drop it below one and no
+		// more-expensive variant still holds replicas — i.e. it is the last with
+		// replicas in the set. When minReplicas >= 1, removable <= current-1 so
+		// toRemove <= current-1 and current-toRemove >= 1 already, so this clause
+		// never triggers.
+		if i == len(sorted)-1 && current-toRemove < 1 && !anyHasReplicas(sorted[:i], targets) {
+			toRemove = current - 1
+		}
+		if toRemove <= 0 {
 			continue
 		}
 
-		targets[vc.VariantName] = current - replicasToRemove
-		remaining -= float64(replicasToRemove) * vc.PerReplicaCapacity
+		targets[vc.VariantName] = current - toRemove
+		remaining -= float64(toRemove) * vc.PerReplicaCapacity
 
 		logger.V(logging.DEBUG).Info("Scale-down allocation",
 			"variant", vc.VariantName,
-			"removed", replicasToRemove,
+			"removed", toRemove,
 			"cost", vc.Cost)
 	}
+}
+
+// anyHasReplicas reports whether any of the given variants has a positive target.
+func anyHasReplicas(variants []interfaces.VariantCapacity, targets map[string]int) bool {
+	for _, vc := range variants {
+		if targets[vc.VariantName] > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // variantsForRole returns the capacities whose role matches exactly (an empty
@@ -277,19 +281,6 @@ func initTargets(states []interfaces.VariantReplicaState) map[string]int {
 	return targets
 }
 
-// findCheapestVariant returns the variant name with the lowest cost.
-func findCheapestVariant(capacities []interfaces.VariantCapacity) string {
-	cheapest := ""
-	minCost := math.MaxFloat64
-	for _, vc := range capacities {
-		if vc.Cost < minCost {
-			minCost = vc.Cost
-			cheapest = vc.VariantName
-		}
-	}
-	return cheapest
-}
-
 // sortByCostEfficiencyAsc returns variants sorted by cost/perReplicaCapacity ascending.
 func sortByCostEfficiencyAsc(capacities []interfaces.VariantCapacity) []interfaces.VariantCapacity {
 	sorted := make([]interfaces.VariantCapacity, len(capacities))
@@ -300,12 +291,19 @@ func sortByCostEfficiencyAsc(capacities []interfaces.VariantCapacity) []interfac
 	return sorted
 }
 
-// sortByCostDesc returns variants sorted by absolute cost descending.
+// sortByCostDesc returns variants sorted by absolute cost descending. Equal-cost
+// variants are tie-broken by per-replica capacity ascending, so the highest-PRC
+// variant at the cheapest cost tier lands last — the deterministic slot the
+// scale-down protection keeps at one replica (prefer keeping the more capable
+// replica among equal-cost variants).
 func sortByCostDesc(capacities []interfaces.VariantCapacity) []interfaces.VariantCapacity {
 	sorted := make([]interfaces.VariantCapacity, len(capacities))
 	copy(sorted, capacities)
 	sort.Slice(sorted, func(i, j int) bool {
-		return sorted[i].Cost > sorted[j].Cost
+		if sorted[i].Cost != sorted[j].Cost {
+			return sorted[i].Cost > sorted[j].Cost
+		}
+		return sorted[i].PerReplicaCapacity < sorted[j].PerReplicaCapacity
 	})
 	return sorted
 }

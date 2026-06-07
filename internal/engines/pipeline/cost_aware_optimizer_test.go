@@ -665,14 +665,17 @@ var _ = Describe("CostAwareOptimizer", func() {
 			Expect(sorted[2].VariantName).To(Equal("cheap"))
 		})
 
-		It("findCheapestVariant should return lowest cost variant", func() {
+		It("sortByCostDesc should tie-break equal cost by per-replica capacity ascending", func() {
+			// Among equal-cost variants, the higher-PRC one must land last — the
+			// deterministic slot scale-down protects at one replica.
 			capacities := []interfaces.VariantCapacity{
-				{VariantName: "mid", Cost: 10.0},
-				{VariantName: "cheap", Cost: 5.0},
-				{VariantName: "expensive", Cost: 15.0},
+				{VariantName: "lo-prc", Cost: 5.0, PerReplicaCapacity: 1000},
+				{VariantName: "hi-prc", Cost: 5.0, PerReplicaCapacity: 9000},
 			}
 
-			Expect(findCheapestVariant(capacities)).To(Equal("cheap"))
+			sorted := sortByCostDesc(capacities)
+
+			Expect(sorted[len(sorted)-1].VariantName).To(Equal("hi-prc"))
 		})
 
 		It("mergeConstraints should take minimum available per type", func() {
