@@ -68,18 +68,19 @@ spec:
   scaleToZero: { enabled: false }
 
   # (b) pluggable lists — {type, name, parameters}; `parameters` is plugin-owned
-  analyzers:                          # one or more; tenant-tunable
+  analyzers:                          # one or more; TENANT-tunable, any tier
     - type: saturation
       name: sat                       # identity, used for cross-tier merge
       parameters:                     # x-kubernetes-preserve-unknown-fields
         scaleUpThreshold: 0.95
-  limiters:                           # zero or more; compose as a chain
+  limiters:                           # zero or more; chain; CLUSTER-DEFAULT ONLY (admin)
     - type: gpu-inventory
     - type: quota                     # parameters schema owned by #1162
 ```
 
 - **(a) Stable cross-cutting fields** (`priority`, `scaleToZero`, `inferencePoolRef`) are **typed** — OpenAPI/CEL-validated, discoverable via `kubectl explain`.
 - **(b) Plugin lists** (`analyzers`, `limiters`) are name-keyed lists of `{type, name, parameters}` where **`parameters` is `x-kubernetes-preserve-unknown-fields`** — each plugin parses and validates its own parameters at load. This is the **EPP `EndpointPickerConfig` pattern** (llm-d's inference scheduler already configures plugins this way), reused for *shape* only — there is no shared config between EPP and WVA; both merely read the `InferencePool`.
+- **Tenant-tunable vs admin-only — an isolation boundary, not a style choice.** `analyzers`, `priority`, and `scaleToZero` are tenant-tunable at any tier. **`limiters` (and `quota`) are cluster-default-only**: they are *instance-wide enforcement*, not tenant knobs. A **CEL rule rejects `limiters`/`quota` on any namespace or per-pool `ScalingPolicy`**, and tenants have no RBAC to write the cluster-default object (it lives in the system namespace). This is load-bearing for security: if a tenant could set `limiters` on a policy they own, they could drop the `quota` limiter — or set `limiters: []` — and **escape their own cap**. So `limiters`/`quota` are never authored, merged, or overridable below the cluster-default tier (§4).
 
 The one property that makes the shape "generic": **adding an analyzer or limiter ships its own `parameters` keys and the CRD schema does not change.** The optimizer is a single fixed stage with nothing to configure today; the schema leaves room for a `spec.optimizer` block later with no redesign.
 
@@ -93,7 +94,7 @@ The surface is still **one CRD**. It is resolved at up to **three placements** o
 2. **Namespace-default** — `ScalingPolicy` in the workload's namespace, no `inferencePoolRef`.
 3. **Per-pool** — `ScalingPolicy` in the workload's namespace, `inferencePoolRef` set.
 
-Fields merge cluster → namespace → per-pool (higher tier wins; `analyzers` merge by `name`).
+Fields merge cluster → namespace → per-pool (higher tier wins; `analyzers` merge by `name`). **`limiters` and `quota` are excluded from the merge entirely — they exist *only* on the cluster-default tier** (CEL-rejected on the others, §3), so a lower tier can neither override them nor remove them. A tenant cannot weaken or delete their own cap by editing a policy they own; the only objects they can write (namespace / per-pool) cannot carry a limiter at all.
 
 **This cannot collapse to a single tier, because quota forces at least two — by ownership, not preference:**
 
