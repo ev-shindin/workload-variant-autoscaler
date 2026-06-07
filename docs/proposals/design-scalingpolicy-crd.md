@@ -105,7 +105,24 @@ These two have **different owners and different RBAC**; they cannot share one ob
 
 The **third (per-pool) tier costs no extra schema**: it is the *same* CRD with `inferencePoolRef` set, in the tenant's own namespace. It adds override *granularity* (one pool tuned differently from its namespace default), not a new surface or a new kind. So "multiple levels" here means three placements of one object resolved by a small, deterministic merge — not three configuration systems.
 
-> The merged result is published on the per-pool object's `status.effectivePolicy` (with `status.sources`), so `kubectl get scalingpolicy <name> -o yaml` shows exactly what is in force and which tiers produced it — the resolution is observable, not an unseen algorithm. (Status field detail deferred to #1194.)
+### Status — the resolution is observable
+
+The per-pool object's status publishes both *what was resolved* and *what it governs*, so `kubectl get scalingpolicy <name> -o yaml` shows exactly what WVA decided — no unseen algorithm:
+
+```yaml
+status:
+  observedPool: granite-premium-pool
+  managedVariants:                     # the workloads this policy governs
+    - workloadRef: { kind: Deployment, name: granite-premium-prefill }
+      role: prefill                    # when known
+    - workloadRef: { kind: Deployment, name: granite-premium-decode }
+      role: decode
+  effectivePolicy: { … }               # merged result (cluster → ns → per-pool)
+  sources: [ … ]                       # contributing tiers, in precedence order
+```
+
+- **`effectivePolicy`** (+ **`sources`**) — the merged result and which tier each field came from.
+- **`managedVariants`** — the workloads this policy actually governs. The policy matches an `InferencePool`; WVA resolves that pool to its pods and their owning workloads (the *variants*) at reconcile time and lists each by its **workload reference — the same object a tenant's HPA/`ScaledObject` `scaleTargetRef` points at.** Discovery is via the pool, *not* by reading HPA objects (§2), so this adds no HPA dependency; it just lets an operator line up *policy → variants → their HPAs*. An **empty list is a loud misconfiguration signal** (the `inferencePoolRef` matched a pool with no workloads — wrong ref or selector mismatch), surfaced as a `PolicyMatched: False` condition. Live per-variant replica counts stay in the `wva_desired_replicas` metric — status holds the stable mapping, not the churning numbers.
 
 ## 5. Deliberately out of scope (deferred to #1194)
 
@@ -113,7 +130,7 @@ To hold this to the bare minimum, the following are **not** decided here and rem
 
 - Migration path and the `wva-config` CLI / migration tool.
 - Deprecation phases and the ConfigMap-removal timeline.
-- The full `status` condition catalog (only `effectivePolicy` / `sources` are referenced above).
+- The full `status` *condition* catalog (only `effectivePolicy`, `sources`, `managedVariants`, and the `PolicyMatched` condition are defined above).
 - Per-role (prefill/decode) configuration — an analyzer-`parameters` concern, not a CRD-shape concern.
 - Alternatives considered and the autoscaler comparison matrices.
 - The `quota` `parameters` schema and enforcement — owned by #1162.
