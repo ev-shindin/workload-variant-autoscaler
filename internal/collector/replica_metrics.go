@@ -53,6 +53,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	llmdVariantAutoscalingV1alpha1 "github.com/llm-d/llm-d-workload-variant-autoscaler/api/v1alpha1"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/collector/podvamap"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/collector/registration"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/collector/source"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/config"
@@ -129,6 +130,9 @@ func (c *ReplicaMetricsCollector) recordMetricsUnavailableEvent(
 //   - scaleTargets: Map of Deployment/LWS namespace/name to Deployment/LWS
 //   - variantAutoscalings: Map of VariantAutoscaling namespace/name to VariantAutoscaling object
 //   - variantCosts: Map of VariantAutoscaling namespace/name to cost value
+//   - podMap: Per-cycle pod→VA mapping derived from scale-target selectors; used to attribute
+//     a pod to its VariantAutoscaling when the llm-d.ai/variant override label is absent.
+//     May be nil, in which case attribution falls back to the label only.
 //
 // Returns:
 //   - []interfaces.ReplicaMetrics: Per-pod metrics for saturation and queueing model analysis
@@ -141,8 +145,9 @@ func (c *ReplicaMetricsCollector) CollectReplicaMetrics(
 	variantAutoscalings map[string]*llmdVariantAutoscalingV1alpha1.VariantAutoscaling,
 	vaEventTracker map[string]bool,
 	variantCosts map[string]float64,
+	podMap *podvamap.Map,
 ) ([]interfaces.ReplicaMetrics, error) {
-	replicaMetrics, err := c.collectReplicaMetrics(ctx, modelID, namespace, scaleTargets, variantAutoscalings, variantCosts)
+	replicaMetrics, err := c.collectReplicaMetrics(ctx, modelID, namespace, scaleTargets, variantAutoscalings, variantCosts, podMap)
 
 	// Determine if metrics are available in this cycle
 	metricsAvailable := err == nil && len(replicaMetrics) > 0
@@ -184,6 +189,7 @@ func (c *ReplicaMetricsCollector) collectReplicaMetrics(
 	scaleTargets map[string]scaletarget.ScaleTargetAccessor,
 	variantAutoscalings map[string]*llmdVariantAutoscalingV1alpha1.VariantAutoscaling,
 	variantCosts map[string]float64,
+	podMap *podvamap.Map,
 ) ([]interfaces.ReplicaMetrics, error) {
 	logger := ctrl.LoggerFrom(ctx)
 
@@ -315,8 +321,15 @@ func (c *ReplicaMetricsCollector) collectReplicaMetrics(
 			podName = labels["pod_name"]
 		}
 
-		// Extract VA name from llm_d_ai_variant label (propagated by ServiceMonitor)
+		// Extract VA name from llm_d_ai_variant label (propagated by ServiceMonitor).
+		// The label is a higher-precedence override; when absent, fall back to the
+		// per-cycle pod→VA map derived from scale-target selectors.
 		vaName := labels[constants.VariantLabelPrometheusKey]
+		if vaName == "" && podMap != nil {
+			if derived, ok := podMap.Lookup(namespace, podName); ok {
+				vaName = derived
+			}
+		}
 
 		// Try to extract port from instance label (IP:port format)
 		instance := labels["instance"]
@@ -752,6 +765,9 @@ func (c *ReplicaMetricsCollector) collectReplicaMetrics(
 		}
 
 		if vaName == "" {
+			// Neither the override label nor per-cycle derivation attributed this pod to
+			// a VA. variant_name is empty because the pod is unattributed — that is the signal.
+			metrics.IncPodMappingMiss("", namespace, constants.PodMappingMissUnresolved)
 			logger.Info("Skipping pod that doesn't match any scale target",
 				"pod", podName,
 				"instance", instanceKey,

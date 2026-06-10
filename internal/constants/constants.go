@@ -62,6 +62,11 @@ const (
 	LeaderWorkerSetKind       = "LeaderWorkerSet"
 	LeaderWorkerSetAPIVersion = "leaderworkerset.x-k8s.io/v1"
 
+	// Intermediate owner kinds traversed when resolving a pod to its scale target
+	// (Pod → ReplicaSet → Deployment, Pod → StatefulSet → LeaderWorkerSet).
+	ReplicaSetKind  = "ReplicaSet"
+	StatefulSetKind = "StatefulSet"
+
 	// K8s Events
 	K8SEventScaledUp                  = "ScaledUp"
 	K8SEventScaledDown                = "ScaledDown"

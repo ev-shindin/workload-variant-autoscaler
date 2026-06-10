@@ -454,6 +454,9 @@ func main() {
 			sourceRegistry,
 			cfg, // Pass unified Config to engine
 		)
+		// Use the uncached API reader for the per-cycle pod LIST in pod→VA derivation,
+		// so it does not start a cluster-wide Pod informer/cache.
+		engine.APIReader = mgr.GetAPIReader()
 		go engine.StartOptimizeLoop(ctx)
 		return nil
 	}))

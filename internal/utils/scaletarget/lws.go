@@ -3,10 +3,15 @@ package scaletarget
 import (
 	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	lwsv1 "sigs.k8s.io/lws/api/leaderworkerset/v1"
 
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/resources"
 )
+
+// lwsNameLabelKey is the well-known label the LeaderWorkerSet controller stamps on
+// every pod it manages, set to the LWS name. It is the reliable selector for a LWS's pods.
+const lwsNameLabelKey = "leaderworkerset.sigs.k8s.io/name"
 
 type lwsAccessor struct {
 	lws *lwsv1.LeaderWorkerSet
@@ -82,6 +87,12 @@ func (r *lwsAccessor) GetGroupSize() int32 {
 		return 1
 	}
 	return *r.lws.Spec.LeaderWorkerTemplate.Size
+}
+
+func (r *lwsAccessor) GetPodSelector() labels.Selector {
+	// r.lws is always not nil. The LWS controller labels every managed pod with
+	// leaderworkerset.sigs.k8s.io/name=<lws name>.
+	return labels.SelectorFromSet(labels.Set{lwsNameLabelKey: r.lws.Name})
 }
 
 func (r *lwsAccessor) GetName() string {

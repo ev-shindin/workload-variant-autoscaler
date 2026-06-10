@@ -185,6 +185,21 @@ const (
 	// WVAKvCacheTokensCapacity is a gauge that tracks total KV cache token capacity per variant.
 	// Labels: variant_name, namespace, model_name
 	WVAKvCacheTokensCapacity = "wva_kv_cache_tokens_capacity"
+
+	// WVAPodMappingMissTotal is a counter that tracks pods that could not be attributed
+	// to a VariantAutoscaling during per-cycle derivation from the scaleTargetRef selector.
+	// Labels: variant_name, namespace, reason
+	WVAPodMappingMissTotal = "wva_pod_mapping_miss_total"
+)
+
+// Pod-mapping miss reasons (values for the `reason` label of WVAPodMappingMissTotal).
+const (
+	// PodMappingMissUnresolved indicates a scraped pod matched no managed workload selector
+	// and carried no llm-d.ai/variant override label.
+	PodMappingMissUnresolved = "unresolved"
+	// PodMappingMissAmbiguous indicates a pod matched more than one workload selector and the
+	// owner-reference tiebreak could not attribute it to a single VariantAutoscaling.
+	PodMappingMissAmbiguous = "ambiguous"
 )
 
 // Metric Label Names

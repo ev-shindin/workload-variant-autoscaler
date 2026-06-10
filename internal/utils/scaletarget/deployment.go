@@ -4,6 +4,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/resources"
 )
@@ -64,6 +65,16 @@ func (r *deploymentAccessor) GetWorkerPodTemplateSpec() *corev1.PodTemplateSpec 
 
 func (r *deploymentAccessor) GetGroupSize() int32 {
 	return 1
+}
+
+func (r *deploymentAccessor) GetPodSelector() labels.Selector {
+	// r.deployment is always not nil; spec.selector is a required field on Deployment.
+	selector, err := v1.LabelSelectorAsSelector(r.deployment.Spec.Selector)
+	if err != nil || selector == nil {
+		// A malformed/absent selector matches nothing rather than everything.
+		return labels.Nothing()
+	}
+	return selector
 }
 
 func (r *deploymentAccessor) GetName() string {

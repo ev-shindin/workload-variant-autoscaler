@@ -243,14 +243,16 @@ This periodic reconciliation is why many Update and Delete events can be safely 
 
 ## Prerequisites
 
-### `llm-d.ai/variant` Label on the Scale Target
+### `llm-d.ai/variant` Label on the Scale Target (optional override)
 
-WVA identifies which pods belong to a given `VariantAutoscaling` resource by reading the `llm-d.ai/variant` label from Prometheus metrics. Two things must be true for this to work:
+By default WVA derives which pods belong to a `VariantAutoscaling` itself, once per optimization cycle, by listing the pods behind the scale target's selector (`scaleTargetRef` → Deployment/LeaderWorkerSet) and attributing each to that VA. **For the standard kinds (Deployment, LeaderWorkerSet) no pod-template label or ServiceMonitor relabeling rule is required** — pointing a `VariantAutoscaling` at a running workload is sufficient, with no rolling restart to adopt.
+
+The `llm-d.ai/variant` label remains supported as a **higher-precedence override**, for workloads the selector can't resolve (custom kinds or non-standard owner chains) and for back-compat with existing installs. When the label is present on a pod it takes precedence over the derived mapping. To use it, two things must be true:
 
 1. The `llm-d.ai/variant` label must be present on the **pod template** of the scale target (Deployment or LeaderWorkerSet), with a value equal to the name of the corresponding `VariantAutoscaling` resource.
 2. The `ServiceMonitor` or `PodMonitor` that Prometheus uses to scrape those pods must include a target relabeling rule that propagates the pod label into the scraped metrics as `llm_d_ai_variant`.
 
-**Both are your responsibility.** WVA does not configure either automatically.
+WVA reads the label but never writes it; both steps below are your responsibility only if you opt into the override.
 
 #### 1. Set the pod template label
 
@@ -315,15 +317,15 @@ spec:
 
 > **Important**: This rule must live under `relabelings` (target relabeling), **not** `metricRelabelings` (metric relabeling). The `__meta_kubernetes_pod_label_*` labels are only available during target relabeling and are stripped before metric relabeling runs.
 
-WVA uses the `llm_d_ai_variant` metric label to associate per-pod metrics with the correct `VariantAutoscaling` resource.
+WVA uses the `llm_d_ai_variant` metric label, when present, to associate per-pod metrics with the correct `VariantAutoscaling` resource, taking precedence over the derived mapping.
 
-If the pod label or the relabeling rule is absent, WVA will not collect metrics for the affected pods and scaling decisions for that variant will not be made.
+If the override label or relabeling rule is absent, WVA falls back to per-cycle selector derivation (the default). A pod that resolves to no scale target — and carries no override label — is skipped and counted in the `wva_pod_mapping_miss_total{reason="unresolved"}` metric; a pod matched by multiple overlapping selectors that the owner-reference tiebreak cannot disambiguate is counted with `reason="ambiguous"`.
 
 ## Best Practices
 
 ### For Operators
 
-1. **Set `llm-d.ai/variant` before creating the VA**: Ensure the pod template label is present on the scale target before creating the `VariantAutoscaling` resource. WVA begins collecting metrics on the first reconciliation and will miss pods that don't yet carry the label.
+1. **Adopt without touching the workload**: For Deployment/LeaderWorkerSet scale targets, no pod-template label is needed — create the `VariantAutoscaling` pointing at the running workload and WVA derives the pod mapping from the selector. Only reach for the `llm-d.ai/variant` override (and its relabeling rule) for custom kinds or non-standard owner chains; setting it requires a rolling restart of the workload, so prefer derivation where it works.
 
 2. **Create VAs after deployments are ready**: While the controller handles the race condition, creating VAs after deployments are fully initialized avoids unnecessary early reconciliation cycles.
 

@@ -35,6 +35,7 @@ import (
 	llmdVariantAutoscalingV1alpha1 "github.com/llm-d/llm-d-workload-variant-autoscaler/api/v1alpha1"
 	actuator "github.com/llm-d/llm-d-workload-variant-autoscaler/internal/actuator"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/collector"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/collector/podvamap"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/collector/registration"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/collector/source"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/config"
@@ -119,6 +120,12 @@ type Engine struct {
 	client   client.Client
 	scheme   *runtime.Scheme
 	executor executor.Executor
+
+	// APIReader is an uncached reader (mgr.GetAPIReader()) used for the per-cycle pod
+	// LIST in pod→VariantAutoscaling derivation, so listing pods does not start a
+	// cluster-wide Pod informer/cache. Falls back to the cached client when nil
+	// (e.g. in unit tests that construct the Engine directly).
+	APIReader client.Reader
 
 	// Recorder - use wrapper function recordEvent to limit number of events per va in an optimization cycle
 	Recorder record.EventRecorder
@@ -1248,10 +1255,21 @@ func (e *Engine) prepareModelData(
 		variantCosts[variantKey] = cost
 	}
 
+	// Derive the pod→VariantAutoscaling map for this cycle from each VA's scale-target
+	// selector, so the collector no longer depends on the tenant-authored
+	// llm-d.ai/variant pod label (which remains a higher-precedence override).
+	// Use the uncached APIReader so the per-cycle pod LIST does not start a
+	// cluster-wide Pod informer; fall back to the cached client when unset.
+	var podListReader client.Reader = k8sClient
+	if e.APIReader != nil {
+		podListReader = e.APIReader
+	}
+	podMap := podvamap.Build(ctx, podListReader, scaleTargets, variantAutoscalings)
+
 	logger.V(logging.DEBUG).Info("Using source infrastructure for replica metrics",
 		"modelID", modelID,
 		"namespace", namespace)
-	replicaMetrics, err := e.ReplicaMetricsCollector.CollectReplicaMetrics(ctx, modelID, namespace, scaleTargets, variantAutoscalings, e.vaEventTracker, variantCosts)
+	replicaMetrics, err := e.ReplicaMetricsCollector.CollectReplicaMetrics(ctx, modelID, namespace, scaleTargets, variantAutoscalings, e.vaEventTracker, variantCosts, podMap)
 	if err != nil {
 		return nil, fmt.Errorf("failed to collect Saturation metrics for model %s: %w", modelID, err)
 	}

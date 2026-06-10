@@ -3,6 +3,7 @@ package scaletarget
 import (
 	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 )
 
 // ScaleTargetAccessor provides a uniform interface to extract scaling-relevant
@@ -44,4 +45,10 @@ type ScaleTargetAccessor interface {
 	// For Deployment: always 1.
 	// For LWS: spec.leaderWorkerTemplate.size (1 leader + N-1 workers).
 	GetGroupSize() int32
+
+	// GetPodSelector returns a label selector matching the pods that belong to this
+	// scale target, used to derive the pod→VariantAutoscaling mapping per cycle.
+	// For Deployment: spec.selector.
+	// For LWS: the leaderworkerset.sigs.k8s.io/name label the LWS stamps on its pods.
+	GetPodSelector() labels.Selector
 }
