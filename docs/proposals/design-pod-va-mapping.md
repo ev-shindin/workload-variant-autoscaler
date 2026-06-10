@@ -23,13 +23,13 @@ Issue #1072 names the same fragility but proposes the *opposite* fix — have th
 
 ## Solution
 
-WVA derives the mapping itself from the scale target it already reads, once per optimization cycle (the timer-driven loop that already scrapes pods, every `OptimizationInterval` — not the per-VA-event `Reconcile`) — **no tenant-authored join key, no pod mutation, no new watch.**
+WVA derives the mapping itself from the scale target it already reads, once per optimization cycle (the timer-driven optimization loop, every `OptimizationInterval` — not the per-VA-event `Reconcile`) — **no tenant-authored join key, no pod mutation, no new watch.**
 
 - **Per-cycle derivation.** Once per cycle, for each autoscaling object it manages (a `VariantAutoscaling` today), WVA reads the `scaleTargetRef`, lists the pods behind the target's selector, and maps each pod back to that object. It's kind-aware for the standard kinds — `Deployment` and `LeaderWorkerSet` expose selectors and owner chains differently — with the opt-in label (below) for kinds the selector can't resolve. Resolution moves from per-metric to once-per-cycle.
 - **Ownership.** A pod is attributed by selector + namespace match. Confirming strict ownership would add one read up the owner chain (`Pod → ReplicaSet → Deployment`, or `Pod → StatefulSet → LeaderWorkerSet`); since a workload's selector is meant to uniquely own its pods, the default trusts selector + namespace and treats that extra read as optional hardening for the overlapping-selector edge case.
-- **No new watch.** The per-cycle list reuses the pod LIST the scraping source already issues (`pod_scraping_source.go` already `List`s the pods it scrapes), so it adds **no always-on Pod watch** and no cluster-scale Pod cache; WVA's controller already watches the `VariantAutoscaling` and its scale target, and neither watches `Pod`.
+- **No new watch.** The map is built from a bounded per-cycle pod LIST via the uncached API reader (`mgr.GetAPIReader()`) — one selector-scoped LIST per managed scale target, served directly by the API server — so it adds **no always-on Pod watch** and no cluster-scale Pod informer/cache. WVA's controller already watches the `VariantAutoscaling` and its scale target, and neither watches `Pod`.
 - **O(1) hot path.** Each per-metric lookup becomes a single `Lookup(podKey) → autoscaling object` map read (`podKey` = `namespace/name`, or `:port` for multi-vLLM pods); no Kubernetes calls in the metrics path.
-- **Misses become a signal, not silence.** An unresolved metric increments `wva_pod_mapping_miss_total{reason}` and logs a structured warning; an autoscaling object whose pods exist but aren't resolving gets a `PodMappingMissing` status condition. The old silent wrong-capacity fallback becomes visible. (Most misses are the brief pod-creation-to-next-cycle window — transient and self-healing.)
+- **Misses become a signal, not silence.** An unresolved pod increments `wva_pod_mapping_miss_total{reason}` (`reason` = `unresolved` or `ambiguous`) and logs a structured warning, so the old silent wrong-capacity fallback becomes visible. The signal is a metric, not a `VariantAutoscaling` status condition — the VA CRD is being deprecated, so the durable signal lives in Prometheus, not on the object. (Most misses are the brief pod-creation-to-next-cycle window — transient and self-healing.)
 - **Opt-in label for kinds the selector can't resolve.** For workloads WVA can't attribute by selector — custom CRDs, or non-standard owner chains — a label stays as a *higher-precedence override*. Its value names the same **autoscaling object** the derived path resolves to, not a frozen VA name, so it tracks the deprecation migration (below) instead of re-introducing the anchor the join key fails on. WVA reads it, never writes it; the existing `llm-d.ai/variant` label and its ServiceMonitor relabel rule (#1145) stay for installs that keep them.
 
 **Tenant experience:** apply the llm-d autoscaling kustomization for a `Deployment`/`LWS` — done. No pod-template edit, no relabel rule, no LWS double-template, no rolling restart to adopt.
@@ -46,7 +46,7 @@ The map exposes one internal contract — `Lookup(podKey) → autoscaling object
 
 ## Open question
 
-**List scope and cost.** The map is built from a per-cycle pod LIST scoped by the `scaleTargetRef` selector — no always-on watch. Open: whether to additionally restrict the list to namespaces that contain a managed workload, and whether the per-cycle LIST cost holds at scale. Settled with a list-latency benchmark on a representative cluster.
+**List scope and cost.** The map is built from one selector-scoped pod LIST per managed scale target per cycle, via the uncached API reader — no always-on watch. Open: whether to collapse this to one LIST per namespace with in-memory selector matching (fewer per-cycle API calls), and whether the cost holds at scale. Settled with a list-latency benchmark on a representative cluster.
 
 ---
 
