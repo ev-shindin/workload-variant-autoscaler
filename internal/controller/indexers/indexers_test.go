@@ -649,11 +649,12 @@ var _ = Describe("Indexers", Ordered, func() {
 			ref := autoscalingv2.CrossVersionObjectReference{
 				APIVersion: "apps/v1", Kind: "Deployment", Name: "target-deploy-2",
 			}
-			// Give the cache a chance to sync
+			// Wait for the cached client to ingest the new HPA before checking the
+			// index — without this, the indexed lookup can return (nil, nil) before
+			// the object propagates, masking real failures.
 			Eventually(func() error {
-				_, err := FindHPAForScaleTarget(testCtx, mgrClient, ref, ns)
-				return err
-			}).ShouldNot(HaveOccurred())
+				return mgrClient.Get(testCtx, client.ObjectKeyFromObject(hpa), &autoscalingv2.HorizontalPodAutoscaler{})
+			}).Should(Succeed())
 
 			got, err := FindHPAForScaleTarget(testCtx, mgrClient, ref, ns)
 			Expect(err).ToNot(HaveOccurred())
