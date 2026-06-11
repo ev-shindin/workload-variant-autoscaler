@@ -14,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/utils/ptr"
+	lwsv1 "sigs.k8s.io/lws/api/leaderworkerset/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
@@ -24,6 +25,7 @@ func newScheme(t *testing.T) *runtime.Scheme {
 	for _, add := range []func(*runtime.Scheme) error{
 		clientgoscheme.AddToScheme,
 		kedav1alpha1.AddToScheme,
+		lwsv1.AddToScheme,
 	} {
 		if err := add(s); err != nil {
 			t.Fatalf("scheme add: %v", err)
@@ -225,5 +227,33 @@ func TestLocate_CacheHitOnSecondCall(t *testing.T) {
 	}
 	if got == nil || got.HPA == nil || got.HPA.Name != "h" {
 		t.Errorf("cache miss on second call: got=%v", got)
+	}
+}
+
+func TestLocate_LWSChain(t *testing.T) {
+	ns := "default"
+	lws := &lwsv1.LeaderWorkerSet{ObjectMeta: metav1.ObjectMeta{Name: "lws", Namespace: ns, UID: "uid-lws"}}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: ns,
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "leaderworkerset.x-k8s.io/v1", Kind: "LeaderWorkerSet",
+				Name: "lws", UID: "uid-lws", Controller: ptr.To(true),
+			}}},
+	}
+	hpa := &autoscalingv2.HorizontalPodAutoscaler{
+		ObjectMeta: metav1.ObjectMeta{Name: "h", Namespace: ns,
+			Annotations: map[string]string{"llm-d.ai/managed": "true"}},
+		Spec: autoscalingv2.HorizontalPodAutoscalerSpec{
+			ScaleTargetRef: autoscalingv2.CrossVersionObjectReference{
+				APIVersion: "leaderworkerset.x-k8s.io/v1", Kind: "LeaderWorkerSet", Name: "lws",
+			},
+			MaxReplicas: 5,
+		},
+	}
+	cached, apiReader := newClients(t, lws, pod, hpa)
+	loc, _ := locator.New(cached, apiReader)
+	got, err := loc.Locate(context.Background(), ns, "p")
+	if err != nil || got == nil || got.HPA == nil || got.HPA.Name != "h" {
+		t.Fatalf("got=%v err=%v", got, err)
 	}
 }
