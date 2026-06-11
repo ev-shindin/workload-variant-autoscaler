@@ -218,7 +218,7 @@ func NewEngine(client client.Client, scheme *runtime.Scheme, recorder record.Eve
 		scheme:                  scheme,
 		Recorder:                recorder,
 		Config:                  cfg,
-		ReplicaMetricsCollector: collector.NewReplicaMetricsCollector(promSource, client, recorder),
+		ReplicaMetricsCollector: collector.NewReplicaMetricsCollector(promSource, client, recorder, nil),
 		ScaleToZeroEnforcer:     pipeline.NewEnforcer(requestCountFunc),
 		GPULimiter:              gpuLimiter,
 		metricsRegistry:         metricsRegistry,

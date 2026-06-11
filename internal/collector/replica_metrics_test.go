@@ -103,7 +103,7 @@ func TestRecordMetricsUnavailableEvent(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			fakeRecorder := record.NewFakeRecorder(100)
 			mockSource := &mockMetricsSource{}
-			collector := NewReplicaMetricsCollector(mockSource, nil, fakeRecorder)
+			collector := NewReplicaMetricsCollector(mockSource, nil, fakeRecorder, nil)
 
 			variantAutoscalings := make(map[string]*llmdVariantAutoscalingV1alpha1.VariantAutoscaling)
 			for i := 0; i < tt.numVAs; i++ {
@@ -183,7 +183,7 @@ func TestCollectReplicaMetrics_ErrorRecordsEvent(t *testing.T) {
 	mockSource := &mockMetricsSource{
 		refreshError: errors.New("prometheus connection failed"),
 	}
-	collector := NewReplicaMetricsCollector(mockSource, nil, fakeRecorder)
+	collector := NewReplicaMetricsCollector(mockSource, nil, fakeRecorder, nil)
 
 	// First call with error: no event (first observation, unknown previous state)
 	metrics, err := collector.CollectReplicaMetrics(ctx, "test-model", "default", scaleTargets, variantAutoscalings, nil, variantCosts)
@@ -241,7 +241,7 @@ func TestCollectReplicaMetrics_NoMetricsRecordsEvent(t *testing.T) {
 	mockSource := &mockMetricsSource{
 		results: make(map[string]*source.MetricResult),
 	}
-	collector := NewReplicaMetricsCollector(mockSource, nil, fakeRecorder)
+	collector := NewReplicaMetricsCollector(mockSource, nil, fakeRecorder, nil)
 
 	// First call: no metrics, should NOT emit event (first observation, unknown previous state)
 	metrics, err := collector.CollectReplicaMetrics(ctx, "test-model", "default", scaleTargets, variantAutoscalings, nil, variantCosts)
@@ -316,7 +316,7 @@ func TestCollectReplicaMetrics_EdgeTriggeredEvents(t *testing.T) {
 	mockSource := &mockMetricsSource{
 		results: make(map[string]*source.MetricResult),
 	}
-	collector := NewReplicaMetricsCollector(mockSource, nil, fakeRecorder)
+	collector := NewReplicaMetricsCollector(mockSource, nil, fakeRecorder, nil)
 
 	// First call: metrics unavailable, should NOT emit event (first observation, unknown previous state)
 	_, err := collector.CollectReplicaMetrics(ctx, "test-model", "default", scaleTargets, variantAutoscalings, nil, variantCosts)
@@ -377,7 +377,7 @@ func TestCollectReplicaMetrics_MetricsObservation(t *testing.T) {
 	}
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
 	fakeRecorder := record.NewFakeRecorder(100)
-	collector := NewReplicaMetricsCollector(mockSource, k8sClient, fakeRecorder)
+	collector := NewReplicaMetricsCollector(mockSource, k8sClient, fakeRecorder, nil)
 
 	// Call the function
 	_, err = collector.CollectReplicaMetrics(
@@ -488,7 +488,7 @@ func TestCollectReplicaMetrics_ErrorMetrics(t *testing.T) {
 	}
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
 	fakeRecorder := record.NewFakeRecorder(100)
-	collector := NewReplicaMetricsCollector(mockSource, k8sClient, fakeRecorder)
+	collector := NewReplicaMetricsCollector(mockSource, k8sClient, fakeRecorder, nil)
 
 	// Call the function - should return error
 	_, err = collector.CollectReplicaMetrics(

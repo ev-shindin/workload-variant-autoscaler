@@ -53,6 +53,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	llmdVariantAutoscalingV1alpha1 "github.com/llm-d/llm-d-workload-variant-autoscaler/api/v1alpha1"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/collector/locator"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/collector/registration"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/collector/source"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/config"
@@ -74,6 +75,7 @@ type ReplicaMetricsCollector struct {
 	source    source.MetricsSource
 	k8sClient client.Client
 	recorder  record.EventRecorder
+	locator   locator.PodLocator
 	// metricsAvailableState tracks whether metrics were available in the previous
 	// cycle for each VA (keyed by namespace/name). Used for edge-triggered events.
 	metricsAvailableState map[string]bool
@@ -81,11 +83,12 @@ type ReplicaMetricsCollector struct {
 }
 
 // NewReplicaMetricsCollector creates a new replica metrics collector.
-func NewReplicaMetricsCollector(metricsSource source.MetricsSource, k8sClient client.Client, recorder record.EventRecorder) *ReplicaMetricsCollector {
+func NewReplicaMetricsCollector(metricsSource source.MetricsSource, k8sClient client.Client, recorder record.EventRecorder, podLocator locator.PodLocator) *ReplicaMetricsCollector {
 	return &ReplicaMetricsCollector{
 		source:                metricsSource,
 		k8sClient:             k8sClient,
 		recorder:              recorder,
+		locator:               podLocator,
 		metricsAvailableState: make(map[string]bool),
 	}
 }
@@ -174,6 +177,54 @@ func (c *ReplicaMetricsCollector) CollectReplicaMetrics(
 		return nil, err
 	}
 	return replicaMetrics, nil
+}
+
+// buildInstanceKey returns (instanceKey, podName, vaName) for a series's labels.
+// vaName comes from the llm_d_ai_variant label when present (the legacy /
+// shadow-pod fast path). When absent and a pod label is present, falls back
+// to the locator's owner-walk for Deployment / LWS layouts. Returns
+// vaName="" when neither path resolves; the caller treats that as "skip".
+func (c *ReplicaMetricsCollector) buildInstanceKey(ctx context.Context, namespace string, labels map[string]string) (instanceKey, podName, vaName string) {
+	podName = labels["pod"]
+	if podName == "" {
+		podName = labels["pod_name"]
+	}
+
+	vaName = labels[constants.VariantLabelPrometheusKey]
+	if vaName == "" && podName != "" && c.locator != nil {
+		ms, err := c.locator.Locate(ctx, namespace, podName)
+		if err != nil {
+			ctrl.LoggerFrom(ctx).V(logging.DEBUG).Info("locator.Locate failed; treating pod as unmanaged",
+				"pod", podName, "namespace", namespace, "error", err)
+		} else if ms != nil {
+			switch {
+			case ms.HPA != nil:
+				vaName = ms.HPA.Name
+			case ms.ScaledObject != nil:
+				vaName = ms.ScaledObject.Name
+			}
+		}
+	}
+
+	instance := labels["instance"]
+	port := ""
+	if instance != "" && podName != "" {
+		if idx := strings.LastIndex(instance, ":"); idx != -1 {
+			port = instance[idx+1:]
+		}
+	}
+
+	switch {
+	case podName != "" && port != "":
+		instanceKey = podName + ":" + port
+	case instance != "":
+		instanceKey = instance
+	case podName != "":
+		instanceKey = podName
+	default:
+		return "", "", ""
+	}
+	return instanceKey, podName, vaName
 }
 
 // collectReplicaMetrics is the internal implementation that collects per-replica metrics.
@@ -305,47 +356,6 @@ func (c *ReplicaMetricsCollector) collectReplicaMetrics(
 		trackTimestamp(data.avgITLTimestamp)
 	}
 
-	// Helper function to build consistent instance key from labels and extract VA name
-	// Prefers pod_name:port format for consistency with scheduler metrics
-	// Falls back to instance (IP:port) if pod_name is not available
-	// Also extracts the VariantAutoscaling name from the llm_d_ai_variant label
-	buildInstanceKey := func(labels map[string]string) (string, string, string) {
-		podName := labels["pod"]
-		if podName == "" {
-			podName = labels["pod_name"]
-		}
-
-		// Extract VA name from llm_d_ai_variant label (propagated by ServiceMonitor)
-		vaName := labels[constants.VariantLabelPrometheusKey]
-
-		// Try to extract port from instance label (IP:port format)
-		instance := labels["instance"]
-		port := ""
-		if instance != "" && podName != "" {
-			// Extract port from instance (format: IP:port)
-			if idx := strings.LastIndex(instance, ":"); idx != -1 {
-				port = instance[idx+1:]
-			}
-		}
-
-		// Build composite key: pod_name:port (consistent with scheduler metrics)
-		var instanceKey string
-		switch {
-		case podName != "" && port != "":
-			instanceKey = podName + ":" + port
-		case instance != "":
-			// Fallback to instance if we can't build pod_name:port
-			instanceKey = instance
-		case podName != "":
-			// Fallback to just pod name if no port available
-			instanceKey = podName
-		default:
-			return "", "", ""
-		}
-
-		return instanceKey, podName, vaName
-	}
-
 	// Extract per-pod metrics from results
 	podData := make(map[string]*podMetricData)
 
@@ -355,7 +365,7 @@ func (c *ReplicaMetricsCollector) collectReplicaMetrics(
 			return nil, fmt.Errorf("KV cache query failed: %w", result.Error)
 		}
 		for _, value := range result.Values {
-			instanceKey, podName, vaName := buildInstanceKey(value.Labels)
+			instanceKey, podName, vaName := c.buildInstanceKey(ctx, namespace, value.Labels)
 			if instanceKey == "" {
 				continue
 			}
@@ -384,7 +394,7 @@ func (c *ReplicaMetricsCollector) collectReplicaMetrics(
 			return nil, fmt.Errorf("queue length query failed: %w", result.Error)
 		}
 		for _, value := range result.Values {
-			instanceKey, podName, vaName := buildInstanceKey(value.Labels)
+			instanceKey, podName, vaName := c.buildInstanceKey(ctx, namespace, value.Labels)
 			if instanceKey == "" {
 				continue
 			}
@@ -417,7 +427,7 @@ func (c *ReplicaMetricsCollector) collectReplicaMetrics(
 	if result := results[registration.QueryCacheConfigInfo]; result != nil {
 		if !result.HasError() {
 			for _, value := range result.Values {
-				instanceKey, podName, _ := buildInstanceKey(value.Labels)
+				instanceKey, podName, _ := c.buildInstanceKey(ctx, namespace, value.Labels)
 				if instanceKey == "" {
 					continue
 				}
@@ -458,7 +468,7 @@ func (c *ReplicaMetricsCollector) collectReplicaMetrics(
 	if result := results[registration.QueryAvgOutputTokens]; result != nil {
 		if !result.HasError() {
 			for _, value := range result.Values {
-				instanceKey, podName, vaName := buildInstanceKey(value.Labels)
+				instanceKey, podName, vaName := c.buildInstanceKey(ctx, namespace, value.Labels)
 				if instanceKey == "" {
 					continue
 				}
@@ -482,7 +492,7 @@ func (c *ReplicaMetricsCollector) collectReplicaMetrics(
 	if result := results[registration.QueryAvgInputTokens]; result != nil {
 		if !result.HasError() {
 			for _, value := range result.Values {
-				instanceKey, podName, vaName := buildInstanceKey(value.Labels)
+				instanceKey, podName, vaName := c.buildInstanceKey(ctx, namespace, value.Labels)
 				if instanceKey == "" {
 					continue
 				}
@@ -506,7 +516,7 @@ func (c *ReplicaMetricsCollector) collectReplicaMetrics(
 	if result := results[registration.QueryPrefixCacheHitRate]; result != nil {
 		if !result.HasError() {
 			for _, value := range result.Values {
-				instanceKey, podName, vaName := buildInstanceKey(value.Labels)
+				instanceKey, podName, vaName := c.buildInstanceKey(ctx, namespace, value.Labels)
 				if instanceKey == "" {
 					continue
 				}
@@ -577,7 +587,7 @@ func (c *ReplicaMetricsCollector) collectReplicaMetrics(
 	if result := results[registration.QueryAvgTTFT]; result != nil {
 		if !result.HasError() {
 			for _, value := range result.Values {
-				instanceKey, podName, vaName := buildInstanceKey(value.Labels)
+				instanceKey, podName, vaName := c.buildInstanceKey(ctx, namespace, value.Labels)
 				if instanceKey == "" {
 					continue
 				}
@@ -605,7 +615,7 @@ func (c *ReplicaMetricsCollector) collectReplicaMetrics(
 	if result := results[registration.QueryAvgITL]; result != nil {
 		if !result.HasError() {
 			for _, value := range result.Values {
-				instanceKey, podName, vaName := buildInstanceKey(value.Labels)
+				instanceKey, podName, vaName := c.buildInstanceKey(ctx, namespace, value.Labels)
 				if instanceKey == "" {
 					continue
 				}
