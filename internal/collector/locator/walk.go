@@ -89,11 +89,11 @@ func nodeOf(obj client.Object, namespace string) chainNode {
 		case *corev1.Pod:
 			apiVersion, kind = "v1", "Pod"
 		case *appsv1.ReplicaSet:
-			apiVersion, kind = "apps/v1", "ReplicaSet"
+			apiVersion, kind = constants.DeploymentAPIVersion, "ReplicaSet"
 		case *appsv1.Deployment:
-			apiVersion, kind = "apps/v1", "Deployment"
+			apiVersion, kind = constants.DeploymentAPIVersion, constants.DeploymentKind
 		case *lwsv1.LeaderWorkerSet:
-			apiVersion, kind = "leaderworkerset.x-k8s.io/v1", "LeaderWorkerSet"
+			apiVersion, kind = constants.LeaderWorkerSetAPIVersion, constants.LeaderWorkerSetKind
 		}
 	}
 	return chainNode{
@@ -110,15 +110,15 @@ func nodeOf(obj client.Object, namespace string) chainNode {
 func newTypedFor(owner *metav1.OwnerReference) (client.Object, bool) {
 	switch owner.Kind {
 	case "ReplicaSet":
-		if owner.APIVersion == "apps/v1" {
+		if owner.APIVersion == constants.DeploymentAPIVersion {
 			return &appsv1.ReplicaSet{}, true
 		}
-	case "Deployment":
-		if owner.APIVersion == "apps/v1" {
+	case constants.DeploymentKind:
+		if owner.APIVersion == constants.DeploymentAPIVersion {
 			return &appsv1.Deployment{}, true
 		}
-	case "LeaderWorkerSet":
-		if owner.APIVersion == "leaderworkerset.x-k8s.io/v1" {
+	case constants.LeaderWorkerSetKind:
+		if owner.APIVersion == constants.LeaderWorkerSetAPIVersion {
 			return &lwsv1.LeaderWorkerSet{}, true
 		}
 	}

@@ -14,9 +14,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/utils/ptr"
-	lwsv1 "sigs.k8s.io/lws/api/leaderworkerset/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	lwsv1 "sigs.k8s.io/lws/api/leaderworkerset/v1"
 )
 
 func newScheme(t *testing.T) *runtime.Scheme {
@@ -48,8 +48,10 @@ func newClients(t *testing.T, objs ...runtime.Object) (cached, apiReader client.
 	return build(), build()
 }
 
+const testNamespace = "default"
+
 func TestLocate_DeploymentChainHitsManagedHPA(t *testing.T) {
-	ns := "default"
+	ns := testNamespace
 	deploy := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "d", Namespace: ns, UID: "uid-d"}}
 	rs := &appsv1.ReplicaSet{
 		ObjectMeta: metav1.ObjectMeta{
@@ -93,7 +95,7 @@ func TestLocate_DeploymentChainHitsManagedHPA(t *testing.T) {
 }
 
 func TestLocate_UnmanagedReturnsNil(t *testing.T) {
-	ns := "default"
+	ns := testNamespace
 	deploy := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "d", Namespace: ns, UID: "uid-d"}}
 	rs := &appsv1.ReplicaSet{
 		ObjectMeta: metav1.ObjectMeta{Name: "rs", Namespace: ns, UID: "uid-rs",
@@ -117,7 +119,7 @@ func TestLocate_UnmanagedReturnsNil(t *testing.T) {
 func TestLocate_PodNotFound(t *testing.T) {
 	cached, apiReader := newClients(t)
 	loc, _ := locator.New(cached, apiReader)
-	got, err := loc.Locate(context.Background(), "default", "missing")
+	got, err := loc.Locate(context.Background(), testNamespace, "missing")
 	if err != nil {
 		t.Fatalf("Locate: %v", err)
 	}
@@ -127,7 +129,7 @@ func TestLocate_PodNotFound(t *testing.T) {
 }
 
 func TestLocateByVariant_HPA(t *testing.T) {
-	ns := "default"
+	ns := testNamespace
 	hpa := &autoscalingv2.HorizontalPodAutoscaler{
 		ObjectMeta: metav1.ObjectMeta{Name: "v", Namespace: ns,
 			Annotations: map[string]string{"llm-d.ai/managed": "true"}},
@@ -148,7 +150,7 @@ func TestLocateByVariant_HPA(t *testing.T) {
 }
 
 func TestLocateByVariant_UnmanagedHPA(t *testing.T) {
-	ns := "default"
+	ns := testNamespace
 	hpa := &autoscalingv2.HorizontalPodAutoscaler{
 		ObjectMeta: metav1.ObjectMeta{Name: "v", Namespace: ns},
 		Spec: autoscalingv2.HorizontalPodAutoscalerSpec{
@@ -168,7 +170,7 @@ func TestLocateByVariant_UnmanagedHPA(t *testing.T) {
 }
 
 func TestLocateByVariant_AmbiguousHPAandSO(t *testing.T) {
-	ns := "default"
+	ns := testNamespace
 	hpa := &autoscalingv2.HorizontalPodAutoscaler{
 		ObjectMeta: metav1.ObjectMeta{Name: "v", Namespace: ns,
 			Annotations: map[string]string{"llm-d.ai/managed": "true"}},
@@ -192,7 +194,7 @@ func TestLocateByVariant_AmbiguousHPAandSO(t *testing.T) {
 }
 
 func TestLocate_CacheHitOnSecondCall(t *testing.T) {
-	ns := "default"
+	ns := testNamespace
 	deploy := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "d", Namespace: ns, UID: "uid-d"}}
 	rs := &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{Name: "rs", Namespace: ns, UID: "uid-rs",
 		OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "Deployment", Name: "d", UID: "uid-d", Controller: ptr.To(true)}}}}
@@ -231,7 +233,7 @@ func TestLocate_CacheHitOnSecondCall(t *testing.T) {
 }
 
 func TestLocate_LWSChain(t *testing.T) {
-	ns := "default"
+	ns := testNamespace
 	lws := &lwsv1.LeaderWorkerSet{ObjectMeta: metav1.ObjectMeta{Name: "lws", Namespace: ns, UID: "uid-lws"}}
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: ns,
