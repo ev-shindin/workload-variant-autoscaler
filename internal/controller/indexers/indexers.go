@@ -42,11 +42,12 @@ func scaleTargetIndexKey(namespace string, ref autoscalingv2.CrossVersionObjectR
 }
 
 // SetupIndexes registers custom field indexes with the manager's cache.
-// Currently only the VariantAutoscaling index is registered here; HPA and
-// ScaledObject indexes are added in Tasks 7 and 8.
 func SetupIndexes(ctx context.Context, mgr manager.Manager) error {
 	if err := mgr.GetFieldIndexer().IndexField(ctx, &llmdVariantAutoscalingV1alpha1.VariantAutoscaling{}, VAScaleTargetKey, VAScaleTargetIndexFunc); err != nil {
 		return fmt.Errorf("failed to set up index by scale target for VariantAutoscaling: %w", err)
+	}
+	if err := mgr.GetFieldIndexer().IndexField(ctx, &autoscalingv2.HorizontalPodAutoscaler{}, HPAByScaleTargetKey, HPAByScaleTargetIndexFunc); err != nil {
+		return fmt.Errorf("failed to set up index by scale target for HPA: %w", err)
 	}
 	return nil
 }

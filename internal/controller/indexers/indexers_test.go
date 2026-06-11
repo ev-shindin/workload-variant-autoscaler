@@ -582,6 +582,85 @@ var _ = Describe("Indexers", Ordered, func() {
 		})
 	})
 
+	Describe("HPA index", func() {
+		It("returns a managed HPA for its Deployment scaleTargetRef", func() {
+			ns := namespace + "-hpa-1"
+			Expect(k8sClient.Create(testCtx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+			defer func() {
+				Expect(client.IgnoreNotFound(k8sClient.Delete(testCtx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}))).To(Succeed())
+			}()
+
+			hpa := &autoscalingv2.HorizontalPodAutoscaler{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "managed-hpa",
+					Namespace:   ns,
+					Annotations: map[string]string{"llm-d.ai/managed": "true"},
+				},
+				Spec: autoscalingv2.HorizontalPodAutoscalerSpec{
+					ScaleTargetRef: autoscalingv2.CrossVersionObjectReference{
+						APIVersion: "apps/v1", Kind: "Deployment", Name: "target-deploy",
+					},
+					MaxReplicas: 10,
+				},
+			}
+			Expect(k8sClient.Create(testCtx, hpa)).To(Succeed())
+			defer func() {
+				Expect(client.IgnoreNotFound(k8sClient.Delete(testCtx, hpa))).To(Succeed())
+			}()
+
+			ref := autoscalingv2.CrossVersionObjectReference{
+				APIVersion: "apps/v1", Kind: "Deployment", Name: "target-deploy",
+			}
+			Eventually(func() string {
+				got, err := FindHPAForScaleTarget(testCtx, mgrClient, ref, ns)
+				if err != nil || got == nil {
+					return ""
+				}
+				return got.Name
+			}).Should(Equal("managed-hpa"))
+
+			got, err := FindHPAForScaleTarget(testCtx, mgrClient, ref, ns)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(got).ToNot(BeNil())
+			Expect(got.Name).To(Equal("managed-hpa"))
+		})
+
+		It("ignores HPAs without llm-d.ai/managed=true", func() {
+			ns := namespace + "-hpa-2"
+			Expect(k8sClient.Create(testCtx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+			defer func() {
+				Expect(client.IgnoreNotFound(k8sClient.Delete(testCtx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}))).To(Succeed())
+			}()
+
+			hpa := &autoscalingv2.HorizontalPodAutoscaler{
+				ObjectMeta: metav1.ObjectMeta{Name: "unmanaged", Namespace: ns},
+				Spec: autoscalingv2.HorizontalPodAutoscalerSpec{
+					ScaleTargetRef: autoscalingv2.CrossVersionObjectReference{
+						APIVersion: "apps/v1", Kind: "Deployment", Name: "target-deploy-2",
+					},
+					MaxReplicas: 5,
+				},
+			}
+			Expect(k8sClient.Create(testCtx, hpa)).To(Succeed())
+			defer func() {
+				Expect(client.IgnoreNotFound(k8sClient.Delete(testCtx, hpa))).To(Succeed())
+			}()
+
+			ref := autoscalingv2.CrossVersionObjectReference{
+				APIVersion: "apps/v1", Kind: "Deployment", Name: "target-deploy-2",
+			}
+			// Give the cache a chance to sync
+			Eventually(func() error {
+				_, err := FindHPAForScaleTarget(testCtx, mgrClient, ref, ns)
+				return err
+			}).ShouldNot(HaveOccurred())
+
+			got, err := FindHPAForScaleTarget(testCtx, mgrClient, ref, ns)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(got).To(BeNil())
+		})
+	})
+
 	Describe("APIVersion handling", func() {
 		It("should match VAs with explicit APIVersion", func() {
 			deploymentName := "test-deploy-apiversion"
