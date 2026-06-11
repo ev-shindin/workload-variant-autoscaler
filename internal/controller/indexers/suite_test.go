@@ -19,12 +19,15 @@ package indexers
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	kedav1alpha1 "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -62,11 +65,17 @@ var _ = BeforeSuite(func() {
 	err = llmdv1alpha1.AddToScheme(scheme.Scheme)
 	Expect(err).NotTo(HaveOccurred())
 
+	err = kedav1alpha1.AddToScheme(scheme.Scheme)
+	Expect(err).NotTo(HaveOccurred())
+
 	// +kubebuilder:scaffold:scheme
 
 	By("bootstrapping test environment")
 	testEnv = &envtest.Environment{
-		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "..", "config", "base", "crd")},
+		CRDDirectoryPaths: []string{
+			filepath.Join("..", "..", "..", "config", "base", "crd"),
+			filepath.Join(getKEDACRDDir()),
+		},
 		ErrorIfCRDPathMissing: true,
 	}
 
@@ -91,6 +100,22 @@ var _ = AfterSuite(func() {
 	err := testEnv.Stop()
 	Expect(err).NotTo(HaveOccurred())
 })
+
+// getKEDACRDDir returns the path to KEDA CRD bases in the Go module cache.
+// This allows envtest to load the ScaledObject CRD without bundling it in the repo.
+func getKEDACRDDir() string {
+	// Prefer GOMODCACHE env var (set by go toolchain), then fall back to `go env`.
+	goModCache := os.Getenv("GOMODCACHE")
+	if goModCache == "" {
+		if out, err := exec.Command("go", "env", "GOMODCACHE").Output(); err == nil {
+			goModCache = strings.TrimSpace(string(out))
+		}
+	}
+	if goModCache == "" {
+		goModCache = filepath.Join(os.Getenv("HOME"), "go", "pkg", "mod")
+	}
+	return filepath.Join(goModCache, "github.com", "kedacore", "keda", "v2@v2.18.0", "config", "crd", "bases")
+}
 
 // getFirstFoundEnvTestBinaryDir locates the first binary in the specified path.
 // ENVTEST-based tests depend on specific binaries, usually located in paths set by

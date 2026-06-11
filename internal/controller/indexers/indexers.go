@@ -14,6 +14,7 @@ import (
 	"context"
 	"fmt"
 
+	kedav1alpha1 "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
 	llmdVariantAutoscalingV1alpha1 "github.com/llm-d/llm-d-workload-variant-autoscaler/api/v1alpha1"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/constants"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/logging"
@@ -48,6 +49,9 @@ func SetupIndexes(ctx context.Context, mgr manager.Manager) error {
 	}
 	if err := mgr.GetFieldIndexer().IndexField(ctx, &autoscalingv2.HorizontalPodAutoscaler{}, HPAByScaleTargetKey, HPAByScaleTargetIndexFunc); err != nil {
 		return fmt.Errorf("failed to set up index by scale target for HPA: %w", err)
+	}
+	if err := mgr.GetFieldIndexer().IndexField(ctx, &kedav1alpha1.ScaledObject{}, ScaledObjectByScaleTargetKey, ScaledObjectByScaleTargetIndexFunc); err != nil {
+		return fmt.Errorf("failed to set up index by scale target for ScaledObject: %w", err)
 	}
 	return nil
 }
