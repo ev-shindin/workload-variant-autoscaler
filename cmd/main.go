@@ -449,6 +449,7 @@ func main() {
 
 		engine := saturation.NewEngine(
 			mgr.GetClient(),
+			mgr.GetAPIReader(),
 			mgr.GetScheme(),
 			mgr.GetEventRecorderFor("workload-variant-autoscaler-saturation-engine"),
 			sourceRegistry,
