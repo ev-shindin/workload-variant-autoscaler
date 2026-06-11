@@ -2,6 +2,10 @@
 // ScaledObject) that controls its replica count, via ownerReferences walking
 // for Deployment / LWS layouts and via the variant name for shadow-pod
 // layouts. See docs/superpowers/specs/2026-06-11-pod-to-managed-scaler-locator-design.md.
+
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups=apps,resources=replicasets,verbs=get;list;watch
+
 package locator
 
 import (
