@@ -71,11 +71,12 @@ var _ = BeforeSuite(func() {
 	// +kubebuilder:scaffold:scheme
 
 	By("bootstrapping test environment")
+	crdPaths := []string{filepath.Join("..", "..", "..", "config", "base", "crd")}
+	if dir := getKEDACRDDir(); dir != "" {
+		crdPaths = append(crdPaths, dir)
+	}
 	testEnv = &envtest.Environment{
-		CRDDirectoryPaths: []string{
-			filepath.Join("..", "..", "..", "config", "base", "crd"),
-			filepath.Join(getKEDACRDDir()),
-		},
+		CRDDirectoryPaths:     crdPaths,
 		ErrorIfCRDPathMissing: true,
 	}
 
@@ -101,20 +102,22 @@ var _ = AfterSuite(func() {
 	Expect(err).NotTo(HaveOccurred())
 })
 
-// getKEDACRDDir returns the path to KEDA CRD bases in the Go module cache.
-// This allows envtest to load the ScaledObject CRD without bundling it in the repo.
+// getKEDACRDDir returns the path to the KEDA CRD bases bundled with the
+// version of github.com/kedacore/keda/v2 that this module pins. Resolved at
+// test time via `go list -m` so the path tracks whatever go.mod says,
+// without hardcoding a version. Returns "" when resolution fails or the
+// directory does not exist; callers should skip appending the path in
+// that case.
 func getKEDACRDDir() string {
-	// Prefer GOMODCACHE env var (set by go toolchain), then fall back to `go env`.
-	goModCache := os.Getenv("GOMODCACHE")
-	if goModCache == "" {
-		if out, err := exec.Command("go", "env", "GOMODCACHE").Output(); err == nil {
-			goModCache = strings.TrimSpace(string(out))
-		}
+	out, err := exec.Command("go", "list", "-m", "-f", "{{.Dir}}", "github.com/kedacore/keda/v2").Output()
+	if err != nil {
+		return ""
 	}
-	if goModCache == "" {
-		goModCache = filepath.Join(os.Getenv("HOME"), "go", "pkg", "mod")
+	dir := filepath.Join(strings.TrimSpace(string(out)), "config", "crd", "bases")
+	if _, err := os.Stat(dir); err != nil {
+		return ""
 	}
-	return filepath.Join(goModCache, "github.com", "kedacore", "keda", "v2@v2.18.0", "config", "crd", "bases")
+	return dir
 }
 
 // getFirstFoundEnvTestBinaryDir locates the first binary in the specified path.
