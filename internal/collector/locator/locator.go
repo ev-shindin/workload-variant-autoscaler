@@ -46,10 +46,10 @@ type PodLocator interface {
 // New constructs a PodLocator.
 //
 //   - cached    — controller-runtime cached client (mgr.GetClient()), used
-//     only for the field-indexed list of managed HPAs / ScaledObjects.
+//     for the field-indexed scaler lookups and for LocateByVariant's
+//     direct Get by name (HPAs and ScaledObjects are already watched).
 //   - apiReader — uncached reader (mgr.GetAPIReader()), used for every
-//     Pod / ReplicaSet / Deployment / LWS read in the owner-chain walk
-//     and for LocateByVariant.
+//     Pod / ReplicaSet / Deployment / LWS read in the owner-chain walk.
 func New(cached, apiReader client.Reader) (PodLocator, error) {
 	cache, err := newResolutionCache(defaultCacheSize)
 	if err != nil {
@@ -181,6 +181,8 @@ func (l *podLocator) getManagedHPA(ctx context.Context, namespace, name string) 
 	return hpa, nil
 }
 
+// getManagedScaledObject fetches a ScaledObject by name and returns it only
+// if it carries llm-d.ai/managed=true.
 func (l *podLocator) getManagedScaledObject(ctx context.Context, namespace, name string) (*kedav1alpha1.ScaledObject, error) {
 	so := &kedav1alpha1.ScaledObject{}
 	if err := l.cached.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, so); err != nil {
