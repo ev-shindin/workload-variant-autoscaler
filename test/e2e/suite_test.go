@@ -180,6 +180,15 @@ var _ = BeforeSuite(func() {
 		g.Expect(runningPods).To(BeNumerically(">", 0), "No running WVA controller pods")
 	}).Should(Succeed(), "WVA controller should be running")
 
+	// The kustomize base now ships the saturation ConfigMap with
+	// analyzers:[saturation] (the V2 token-based path). Revert it to the V1
+	// percentage-based default so the existing scaling specs run the same path
+	// they were written and validated against. Suites that exercise V2
+	// (saturation_v2_test.go, saturation_analyzer_path_test.go) set and restore
+	// their own config, so they are unaffected.
+	By("Reverting saturation config to V1 for suite consistency")
+	revertSaturationConfigToV1()
+
 	By("Verifying llm-d infrastructure")
 	// Verify Gateway CRDs exist
 	Eventually(func(g Gomega) {
@@ -253,6 +262,33 @@ var _ = BeforeSuite(func() {
 
 	GinkgoWriter.Println("BeforeSuite completed successfully - infrastructure ready")
 })
+
+// satConfigV1Default mirrors the pre-V2 kustomize default for the saturation
+// ConfigMap (no analyzers list and no analyzerName → V1 percentage-based path).
+const satConfigV1Default = `kvCacheThreshold: 0.80
+queueLengthThreshold: 5
+kvSpareTrigger: 0.1
+queueSpareTrigger: 3
+enableLimiter: false
+`
+
+// revertSaturationConfigToV1 patches the deployed saturation ConfigMap's
+// "default" entry to the V1 config, so the general e2e suite runs the V1
+// percentage-based analyzer regardless of the kustomize default (which now
+// selects V2). The controller hot-reloads the labeled ConfigMap, so no restart
+// is required.
+func revertSaturationConfigToV1() {
+	name := saturationConfigMapName()
+	ns := cfg.WVANamespace
+	cm, err := k8sClient.CoreV1().ConfigMaps(ns).Get(ctx, name, metav1.GetOptions{})
+	Expect(err).NotTo(HaveOccurred(), "failed to get saturation ConfigMap %s/%s", ns, name)
+	if cm.Data == nil {
+		cm.Data = map[string]string{}
+	}
+	cm.Data["default"] = satConfigV1Default
+	_, err = k8sClient.CoreV1().ConfigMaps(ns).Update(ctx, cm, metav1.UpdateOptions{})
+	Expect(err).NotTo(HaveOccurred(), "failed to revert saturation ConfigMap to V1")
+}
 
 // ReportAfterEach dumps controller logs and VA status after a failed test.
 // This makes E2E failures self-contained and easier to debug (why scaling happened / didn't happen).
