@@ -49,6 +49,12 @@ As shipped (kustomize base and helm chart), the **default ConfigMap selects the 
 ```yaml
 analyzers:
   - name: saturation
+    # Per-analyzer threshold overrides (optional; shown with their defaults):
+    # scaleUpThreshold: 0.85     # default
+    # scaleDownBoundary: 0.70    # default
+# Global threshold overrides (optional; apply to every analyzer):
+# scaleUpThreshold: 0.85
+# scaleDownBoundary: 0.70
 kvCacheThreshold: 0.80
 queueLengthThreshold: 5
 kvSpareTrigger: 0.1
