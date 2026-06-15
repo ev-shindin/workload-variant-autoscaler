@@ -38,6 +38,7 @@ var (
 	metricsCollectionErrors             *prometheus.CounterVec
 	metricsPodsDiscovered               *prometheus.GaugeVec
 	metricsFreshnessStatus              *prometheus.GaugeVec
+	podMappingMissTotal                 *prometheus.CounterVec
 
 	// Saturation and capacity metrics
 	saturationUtilization *prometheus.GaugeVec
@@ -321,6 +322,18 @@ func InitMetrics(registry prometheus.Registerer) error {
 		metricsFreshnessStatusLabels,
 	)
 
+	podMappingMissLabels := []string{constants.LabelNamespace, constants.LabelReason}
+	if controllerInstance != "" {
+		podMappingMissLabels = append(podMappingMissLabels, constants.LabelControllerInstance)
+	}
+	podMappingMissTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: constants.WVAPodMappingMissTotal,
+			Help: "Total number of pods whose metrics could not be attributed to a managed scaler",
+		},
+		podMappingMissLabels,
+	)
+
 	// Register metrics with the registry
 	if err := registry.Register(replicaScalingTotal); err != nil {
 		return fmt.Errorf("failed to register replicaScalingTotal metric: %w", err)
@@ -375,6 +388,9 @@ func InitMetrics(registry prometheus.Registerer) error {
 	}
 	if err := registry.Register(metricsPodsDiscovered); err != nil {
 		return fmt.Errorf("failed to register metricsPodsDiscovered metric: %w", err)
+	}
+	if err := registry.Register(podMappingMissTotal); err != nil {
+		return fmt.Errorf("failed to register podMappingMissTotal metric: %w", err)
 	}
 	if err := registry.Register(metricsFreshnessStatus); err != nil {
 		return fmt.Errorf("failed to register metricsFreshnessStatus metric: %w", err)
@@ -675,6 +691,21 @@ func IncMetricsCollectionErrors(queryType, reason string) {
 		labels[constants.LabelControllerInstance] = controllerInstance
 	}
 	metricsCollectionErrors.With(labels).Inc()
+}
+
+// IncPodMappingMiss increments the pod-to-managed-scaler mapping miss counter.
+func IncPodMappingMiss(namespace, reason string) {
+	if podMappingMissTotal == nil {
+		return
+	}
+	labels := prometheus.Labels{
+		constants.LabelNamespace: namespace,
+		constants.LabelReason:    reason,
+	}
+	if controllerInstance != "" {
+		labels[constants.LabelControllerInstance] = controllerInstance
+	}
+	podMappingMissTotal.With(labels).Inc()
 }
 
 // SetMetricsPodsDiscovered sets the number of pods discovered in a namespace.

@@ -762,6 +762,11 @@ func (c *ReplicaMetricsCollector) collectReplicaMetrics(
 		}
 
 		if vaName == "" {
+			// Neither the llm-d.ai/variant label nor the pod locator attributed
+			// this pod to a managed scaler. Count it so the otherwise-silent skip
+			// is observable; the pod is unattributed, so the metric is keyed by
+			// namespace and reason only.
+			metrics.IncPodMappingMiss(namespace, constants.PodMappingMissUnresolved)
 			logger.Info("Skipping pod that doesn't match any scale target",
 				"pod", podName,
 				"instance", instanceKey,
