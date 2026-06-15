@@ -109,6 +109,31 @@ func (e *Engine) runAnalyzersAndScore(
 	satUp, satDown := resolveThresholds(interfaces.SaturationAnalyzerName, config)
 	applyUniversalThreshold(baseResult, satUp, satDown)
 
+	// Log the resolved thresholds together with the post-recalibration capacity
+	// that actually drives the scaling decision. The earlier "V2 saturation
+	// analysis completed" line logs the analyzer's RAW output (before this
+	// step), so without this an operator cannot tell whether a spareCapacity of
+	// 0 came from the analyzer or from a non-positive scaleDownBoundary (which
+	// silently skips the scale-down branch in applyUniversalThreshold).
+	logger.Info("V2 saturation thresholds resolved",
+		"modelID", modelID,
+		"namespace", namespace,
+		"scaleUpThreshold", satUp,
+		"scaleDownBoundary", satDown,
+		"requiredCapacity", baseResult.RequiredCapacity,
+		"spareCapacity", baseResult.SpareCapacity)
+	// A non-positive saturation threshold disables scale-up/down recalibration
+	// for the cycle and is almost always a misconfiguration or a config that was
+	// not recognized as V2 when defaults were applied (so ScaleUp/ScaleDownBoundary
+	// were never filled). Surface it loudly rather than silently no-op'ing.
+	if satUp <= 0 || satDown <= 0 {
+		logger.Info("V2 saturation thresholds are non-positive; scale recalibration is disabled this cycle — check ConfigMap reload and that the resolved config is V2 (analyzers / analyzerName: saturation)",
+			"modelID", modelID,
+			"namespace", namespace,
+			"scaleUpThreshold", satUp,
+			"scaleDownBoundary", satDown)
+	}
+
 	// Build AnalyzerInput once; shared by all non-saturation analyzers.
 	// Note: &config has had saturation's per-entry threshold overrides applied
 	// (the loop above). Non-saturation analyzers therefore receive the
