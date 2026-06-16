@@ -9,6 +9,7 @@ import (
 
 	llmdOptv1alpha1 "github.com/llm-d/llm-d-workload-variant-autoscaler/api/v1alpha1"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/constants"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/interfaces"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -432,12 +433,12 @@ func NewMetricsEmitter() *MetricsEmitter {
 }
 
 // EmitReplicaScalingMetrics emits metrics related to replica scaling
-func (m *MetricsEmitter) EmitReplicaScalingMetrics(ctx context.Context, va *llmdOptv1alpha1.VariantAutoscaling, direction, reason string) error {
+func (m *MetricsEmitter) EmitReplicaScalingMetrics(ctx context.Context, va *llmdOptv1alpha1.VariantAutoscaling, direction interfaces.SaturationAction, reason interfaces.DecisionReason) error {
 	labels := prometheus.Labels{
 		constants.LabelVariantName: va.Name,
 		constants.LabelNamespace:   va.Namespace,
-		constants.LabelDirection:   direction,
-		constants.LabelReason:      reason,
+		constants.LabelDirection:   string(direction),
+		constants.LabelReason:      fmt.Sprintf("%s: %s", reason, direction),
 	}
 
 	// Add controller_instance label if configured

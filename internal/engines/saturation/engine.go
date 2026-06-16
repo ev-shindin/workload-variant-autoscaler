@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
-	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -1042,11 +1041,11 @@ func (e *Engine) convertSaturationTargetsToDecisions(
 			SaturationOnly:         true,
 			ModelBasedDecision:     false,
 			SafetyOverride:         false,
-			Reason:                 "saturation-only mode: " + string(action),
 			GPUsPerReplica:         gpusPerReplica,
 			MinReplicas:            state.MinReplicas,
 			MaxReplicas:            state.MaxReplicas,
 		}
+		decision.SetDecisionReason(action, interfaces.DecisionReasonSaturationOnly, fmt.Sprintf("%s: %s", string(interfaces.DecisionReasonSaturationOnly), string(action)))
 
 		if va != nil {
 			decision.AcceleratorName = va.AcceleratorName
@@ -1359,7 +1358,7 @@ func (e *Engine) applySaturationDecisions(
 		if hasDecision {
 			targetReplicas = decision.TargetReplicas
 			acceleratorName = decision.AcceleratorName
-			reason = decision.Reason
+			reason = decision.Reason()
 		} else {
 			// No change/decision: Keep current target or default to current replicas
 			// We effectively explicitly "decide" to keep things as they are if no decision was made
@@ -1520,9 +1519,9 @@ func (e *Engine) applySaturationDecisions(
 			// Only log detail if we had a decision or periodically (to avoid spamming logs on every loop for no-ops)
 			if hasDecision {
 				// Emit Kubernetes event for observability
-				e.recordScalingEvent(&updateVa, decision.Action, decision.TargetReplicas, decision.Reason)
+				e.recordScalingEvent(&updateVa, decision.Action, decision.TargetReplicas, decision.Reason())
 				if decision.WasLimited {
-					e.recordEvent(va, corev1.EventTypeWarning, constants.K8SEventResourceConstrained, decision.Reason)
+					e.recordEvent(va, corev1.EventTypeWarning, constants.K8SEventResourceConstrained, decision.Reason())
 				}
 
 				logger.Info("Successfully emitted metrics",
@@ -1590,9 +1589,7 @@ func (e *Engine) applySaturationDecisions(
 
 		if hasDecision {
 			if decision.Action != interfaces.ActionNoChange {
-				// Sanitize reason to prevent Prometheus cardinality explosion from dynamic numeric values
-				sanitizedReason := sanitizeReasonForMetrics(reason, decision.Action)
-				if err := e.metricsEmitter.EmitReplicaScalingMetrics(ctx, &updateVa, string(decision.Action), sanitizedReason); err != nil {
+				if err := e.metricsEmitter.EmitReplicaScalingMetrics(ctx, &updateVa, decision.Action, decision.DecisionReason()); err != nil {
 					logger.Error(err, "Failed to emit replica scaling metrics")
 				}
 			}
@@ -1603,58 +1600,6 @@ func (e *Engine) applySaturationDecisions(
 				"target", targetReplicas,
 				"reason", reason)
 		}
-	}
-}
-
-// sanitizeReasonForMetrics converts detailed reason strings into bounded categorical
-// values safe for use as Prometheus label values. This prevents cardinality explosion
-// from dynamic numeric values embedded in reason strings.
-// TODO: look fragile, refactor this function for better solution
-func sanitizeReasonForMetrics(reason string, action interfaces.SaturationAction) string {
-	// Check for saturation-only mode patterns
-	if strings.Contains(reason, "saturation-only mode:") {
-		switch action {
-		case interfaces.ActionScaleUp:
-			return "saturation-only mode: scale-up"
-		case interfaces.ActionScaleDown:
-			return "saturation-only mode: scale-down"
-		default:
-			return "saturation-only mode: no-change"
-		}
-	}
-
-	// Check for scale-from-zero pattern
-	if strings.Contains(reason, "scalefromzero") {
-		switch action {
-		case interfaces.ActionScaleUp:
-			return "scalefromzero: scale-up"
-		case interfaces.ActionScaleDown:
-			return "scalefromzero: scale-down"
-		default:
-			return "scalefromzero: no-change"
-		}
-	}
-
-	// Check for V2 optimizer patterns (cost-aware, greedy-by-score, enforced)
-	if strings.Contains(reason, "V2") {
-		switch action {
-		case interfaces.ActionScaleUp:
-			return "V2 scale-up"
-		case interfaces.ActionScaleDown:
-			return "V2 scale-down"
-		default:
-			return "V2 no-change"
-		}
-	}
-
-	// Default fallback based on action
-	switch action {
-	case interfaces.ActionScaleUp:
-		return "scale-up"
-	case interfaces.ActionScaleDown:
-		return "scale-down"
-	default:
-		return "no-change"
 	}
 }
 

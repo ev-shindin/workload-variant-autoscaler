@@ -189,7 +189,7 @@ func updateDecisionAction(d *interfaces.VariantDecision, optimizerName, policyTy
 	default:
 		d.Action = interfaces.ActionNoChange
 	}
-	d.Reason = fmt.Sprintf("V2 %s (optimizer: %s, enforced)", d.Action, optimizerName)
+	d.SetDecisionReason(d.Action, interfaces.DecisionReasonV2, fmt.Sprintf("V2 %s (optimizer: %s, enforced)", d.Action, optimizerName))
 
 	// finally record metric
 	metricsEmitter.RecordEnforcerMetric(policyType)

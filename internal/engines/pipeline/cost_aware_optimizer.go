@@ -253,20 +253,24 @@ func buildDecisionsWithOptimizer(
 		vc := vcMap[name]
 
 		var action interfaces.SaturationAction
-		var reason string
+		var decisionReason interfaces.DecisionReason
+		var detailedReason string
 		switch {
 		case target > state.CurrentReplicas:
 			action = interfaces.ActionScaleUp
-			reason = fmt.Sprintf("V2 scale-up (optimizer: %s)", optimizerName)
+			decisionReason = interfaces.DecisionReasonV2
+			detailedReason = fmt.Sprintf("%s (optimizer: %s)", string(decisionReason), optimizerName)
 		case target < state.CurrentReplicas:
 			action = interfaces.ActionScaleDown
-			reason = fmt.Sprintf("V2 scale-down (optimizer: %s)", optimizerName)
+			decisionReason = interfaces.DecisionReasonV2
+			detailedReason = fmt.Sprintf("%s (optimizer: %s)", string(decisionReason), optimizerName)
 		default:
 			action = interfaces.ActionNoChange
-			reason = "V2 steady state"
+			decisionReason = interfaces.DecisionReasonV2
+			detailedReason = string(decisionReason)
 		}
 
-		decisions = append(decisions, interfaces.VariantDecision{
+		decision := interfaces.VariantDecision{
 			VariantName:     name,
 			ModelID:         req.ModelID,
 			Namespace:       req.Namespace,
@@ -276,10 +280,11 @@ func buildDecisionsWithOptimizer(
 			CurrentReplicas: state.CurrentReplicas,
 			TargetReplicas:  target,
 			Action:          action,
-			Reason:          reason,
 			MinReplicas:     state.MinReplicas,
 			MaxReplicas:     state.MaxReplicas,
-		})
+		}
+		decision.SetDecisionReason(action, decisionReason, detailedReason)
+		decisions = append(decisions, decision)
 	}
 	return decisions
 }

@@ -344,7 +344,7 @@ func (e *Engine) processInactiveVariant(ctx context.Context, scaleTargets map[st
 		if err != nil {
 			return err
 		}
-		common.DecisionCache.Set(va.Name, va.Namespace, interfaces.VariantDecision{
+		d := interfaces.VariantDecision{
 			VariantName:        va.Name,
 			Namespace:          va.Namespace,
 			ModelID:            va.Spec.ModelID,
@@ -357,11 +357,12 @@ func (e *Engine) processInactiveVariant(ctx context.Context, scaleTargets map[st
 			SafetyOverride:     false,
 			ModelBasedDecision: false,
 			AcceleratorName:    accelerator,
-			Reason:             reason, // Reason for scaling up
 			MetricsAvailable:   true,
 			MetricsReason:      MetricsReasonAvailable,
 			MetricsMessage:     MetricsMessageAvailable,
-		})
+		}
+		d.SetDecisionReason(interfaces.ActionScaleUp, interfaces.DecisionReasonScaleFromZero, string(interfaces.DecisionReasonScaleFromZero)+": pending request - scale-up")
+		common.DecisionCache.Set(va.Name, va.Namespace, d)
 	} else {
 		if decision.CurrentReplicas == 0 {
 			decision.TargetReplicas = targetWorkloadReplicas
@@ -371,7 +372,7 @@ func (e *Engine) processInactiveVariant(ctx context.Context, scaleTargets map[st
 			decision.SaturationBased = false
 			decision.SafetyOverride = false
 			decision.ModelBasedDecision = false
-			decision.Reason = reason
+			decision.SetDecisionReason(interfaces.ActionScaleUp, interfaces.DecisionReasonScaleFromZero, string(interfaces.DecisionReasonScaleFromZero)+": pending request - scale-up")
 			decision.AcceleratorName = accelerator
 			decision.MetricsAvailable = true
 			decision.MetricsReason = MetricsReasonAvailable

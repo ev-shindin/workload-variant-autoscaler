@@ -8,6 +8,31 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// DecisionReason categorizes the reason for a scaling decision.
+// Used to set both VariantDecision.ReasonType (typed category) and
+// VariantDecision.Reason (human-readable detail) via SetDecisionReason.
+type DecisionReason string
+
+// Decision reason type constants for categorizing scaling decisions.
+const (
+	// DecisionReasonV2 indicates a V2 pipeline decision.
+	DecisionReasonV2 DecisionReason = "V2"
+	// DecisionReasonKVCacheUtilAboveThreshold indicates KV cache saturation triggered scale-up.
+	DecisionReasonKVCacheUtilAboveThreshold DecisionReason = "KV cache utilization above threshold"
+	// DecisionReasonKVCacheUtilBelowThreshold indicates low KV cache usage triggered scale-down.
+	DecisionReasonKVCacheUtilBelowThreshold DecisionReason = "KV cache utilization below threshold"
+	// DecisionReasonNoRequestsInRetention indicates scale-to-zero due to no recent requests.
+	DecisionReasonNoRequestsInRetention DecisionReason = "No requests in retention period"
+	// DecisionReasonNoScalingNeeded indicates no action required.
+	DecisionReasonNoScalingNeeded DecisionReason = "No scaling needed"
+	// DecisionReasonSaturationOnly indicates decision from saturation-only mode.
+	DecisionReasonSaturationOnly DecisionReason = "saturation-only mode"
+	// DecisionReasonScaleFromZero indicates scale-up from zero replicas.
+	DecisionReasonScaleFromZero DecisionReason = "scale-from-zero"
+	// DecisionReasonTest is used for test scenarios.
+	DecisionReasonTest DecisionReason = "test"
+)
+
 // SaturationAnalyzerName is the canonical name for the saturation analyzer.
 const SaturationAnalyzerName = "saturation"
 
@@ -256,8 +281,15 @@ type VariantDecision struct {
 	// DecisionSteps records each pipeline stage's contribution to the final decision.
 	// This replaces the single Reason field with structured multi-step tracking.
 	DecisionSteps []DecisionStep
-	// Reason is kept for backward compatibility and contains the final/summary reason
-	Reason string
+
+	// decisionReason is the categorized reason used for Prometheus metric labels.
+	// Set via SetDecisionReason along with the detailed reason string.
+	decisionReason DecisionReason
+
+	// reason contains the detailed human-readable reason for this decision.
+	// Used in logs, events, and status updates.
+	// Set via SetDecisionReason along with the categorized decisionReason.
+	reason string
 
 	// --- Saturation-specific flags ---
 	SaturationBased    bool        // True if decision is primarily saturation-driven
@@ -316,6 +348,24 @@ func (d *VariantDecision) LastStep() *DecisionStep {
 		return nil
 	}
 	return &d.DecisionSteps[len(d.DecisionSteps)-1]
+}
+
+// SetDecisionReason sets both the typed reason category and detailed reason string.
+// The decisionReason should be one of the DecisionReason* constants.
+// The detailedReason provides human-readable context for logs, events, and status.
+func (d *VariantDecision) SetDecisionReason(action SaturationAction, decisionReason DecisionReason, detailedReason string) {
+	d.decisionReason = decisionReason
+	d.reason = detailedReason
+}
+
+// DecisionReason returns the categorized reason used for Prometheus metric labels.
+func (d *VariantDecision) DecisionReason() DecisionReason {
+	return d.decisionReason
+}
+
+// Reason returns the detailed human-readable reason for this decision.
+func (d *VariantDecision) Reason() string {
+	return d.reason
 }
 
 // SaturationAction represents the scaling action
