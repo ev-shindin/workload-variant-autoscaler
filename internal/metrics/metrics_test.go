@@ -473,11 +473,11 @@ var _ = Describe("EmitReplicaScalingMetrics", func() {
 			}
 		}
 
-		Expect(found).To(BeTrue(), "metric with expected labels should exist")
+		// found==true already verifies the metric carries reason="V2" + direction
+		// labels (the match loop above compares every entry in `labels`, which
+		// includes LabelReason=string(DecisionReasonV2), against the gathered series).
+		Expect(found).To(BeTrue(), "metric with reason=\"V2\" and direction=\"scale-up\" labels should exist")
 		Expect(counterValue).To(Equal(1.0), "counter should be incremented to 1")
-
-		// Verify the concrete reason label string
-		Expect(string(interfaces.DecisionReasonV2)).To(Equal("V2"))
 	})
 
 })

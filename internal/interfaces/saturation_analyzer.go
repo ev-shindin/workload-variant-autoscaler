@@ -9,11 +9,12 @@ import (
 )
 
 // DecisionReason categorizes the reason for a scaling decision.
-// Used to set both VariantDecision.ReasonType (typed category) and
-// VariantDecision.Reason (human-readable detail) via SetDecisionReason.
+// It is the typed category passed to SetDecisionReason (read back via
+// ReasonCategory) and is paired there with a human-readable detail string
+// (read back via Reason).
 type DecisionReason string
 
-// Decision reason type constants for categorizing scaling decisions.
+// Defined DecisionReason values for the built-in scaling categories.
 const (
 	// DecisionReasonV2 indicates a V2 pipeline decision.
 	DecisionReasonV2 DecisionReason = "V2"
@@ -351,8 +352,8 @@ func (d *VariantDecision) SetDecisionReason(action SaturationAction, decisionRea
 	d.reason = detailedReason
 }
 
-// DecisionReason returns the categorized reason used for Prometheus metric labels.
-func (d *VariantDecision) GetDecisionReason() DecisionReason {
+// ReasonCategory returns the categorized reason used for Prometheus metric labels.
+func (d *VariantDecision) ReasonCategory() DecisionReason {
 	return d.decisionReason
 }
 

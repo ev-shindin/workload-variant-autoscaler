@@ -1036,7 +1036,6 @@ func (e *Engine) convertSaturationTargetsToDecisions(
 			TargetReplicas:         targetReplicas,
 			OriginalTargetReplicas: targetReplicas, // Store original before limiter modifies it
 			DesiredReplicas:        state.DesiredReplicas,
-			Action:                 action,
 			SaturationBased:        true,
 			SaturationOnly:         true,
 			ModelBasedDecision:     false,
@@ -1589,7 +1588,7 @@ func (e *Engine) applySaturationDecisions(
 
 		if hasDecision {
 			if decision.Action != interfaces.ActionNoChange {
-				if err := e.metricsEmitter.EmitReplicaScalingMetrics(ctx, &updateVa, decision.Action, decision.GetDecisionReason()); err != nil {
+				if err := e.metricsEmitter.EmitReplicaScalingMetrics(ctx, &updateVa, decision.Action, decision.ReasonCategory()); err != nil {
 					logger.Error(err, "Failed to emit replica scaling metrics")
 				}
 			}

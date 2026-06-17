@@ -279,10 +279,11 @@ func buildDecisionsWithOptimizer(
 			Role:            state.Role,
 			CurrentReplicas: state.CurrentReplicas,
 			TargetReplicas:  target,
-			Action:          action,
 			MinReplicas:     state.MinReplicas,
 			MaxReplicas:     state.MaxReplicas,
 		}
+		// SetDecisionReason is the single place that sets d.Action (avoids a
+		// redundant Action assignment in the struct literal above).
 		decision.SetDecisionReason(action, decisionReason, detailedReason)
 		decisions = append(decisions, decision)
 	}

@@ -68,8 +68,11 @@ func TestVariantDecision_SetDecisionReason(t *testing.T) {
 			decision := &VariantDecision{}
 			decision.SetDecisionReason(tt.action, tt.decisionReason, tt.detailedReason)
 
-			if string(decision.GetDecisionReason()) != tt.wantDecisionReason {
-				t.Errorf("SetDecisionReason() GetDecisionReason() = %v, want %v", decision.GetDecisionReason(), tt.wantDecisionReason)
+			if decision.Action != tt.action {
+				t.Errorf("SetDecisionReason() Action = %v, want %v", decision.Action, tt.action)
+			}
+			if string(decision.ReasonCategory()) != tt.wantDecisionReason {
+				t.Errorf("SetDecisionReason() ReasonCategory() = %v, want %v", decision.ReasonCategory(), tt.wantDecisionReason)
 			}
 			if decision.Reason() != tt.detailedReason {
 				t.Errorf("SetDecisionReason() Reason() = %v, want %v", decision.Reason(), tt.detailedReason)
@@ -83,8 +86,8 @@ func TestVariantDecision_SetDecisionReason_MultipleUpdates(t *testing.T) {
 
 	// First update
 	decision.SetDecisionReason(ActionScaleUp, DecisionReasonV2, "V2 (optimizer: cost-aware)")
-	if string(decision.GetDecisionReason()) != "V2" {
-		t.Errorf("First update: GetDecisionReason() = %v, want %v", decision.GetDecisionReason(), "V2")
+	if string(decision.ReasonCategory()) != "V2" {
+		t.Errorf("First update: ReasonCategory() = %v, want %v", decision.ReasonCategory(), "V2")
 	}
 	if decision.Reason() != "V2 (optimizer: cost-aware)" {
 		t.Errorf("First update: Reason() = %v, want %v", decision.Reason(), "V2 (optimizer: cost-aware)")
@@ -92,8 +95,8 @@ func TestVariantDecision_SetDecisionReason_MultipleUpdates(t *testing.T) {
 
 	// Second update should overwrite
 	decision.SetDecisionReason(ActionScaleUp, DecisionReasonV2, "V2 (optimizer: cost-aware, enforced)")
-	if string(decision.GetDecisionReason()) != "V2" {
-		t.Errorf("Second update: GetDecisionReason() = %v, want %v", decision.GetDecisionReason(), "V2")
+	if string(decision.ReasonCategory()) != "V2" {
+		t.Errorf("Second update: ReasonCategory() = %v, want %v", decision.ReasonCategory(), "V2")
 	}
 	if decision.Reason() != "V2 (optimizer: cost-aware, enforced)" {
 		t.Errorf("Second update: Reason() = %v, want %v", decision.Reason(), "V2 (optimizer: cost-aware, enforced)")
