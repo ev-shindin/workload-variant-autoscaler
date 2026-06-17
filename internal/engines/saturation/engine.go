@@ -1589,7 +1589,7 @@ func (e *Engine) applySaturationDecisions(
 
 		if hasDecision {
 			if decision.Action != interfaces.ActionNoChange {
-				if err := e.metricsEmitter.EmitReplicaScalingMetrics(ctx, &updateVa, decision.Action, decision.DecisionReason()); err != nil {
+				if err := e.metricsEmitter.EmitReplicaScalingMetrics(ctx, &updateVa, decision.Action, decision.GetDecisionReason()); err != nil {
 					logger.Error(err, "Failed to emit replica scaling metrics")
 				}
 			}

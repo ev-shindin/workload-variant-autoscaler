@@ -970,7 +970,7 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
-      "description": "Rate of scaling decisions by reason. Metric is wva_replica_scaling_total.",
+      "description": "Number of scaling operations per second over the last 5 minutes, grouped by decision reason. Metric is wva_replica_scaling_total.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1052,9 +1052,9 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (reason) (rate(wva_replica_scaling_total{$namespace_label=~\"$namespace\", variant_name=~\"$variant\"}[5m]))",
+          "expr": "sum by (reason, direction) (rate(wva_replica_scaling_total{$namespace_label=~\"$namespace\", variant_name=~\"$variant\"}[5m]))",
           "instant": false,
-          "legendFormat": "{{reason}}",
+          "legendFormat": "{{reason}}: {{direction}}",
           "range": true,
           "refId": "A"
         }

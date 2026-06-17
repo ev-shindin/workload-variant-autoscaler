@@ -17,14 +17,6 @@ type DecisionReason string
 const (
 	// DecisionReasonV2 indicates a V2 pipeline decision.
 	DecisionReasonV2 DecisionReason = "V2"
-	// DecisionReasonKVCacheUtilAboveThreshold indicates KV cache saturation triggered scale-up.
-	DecisionReasonKVCacheUtilAboveThreshold DecisionReason = "KV cache utilization above threshold"
-	// DecisionReasonKVCacheUtilBelowThreshold indicates low KV cache usage triggered scale-down.
-	DecisionReasonKVCacheUtilBelowThreshold DecisionReason = "KV cache utilization below threshold"
-	// DecisionReasonNoRequestsInRetention indicates scale-to-zero due to no recent requests.
-	DecisionReasonNoRequestsInRetention DecisionReason = "No requests in retention period"
-	// DecisionReasonNoScalingNeeded indicates no action required.
-	DecisionReasonNoScalingNeeded DecisionReason = "No scaling needed"
 	// DecisionReasonSaturationOnly indicates decision from saturation-only mode.
 	DecisionReasonSaturationOnly DecisionReason = "saturation-only mode"
 	// DecisionReasonScaleFromZero indicates scale-up from zero replicas.
@@ -354,12 +346,13 @@ func (d *VariantDecision) LastStep() *DecisionStep {
 // The decisionReason should be one of the DecisionReason* constants.
 // The detailedReason provides human-readable context for logs, events, and status.
 func (d *VariantDecision) SetDecisionReason(action SaturationAction, decisionReason DecisionReason, detailedReason string) {
+	d.Action = action
 	d.decisionReason = decisionReason
 	d.reason = detailedReason
 }
 
 // DecisionReason returns the categorized reason used for Prometheus metric labels.
-func (d *VariantDecision) DecisionReason() DecisionReason {
+func (d *VariantDecision) GetDecisionReason() DecisionReason {
 	return d.decisionReason
 }
 

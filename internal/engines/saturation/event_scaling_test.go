@@ -54,7 +54,7 @@ func TestScaledUpEvent(t *testing.T) {
 		Action:         interfaces.ActionScaleUp,
 		TargetReplicas: 3,
 	}
-	decision.SetDecisionReason(interfaces.ActionScaleUp, interfaces.DecisionReasonKVCacheUtilAboveThreshold, string(interfaces.DecisionReasonKVCacheUtilAboveThreshold))
+	decision.SetDecisionReason(interfaces.ActionScaleUp, interfaces.DecisionReasonTest, string(interfaces.DecisionReasonTest))
 
 	// Simulate the event recording logic from applySaturationDecisions
 	if fakeRecorder != nil {
@@ -108,7 +108,7 @@ func TestScaledDownEvent(t *testing.T) {
 		Action:         interfaces.ActionScaleDown,
 		TargetReplicas: 2,
 	}
-	decision.SetDecisionReason(interfaces.ActionScaleDown, interfaces.DecisionReasonKVCacheUtilBelowThreshold, string(interfaces.DecisionReasonKVCacheUtilBelowThreshold))
+	decision.SetDecisionReason(interfaces.ActionScaleDown, interfaces.DecisionReasonTest, string(interfaces.DecisionReasonTest))
 
 	// Simulate the event recording logic from applySaturationDecisions
 	if fakeRecorder != nil {
@@ -162,7 +162,7 @@ func TestScaledToZeroEvent(t *testing.T) {
 		Action:         interfaces.ActionScaleDown,
 		TargetReplicas: 0,
 	}
-	decision.SetDecisionReason(interfaces.ActionScaleDown, interfaces.DecisionReasonNoRequestsInRetention, string(interfaces.DecisionReasonNoRequestsInRetention))
+	decision.SetDecisionReason(interfaces.ActionScaleDown, interfaces.DecisionReasonTest, string(interfaces.DecisionReasonTest))
 
 	// Simulate the event recording logic from applySaturationDecisions
 	if fakeRecorder != nil {
@@ -217,7 +217,7 @@ func TestResourceConstrainedEvent(t *testing.T) {
 		TargetReplicas: 3,
 		WasLimited:     true,
 	}
-	decision.SetDecisionReason(interfaces.ActionScaleUp, interfaces.DecisionReasonKVCacheUtilAboveThreshold, string(interfaces.DecisionReasonKVCacheUtilAboveThreshold))
+	decision.SetDecisionReason(interfaces.ActionScaleUp, interfaces.DecisionReasonTest, string(interfaces.DecisionReasonTest))
 
 	// Simulate the event recording logic from applySaturationDecisions
 	if fakeRecorder != nil {
@@ -293,7 +293,7 @@ func TestNoEventForNoDecision(t *testing.T) {
 		Action:         interfaces.ActionNoChange,
 		TargetReplicas: 3,
 	}
-	decision.SetDecisionReason(interfaces.ActionNoChange, interfaces.DecisionReasonNoScalingNeeded, string(interfaces.DecisionReasonNoScalingNeeded))
+	decision.SetDecisionReason(interfaces.ActionNoChange, interfaces.DecisionReasonTest, string(interfaces.DecisionReasonTest))
 
 	// Simulate the event recording logic from applySaturationDecisions
 	if fakeRecorder != nil {

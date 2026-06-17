@@ -438,7 +438,7 @@ func (m *MetricsEmitter) EmitReplicaScalingMetrics(ctx context.Context, va *llmd
 		constants.LabelVariantName: va.Name,
 		constants.LabelNamespace:   va.Namespace,
 		constants.LabelDirection:   string(direction),
-		constants.LabelReason:      fmt.Sprintf("%s: %s", reason, direction),
+		constants.LabelReason:      string(reason),
 	}
 
 	// Add controller_instance label if configured
