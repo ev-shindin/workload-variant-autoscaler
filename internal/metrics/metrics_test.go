@@ -159,6 +159,9 @@ func resetMetrics() {
 	kvCacheTokensUsed = nil
 	kvCacheTokensCapacity = nil
 	controllerInstance = ""
+	replicaSeriesMu.Lock()
+	replicaSeriesAccel = map[string]string{}
+	replicaSeriesMu.Unlock()
 }
 
 func gatherMetric(registry *prometheus.Registry, name string) *dto.MetricFamily {
