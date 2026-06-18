@@ -952,6 +952,15 @@ var _ = Describe("CostAwareOptimizer", func() {
 			Expect(merged["A100"]).To(Equal(6))
 			Expect(merged["H100"]).To(Equal(4))
 		})
+
+		It("mergeConstraints skips an unlimited (negative) pool rather than clamping it to a deny", func() {
+			merged := mergeConstraints([]*ResourceConstraints{
+				{Pools: map[string]ResourcePool{"A100": {Limit: -1}, "H100": {Limit: 4}}},
+			})
+
+			Expect(merged).NotTo(HaveKey("A100"), "unlimited => no cap => absent, not 0 (deny)")
+			Expect(merged["H100"]).To(Equal(4))
+		})
 	})
 })
 
@@ -962,3 +971,113 @@ func decisionMap(decisions []interfaces.VariantDecision) map[string]interfaces.V
 	}
 	return m
 }
+
+var _ = Describe("namespace constraint merge helpers", func() {
+	Describe("nsPoolBudget", func() {
+		It("preserves the unlimited sentinel as -1", func() {
+			Expect(nsPoolBudget(ResourcePool{Limit: -1})).To(Equal(-1))
+		})
+		It("returns the available count for a finite pool", func() {
+			Expect(nsPoolBudget(ResourcePool{Limit: 6, Used: 2})).To(Equal(4))
+		})
+		It("clamps a finite over-used pool to 0", func() {
+			Expect(nsPoolBudget(ResourcePool{Limit: 2, Used: 5})).To(Equal(0))
+		})
+	})
+
+	Describe("tighterBudget", func() {
+		It("returns the smaller of two finite budgets", func() {
+			Expect(tighterBudget(4, 2)).To(Equal(2))
+			Expect(tighterBudget(2, 4)).To(Equal(2))
+		})
+		It("treats a negative (unlimited) input as +infinity", func() {
+			Expect(tighterBudget(-1, 4)).To(Equal(4), "unlimited vs finite -> finite")
+			Expect(tighterBudget(4, -1)).To(Equal(4), "finite vs unlimited -> finite")
+		})
+		It("stays unlimited only when both inputs are unlimited", func() {
+			Expect(tighterBudget(-1, -1)).To(Equal(-1))
+		})
+	})
+
+	Describe("mergeNamespaceConstraints", func() {
+		It("returns nil when no provider carries namespace pools", func() {
+			Expect(mergeNamespaceConstraints([]*ResourceConstraints{{Pools: map[string]ResourcePool{"A100": {Limit: 4}}}})).To(BeNil())
+		})
+
+		It("materializes a present-but-empty namespace as a closed (deny-all) marker", func() {
+			merged := mergeNamespaceConstraints([]*ResourceConstraints{
+				{NamespacePools: map[string]map[string]ResourcePool{"team-x": {}}},
+			})
+			Expect(merged).To(HaveKey("team-x"))
+			Expect(merged["team-x"]).To(BeEmpty())
+			Expect(merged["team-x"]).NotTo(BeNil(), "non-nil empty map signals a closed namespace, not 'open'")
+		})
+
+		It("carries the unlimited sentinel through as -1", func() {
+			merged := mergeNamespaceConstraints([]*ResourceConstraints{
+				{NamespacePools: map[string]map[string]ResourcePool{"team-a": {"A100": {Limit: -1}}}},
+			})
+			Expect(merged["team-a"]).To(HaveKeyWithValue("A100", -1))
+		})
+
+		It("takes the tighter budget across two providers for the same (ns,type)", func() {
+			merged := mergeNamespaceConstraints([]*ResourceConstraints{
+				{NamespacePools: map[string]map[string]ResourcePool{"team-a": {"A100": {Limit: 8, Used: 1}}}}, // avail 7
+				{NamespacePools: map[string]map[string]ResourcePool{"team-a": {"A100": {Limit: 4}}}},          // avail 4
+			})
+			Expect(merged["team-a"]).To(HaveKeyWithValue("A100", 4), "min(7,4)")
+		})
+
+		It("lets a finite provider win over an unlimited one for the same (ns,type)", func() {
+			merged := mergeNamespaceConstraints([]*ResourceConstraints{
+				{NamespacePools: map[string]map[string]ResourcePool{"team-a": {"A100": {Limit: -1}}}},
+				{NamespacePools: map[string]map[string]ResourcePool{"team-a": {"A100": {Limit: 5}}}},
+			})
+			Expect(merged["team-a"]).To(HaveKeyWithValue("A100", 5))
+		})
+	})
+
+	Describe("aggregateNamespacePools", func() {
+		It("sums only finite per-(ns,type) pools across namespaces", func() {
+			agg := aggregateNamespacePools(map[string]map[string]ResourcePool{
+				"team-a": {"A100": {Limit: 4, Used: 1}},
+				"team-b": {"A100": {Limit: 2}, "H100": {Limit: 3}},
+			})
+			Expect(agg["A100"]).To(Equal(ResourcePool{Limit: 6, Used: 1}))
+			Expect(agg["H100"]).To(Equal(ResourcePool{Limit: 3}))
+		})
+
+		It("skips unlimited (negative) pools so an all-unlimited config yields an empty map", func() {
+			agg := aggregateNamespacePools(map[string]map[string]ResourcePool{
+				"team-a": {"A100": {Limit: -1}},
+				"team-b": {"H100": {Limit: -1}},
+			})
+			Expect(agg).To(BeEmpty(), "unlimited types impose no finite cluster cap")
+		})
+
+		It("includes finite types but drops unlimited ones in a mixed namespace", func() {
+			agg := aggregateNamespacePools(map[string]map[string]ResourcePool{
+				"team-a": {"A100": {Limit: 4}, "H100": {Limit: -1}},
+			})
+			Expect(agg).To(HaveKey("A100"))
+			Expect(agg).NotTo(HaveKey("H100"))
+		})
+	})
+
+	Describe("poolTotals", func() {
+		It("sums limit/used and returns available", func() {
+			limit, used, avail := poolTotals(map[string]ResourcePool{
+				"A100": {Limit: 8, Used: 3},
+				"H100": {Limit: 4, Used: 1},
+			})
+			Expect(limit).To(Equal(12))
+			Expect(used).To(Equal(4))
+			Expect(avail).To(Equal(8))
+		})
+
+		It("clamps available to 0 when usage exceeds limit", func() {
+			_, _, avail := poolTotals(map[string]ResourcePool{"A100": {Limit: 2, Used: 5}})
+			Expect(avail).To(Equal(0))
+		})
+	})
+})

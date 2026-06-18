@@ -60,6 +60,7 @@ import (
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/coordinator/plugins/gpurebalance"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/datastore"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/engines/analyzers/throughput"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/engines/pipeline"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/engines/saturation"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/engines/scalefromzero"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/logging"
@@ -155,6 +156,15 @@ func main() {
 	flag.Duration("rest-client-timeout", 60*time.Second,
 		"The timeout for REST API calls to the Kubernetes API server. "+
 			"Increased from default ~30s to 60s for better resilience against network latency.")
+
+	flag.String("limiter-type", "inventory",
+		"GPU limiter implementation: 'inventory' (default; physical-capacity-based) or "+
+			"'quota' (operator-declared per-GPU-type quotas at cluster and/or namespace scope). "+
+			"When 'quota' is selected, --quota-config-file must point at a YAML file "+
+			"containing a QuotaLimiterEntries document.")
+	flag.String("quota-config-file", "",
+		"Path to a YAML file declaring QuotaLimiterEntries. Required when --limiter-type=quota. "+
+			"See docs/developer-guide/quota-limiter.md for the schema and examples.")
 
 	opts := ctrlzap.Options{
 		Development: true,
@@ -462,6 +472,29 @@ func main() {
 			os.Exit(1)
 		}
 
+		// Build the GPU limiter selected by --limiter-type. Validation in
+		// config.Validate already guarantees the chosen type is supported
+		// and (for quota) that the YAML loaded into a non-empty entries list.
+		gpuLimiter, err := pipeline.NewLimiterFromConfig(cfg, mgr.GetClient())
+		if err != nil {
+			setupLog.Error(err, "failed to build GPU limiter")
+			return err
+		}
+		setupLog.Info("GPU limiter constructed", "type", cfg.LimiterMode(), "name", gpuLimiter.Name())
+
+		// Quota mode means "no physical-capacity discovery" — including the
+		// inventory-collection call in the saturation engine. We honor that
+		// at the call site (see saturation.shouldCollectClusterInventory),
+		// but warn loudly here so an operator who explicitly enabled
+		// WVA_LIMITED_MODE sees that their inventory log will be suppressed.
+		if cfg.LimiterMode() == config.LimiterTypeQuota && cfg.LimitedModeEnabled() {
+			setupLog.Info("Quota limiter mode is active; cluster inventory collection is disabled "+
+				"despite WVA_LIMITED_MODE=true (no Node API access in quota mode). "+
+				"To re-enable cluster inventory logging, switch to --limiter-type=inventory.",
+				"limiterType", cfg.LimiterMode(),
+				"limitedModeEnabled", cfg.LimitedModeEnabled())
+		}
+
 		engine := saturation.NewEngine(
 			mgr.GetClient(),
 			mgr.GetAPIReader(),
@@ -469,6 +502,7 @@ func main() {
 			mgr.GetEventRecorderFor("workload-variant-autoscaler-saturation-engine"),
 			sourceRegistry,
 			cfg, // Pass unified Config to engine
+			gpuLimiter,
 		)
 		if throughputAnalyzerEnabled(cfg) {
 			registration.RegisterThroughputAnalyzerQueries(sourceRegistry)
