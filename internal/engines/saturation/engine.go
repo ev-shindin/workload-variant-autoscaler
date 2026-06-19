@@ -753,6 +753,49 @@ func (e *Engine) analyzeRoleGroups(
 	return modelDecisions
 }
 
+// selectV2Optimizer chooses the optimizer and GPU constraints for a V2
+// optimization cycle.
+//
+// When the configured optimizer is GreedyByScore it is GPU-aware and expects
+// per-type resource constraints. Those constraints are computed from the GPU
+// limiter's inventory. GreedyByScore interprets absent constraints as zero
+// available capacity (deny-all), NOT as unlimited — so if it were run with
+// empty constraints it would silently suppress all scale-up.
+//
+// Therefore, whenever real constraints cannot be obtained — the limiter does
+// not provide constraints (no ConstraintProvider), or computing them failed
+// because, e.g., node objects are not readable on this cluster — we fall back
+// to the cost-aware optimizer, which is the engine's unlimited path (the same
+// optimizer used when enableLimiter is false), so scale-up proceeds
+// unconstrained instead of being blocked. A constraint that is present but
+// reports zero GPUs is left intact:
+// that is a genuine "no capacity" signal and should still block scale-up.
+func (e *Engine) selectV2Optimizer(
+	ctx context.Context,
+	requests []pipeline.ModelScalingRequest,
+) (pipeline.ScalingOptimizer, []*pipeline.ResourceConstraints) {
+	logger := ctrl.LoggerFrom(ctx)
+
+	// GreedyByScore is currently the only GPU-aware optimizer; any future
+	// constraint-consuming optimizer must be added to this guard.
+	optimizer := e.optimizer
+	if _, ok := optimizer.(*pipeline.GreedyByScoreOptimizer); !ok {
+		return optimizer, nil
+	}
+
+	provider, ok := e.GPULimiter.(pipeline.ConstraintProvider)
+	if !ok {
+		return pipeline.NewCostAwareOptimizer(), nil
+	}
+
+	constraint, err := provider.ComputeConstraints(ctx, computeCurrentGPUUsage(requests))
+	if err != nil {
+		logger.Error(err, "Failed to compute GPU constraints, falling back to unlimited (cost-aware) optimizer for this cycle")
+		return pipeline.NewCostAwareOptimizer(), nil
+	}
+	return optimizer, []*pipeline.ResourceConstraints{constraint}
+}
+
 // optimizeV2 runs the V2 token-based optimizer path (saturation-token-based).
 // Collects AnalyzerResults for all models, calls the optimizer once, then applies enforcer per-model.
 func (e *Engine) optimizeV2(
@@ -818,22 +861,11 @@ func (e *Engine) optimizeV2(
 	}
 
 	// Stage 2: Compute GPU constraints and call optimizer
-	var constraints []*pipeline.ResourceConstraints
-	if _, ok := e.optimizer.(*pipeline.GreedyByScoreOptimizer); ok {
-		currentUsage := computeCurrentGPUUsage(requests)
-		if limiter, ok := e.GPULimiter.(*pipeline.DefaultLimiter); ok {
-			constraint, err := limiter.ComputeConstraints(ctx, currentUsage)
-			if err != nil {
-				logger.Error(err, "Failed to compute GPU constraints, falling back to unlimited")
-			} else {
-				constraints = append(constraints, constraint)
-			}
-		}
-	}
-	allDecisions := e.optimizer.Optimize(ctx, requests, constraints)
+	optimizer, constraints := e.selectV2Optimizer(ctx, requests)
+	allDecisions := optimizer.Optimize(ctx, requests, constraints)
 
 	logger.Info("V2 optimizer produced decisions",
-		"optimizer", e.optimizer.Name(),
+		"optimizer", optimizer.Name(),
 		"decisionCount", len(allDecisions),
 		"modelCount", len(requests))
 
@@ -850,7 +882,7 @@ func (e *Engine) optimizeV2(
 
 		scaledToZero := e.ScaleToZeroEnforcer.EnforcePolicyOnDecisions(
 			ctx, req.ModelID, req.Namespace,
-			allDecisions, scaleToZeroConfig, e.optimizer.Name(),
+			allDecisions, scaleToZeroConfig, optimizer.Name(),
 		)
 		if scaledToZero {
 			logger.Info("Scale-to-zero enforcement applied (V2)",
