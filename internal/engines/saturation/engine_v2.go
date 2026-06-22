@@ -64,14 +64,10 @@ func (e *Engine) runV2AnalysisOnly(
 		return nil, fmt.Errorf("V2 saturation analysis failed: %w", err)
 	}
 
-	logger.Info("V2 saturation analysis completed",
-		"modelID", modelID,
-		"totalSupply", result.TotalSupply,
-		"totalDemand", result.TotalDemand,
-		"utilization", result.Utilization,
-		"requiredCapacity", result.RequiredCapacity,
-		"spareCapacity", result.SpareCapacity)
-
+	// Analysis results are logged by the caller (runAnalyzersAndScore) after the
+	// applyUniversalThreshold post-step, so the single Info line can include the
+	// real RequiredCapacity/SpareCapacity. They are left zero here, so logging
+	// them at this point would always report 0 and be misleading.
 	return result, nil
 }
 
@@ -108,6 +104,19 @@ func (e *Engine) runAnalyzersAndScore(
 	// resolved threshold for the saturation entry (per-analyzer override over global).
 	satUp, satDown := resolveThresholds(interfaces.SaturationAnalyzerName, config)
 	applyUniversalThreshold(baseResult, satUp, satDown)
+
+	// Single Info line for the V2 saturation analysis, emitted after the
+	// post-step so RequiredCapacity/SpareCapacity hold the real values scaling
+	// uses (they are zero in the raw analyzer result; see runV2AnalysisOnly).
+	logger.Info("V2 saturation analysis completed",
+		"modelID", modelID,
+		"totalSupply", baseResult.TotalSupply,
+		"totalDemand", baseResult.TotalDemand,
+		"utilization", baseResult.Utilization,
+		"requiredCapacity", baseResult.RequiredCapacity,
+		"spareCapacity", baseResult.SpareCapacity,
+		"scaleUpThreshold", satUp,
+		"scaleDownBoundary", satDown)
 
 	// Build AnalyzerInput once; shared by all non-saturation analyzers.
 	// Note: &config has had saturation's per-entry threshold overrides applied
