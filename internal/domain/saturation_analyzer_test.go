@@ -102,3 +102,24 @@ func TestVariantDecision_SetDecisionReason_MultipleUpdates(t *testing.T) {
 		t.Errorf("Second update: Reason() = %v, want %v", decision.Reason(), "V2 (optimizer: cost-aware, enforced)")
 	}
 }
+
+func TestVariantDecision_ActionForTarget(t *testing.T) {
+	tests := []struct {
+		name    string
+		current int
+		target  int
+		want    SaturationAction
+	}{
+		{"target above current is scale-up", 2, 5, ActionScaleUp},
+		{"target below current is scale-down", 5, 2, ActionScaleDown},
+		{"target equal to current is no-change", 3, 3, ActionNoChange},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := &VariantDecision{CurrentReplicas: tt.current, TargetReplicas: tt.target}
+			if got := d.ActionForTarget(); got != tt.want {
+				t.Errorf("ActionForTarget() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

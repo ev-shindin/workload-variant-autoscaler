@@ -211,26 +211,46 @@ var _ = Describe("Stabilizer", func() {
 		})
 	})
 
-	Describe("Forget", func() {
+	Describe("Retain", func() {
 		It("drops history for keys not in the active set", func() {
 			// Build a high down-window history for key a.
 			s.Stabilize(Args{Key: "ns/a", CurrentReplicas: 8, DesiredReplicas: 8, MinReplicas: 0, MaxReplicas: 20})
 			clock.Advance(10 * time.Second)
 
-			// Forget it (only key b is active this cycle).
-			s.Forget(map[string]struct{}{"ns/b": {}})
+			// Retain only key b this cycle.
+			s.Retain(map[string]struct{}{"ns/b": {}})
 
 			// With its window gone, key a's scale-down is no longer held at 8.
 			got := s.Stabilize(Args{Key: "ns/a", CurrentReplicas: 8, DesiredReplicas: 2, MinReplicas: 0, MaxReplicas: 20}).Replicas
-			Expect(got).To(Equal(int32(2)), "forgotten history must not damp the next decision")
+			Expect(got).To(Equal(int32(2)), "dropped history must not damp the next decision")
 		})
 
-		It("retains history for keys still in the active set", func() {
+		It("keeps history for keys still in the active set", func() {
 			s.Stabilize(Args{Key: "ns/a", CurrentReplicas: 8, DesiredReplicas: 8, MinReplicas: 0, MaxReplicas: 20})
 			clock.Advance(10 * time.Second)
-			s.Forget(map[string]struct{}{"ns/a": {}})
+			s.Retain(map[string]struct{}{"ns/a": {}})
 			got := s.Stabilize(Args{Key: "ns/a", CurrentReplicas: 8, DesiredReplicas: 2, MinReplicas: 0, MaxReplicas: 20}).Replicas
 			Expect(got).To(Equal(int32(8)), "retained window still holds the recent max")
+		})
+
+		It("drops all history when the active set is empty", func() {
+			s.Stabilize(Args{Key: "ns/a", CurrentReplicas: 8, DesiredReplicas: 8, MinReplicas: 0, MaxReplicas: 20})
+			clock.Advance(10 * time.Second)
+			s.Retain(map[string]struct{}{})
+			got := s.Stabilize(Args{Key: "ns/a", CurrentReplicas: 8, DesiredReplicas: 2, MinReplicas: 0, MaxReplicas: 20}).Replicas
+			Expect(got).To(Equal(int32(2)), "an empty active set evicts every key")
+		})
+
+		It("clears the rate-event budget so the next cycle starts fresh", func() {
+			// First cycle records an up-event: 2->6 hits the +4-pods cap.
+			up := rulesFor(0, autoscalingv2.MaxChangePolicySelect, podsPolicy(4))
+			args := Args{Key: "ns/a", Behavior: behaviorFor(up, nil), CurrentReplicas: 2, DesiredReplicas: 10, MinReplicas: 0, MaxReplicas: 100}
+			Expect(s.Stabilize(args).Replicas).To(Equal(int32(6)), "rate-limited on the first cycle")
+
+			// Evict the key, then the same period must grant a fresh +4 budget.
+			s.Retain(map[string]struct{}{"ns/b": {}})
+			args.CurrentReplicas, args.DesiredReplicas = 6, 100
+			Expect(s.Stabilize(args).Replicas).To(Equal(int32(10)), "after Retain drops the event, +4 from 6 = 10")
 		})
 	})
 

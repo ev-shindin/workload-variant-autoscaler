@@ -158,10 +158,11 @@ func (s *Stabilizer) Stabilize(args Args) Result {
 	}
 }
 
-// Forget drops all retained history for keys not present in active. The engine
-// calls it each cycle with the keys it is about to stabilize, bounding the
-// per-key maps to the live set of scale targets (variants come and go).
-func (s *Stabilizer) Forget(active map[string]struct{}) {
+// Retain keeps history only for the given keys, dropping every other key's
+// trailing window and rate-event budget. The engine calls it each cycle with
+// the keys it is about to stabilize, bounding the per-key maps to the live set
+// of scale targets (variants come and go).
+func (s *Stabilizer) Retain(active map[string]struct{}) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for k := range s.recommendations {

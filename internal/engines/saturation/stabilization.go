@@ -36,7 +36,7 @@ func (e *Engine) applyStabilization(ctx context.Context, decisions []interfaces.
 	for i := range decisions {
 		active[stabilizationKey(&decisions[i])] = struct{}{}
 	}
-	e.stabilizer.Forget(active)
+	e.stabilizer.Retain(active)
 
 	type stabilizationEntry struct {
 		Name  string `json:"name"`
@@ -54,9 +54,11 @@ func (e *Engine) applyStabilization(ctx context.Context, decisions []interfaces.
 			Key:             stabilizationKey(d),
 			CurrentReplicas: int32(d.CurrentReplicas),
 			DesiredReplicas: int32(d.TargetReplicas),
-			MinReplicas:     int32(ptr.Deref(d.MinReplicas, 0)),
-			MaxReplicas:     int32(ptr.Deref(d.MaxReplicas, 0)),
 			Behavior:        behavior,
+			// 0 means no floor / no cap: scale-to-zero and minimum-replica
+			// enforcement remain the enforcer's job, not the stabilizer's.
+			MinReplicas: int32(ptr.Deref(d.MinReplicas, 0)),
+			MaxReplicas: int32(ptr.Deref(d.MaxReplicas, 0)),
 		})
 
 		raw := d.TargetReplicas
@@ -98,10 +100,6 @@ func stabilizationKey(d *interfaces.VariantDecision) string {
 // retargetDecision recomputes a decision's Action after stabilization changed
 // its TargetReplicas, preserving the original reason category so the decision is
 // not mis-attributed in the reason metric label.
-//
-// A nil MinReplicas/MaxReplicas is passed to the stabilizer as 0, where a zero
-// MaxReplicas means "no cap" and a zero MinReplicas means "no floor" —
-// scale-to-zero and minimum-replica enforcement remain the enforcer's job.
 func retargetDecision(d *interfaces.VariantDecision) {
 	category := d.ReasonCategory()
 	if category == "" {
