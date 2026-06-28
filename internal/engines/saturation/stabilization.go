@@ -6,7 +6,7 @@ import (
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 
-	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/interfaces"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/domain"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/stabilization"
 )
 
@@ -17,7 +17,7 @@ import (
 // gated. Each variant (per role, when disaggregated) is stabilized independently
 // against its own trailing recommendation window and per-period rate budget,
 // retained on the Engine's long-lived stabilizer.
-func (e *Engine) applyStabilization(ctx context.Context, decisions []interfaces.VariantDecision) {
+func (e *Engine) applyStabilization(ctx context.Context, decisions []domain.VariantDecision) {
 	if e.stabilizer == nil || len(decisions) == 0 {
 		return
 	}
@@ -91,7 +91,7 @@ func (e *Engine) applyStabilization(ctx context.Context, decisions []interfaces.
 // model so that, even if two models in a namespace ever expose a same-named
 // variant, their histories never collide. Disaggregated P/D variants have one
 // scale target per role, so the role is part of the key too.
-func stabilizationKey(d *interfaces.VariantDecision) string {
+func stabilizationKey(d *domain.VariantDecision) string {
 	key := d.Namespace + "/" + d.ModelID + "/" + d.VariantName
 	if d.Role != "" {
 		key += "/" + d.Role
@@ -102,10 +102,10 @@ func stabilizationKey(d *interfaces.VariantDecision) string {
 // retargetDecision recomputes a decision's Action after stabilization changed
 // its TargetReplicas, preserving the original reason category so the decision is
 // not mis-attributed in the reason metric label.
-func retargetDecision(d *interfaces.VariantDecision) {
+func retargetDecision(d *domain.VariantDecision) {
 	category := d.ReasonCategory()
 	if category == "" {
-		category = interfaces.DecisionReasonV2
+		category = domain.DecisionReasonV2
 	}
 	d.SetDecisionReason(d.ActionForTarget(), category, string(category)+" (stabilized)")
 }
