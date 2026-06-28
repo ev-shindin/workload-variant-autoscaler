@@ -245,7 +245,7 @@ func (s *Stabilizer) ratePoliciesLocked(key string, current, desired int32, now 
 	downEvents := s.downEvents[key]
 
 	if desired > current {
-		limit := calculateScaleUpLimit(current, upEvents, now, up)
+		limit := calculateScaleUpLimit(current, upEvents, downEvents, now, up)
 		if limit < current {
 			limit = current
 		}
@@ -255,7 +255,7 @@ func (s *Stabilizer) ratePoliciesLocked(key string, current, desired int32, now 
 		return desired
 	}
 
-	limit := calculateScaleDownLimit(current, downEvents, now, down)
+	limit := calculateScaleDownLimit(current, upEvents, downEvents, now, down)
 	if limit > current {
 		limit = current
 	}
@@ -265,9 +265,20 @@ func (s *Stabilizer) ratePoliciesLocked(key string, current, desired int32, now 
 	return desired
 }
 
+// periodStartReplicas reconstructs the replica count at the start of a policy
+// period: current minus what was added plus what was removed within the period.
+// Both event directions are needed — an intervening scale in the opposite
+// direction must be accounted for or the budget baseline drifts. Matches the
+// upstream HPA (current - added + removed, used for both directions).
+func periodStartReplicas(current, periodSeconds int32, upEvents, downEvents []scaleEvent, now time.Time) int32 {
+	added := replicasChangePerPeriod(periodSeconds, upEvents, now)
+	removed := replicasChangePerPeriod(periodSeconds, downEvents, now)
+	return current - added + removed
+}
+
 // calculateScaleUpLimit returns the highest replica count scaling up may reach
 // this cycle under the configured policies.
-func calculateScaleUpLimit(current int32, upEvents []scaleEvent, now time.Time, rules resolvedRules) int32 {
+func calculateScaleUpLimit(current int32, upEvents, downEvents []scaleEvent, now time.Time, rules resolvedRules) int32 {
 	if rules.selectPolicy == autoscalingv2.DisabledPolicySelect {
 		return current
 	}
@@ -279,8 +290,7 @@ func calculateScaleUpLimit(current int32, upEvents []scaleEvent, now time.Time, 
 		result = math.MaxInt32
 	}
 	for _, p := range rules.policies {
-		addedInPeriod := replicasChangePerPeriod(p.PeriodSeconds, upEvents, now)
-		periodStart := current - addedInPeriod
+		periodStart := periodStartReplicas(current, p.PeriodSeconds, upEvents, downEvents, now)
 		var proposed int32
 		switch p.Type {
 		case autoscalingv2.PodsScalingPolicy:
@@ -301,7 +311,7 @@ func calculateScaleUpLimit(current int32, upEvents []scaleEvent, now time.Time, 
 
 // calculateScaleDownLimit returns the lowest replica count scaling down may
 // reach this cycle under the configured policies.
-func calculateScaleDownLimit(current int32, downEvents []scaleEvent, now time.Time, rules resolvedRules) int32 {
+func calculateScaleDownLimit(current int32, upEvents, downEvents []scaleEvent, now time.Time, rules resolvedRules) int32 {
 	if rules.selectPolicy == autoscalingv2.DisabledPolicySelect {
 		return current
 	}
@@ -314,8 +324,7 @@ func calculateScaleDownLimit(current int32, downEvents []scaleEvent, now time.Ti
 		result = math.MinInt32
 	}
 	for _, p := range rules.policies {
-		removedInPeriod := replicasChangePerPeriod(p.PeriodSeconds, downEvents, now)
-		periodStart := current + removedInPeriod
+		periodStart := periodStartReplicas(current, p.PeriodSeconds, upEvents, downEvents, now)
 		var proposed int32
 		switch p.Type {
 		case autoscalingv2.PodsScalingPolicy:
@@ -355,10 +364,14 @@ func replicasChangePerPeriod(periodSeconds int32, events []scaleEvent, now time.
 // can budget rate policies against it. Events older than the stabilization
 // ceiling are pruned opportunistically. Must be called with s.mu held.
 //
-// The delta is recorded against the value this stage produced (final), so the
-// rate budget stays accurate only while stabilization is the last stage that
-// determines the actuated replica count. Any future post-stabilization clamp in
-// the V2 path must update this event instead, or the budget will desync.
+// The delta is recorded against the value this stage produced (final). The
+// scale-to-zero / minimum-replica enforcer runs after stabilization and may
+// override the target, so the recorded delta can differ from what is finally
+// actuated. That is acceptable: scale-to-zero is an idle override (no traffic),
+// and a minimum-replica bump only under-counts a future up-budget, making the
+// next scale-up marginally more permissive — never less safe. A future
+// post-stabilization stage that needs exact budgeting would record the event
+// itself after actuation instead.
 func (s *Stabilizer) recordScaleEventLocked(key string, from, to int32, now time.Time) {
 	if to == from {
 		return
@@ -383,6 +396,8 @@ func clamp(v, min, max int32) int32 {
 	return v
 }
 
+// reason returns a short human-readable explanation of which pipeline stage was
+// responsible for the final replica count differing from the raw desired value.
 func reason(desired, stabilized, rateLimited, final int32) string {
 	switch {
 	case final == desired:

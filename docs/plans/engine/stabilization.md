@@ -47,9 +47,13 @@ pipeline, in order, matches the HPA:
    since the optimizer already decided to act.
 3. **Per-period rate policies.** `Pods` and `Percent` policies cap the change
    per `periodSeconds`, budgeting against changes already actuated within the
-   period (tracked as per-key scale events). `selectPolicy` `Max`/`Min`/
-   `Disabled` combines competing policies. Defaults: scale-up the higher of
-   `+4 pods` or `+100%` per `60s`; scale-down `-100%` per `60s`.
+   period (the period start is reconstructed as `current − added + removed`
+   using both scale-up and scale-down events, as the HPA does). `selectPolicy`
+   `Max`/`Min`/`Disabled` combines competing policies. Defaults: scale-up the
+   higher of `+4 pods` or `+100%` per `60s`; scale-down `-100%` per `60s`. The
+   magnitudes and the `300s` down window match the HPA; the `60s` period is
+   chosen for WVA's ~30s optimize cadence rather than the controller's `15s`
+   default (which would make the budget a near no-op at that cadence).
 4. **Min/max clamp** to the variant's bounds.
 
 The `Stabilizer` is long-lived and concurrency-safe; it keeps the trailing
@@ -65,8 +69,8 @@ matches the HPA: stabilize the recommendation, then let the hard bounds have the
 last word. The existing emit path (Prometheus desired-replica gauge, internal
 decision cache, CRD status patch) carries the stabilized value unchanged.
 
-Each variant is keyed `namespace/variant[/role]`, so disaggregated prefill/decode
-scale targets are damped independently.
+Each variant is keyed `namespace/model/variant[/role]`, so disaggregated
+prefill/decode scale targets are damped independently.
 
 A `stabilization-decision` structured log line is emitted per model per cycle,
 grouped like the sibling `scaling-decision` line, with `curr`, `raw`

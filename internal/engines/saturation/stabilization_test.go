@@ -22,6 +22,7 @@ func newStabilizationEngine(enabled bool) *Engine {
 func scaleDecision(ns, name, role string, current, target int) interfaces.VariantDecision {
 	d := interfaces.VariantDecision{
 		Namespace:       ns,
+		ModelID:         "model",
 		VariantName:     name,
 		Role:            role,
 		CurrentReplicas: current,
@@ -47,15 +48,26 @@ var _ = Describe("applyStabilization", func() {
 		Expect(decisions[0].TargetReplicas).To(Equal(6))
 		Expect(decisions[0].Action).To(Equal(interfaces.ActionScaleUp))
 	})
+
+	It("leaves the decision untouched when stabilization does not change the target", func() {
+		e := newStabilizationEngine(true)
+		// current=2, desired=3 is within the default +4-pods budget, so it passes through.
+		d := scaleDecision("ns", "v", "", 2, 3)
+		wantReason := d.Reason()
+		decisions := []interfaces.VariantDecision{d}
+		e.applyStabilization(context.Background(), decisions)
+		Expect(decisions[0].TargetReplicas).To(Equal(3), "target passes through when the stabilizer agrees")
+		Expect(decisions[0].Reason()).To(Equal(wantReason), "reason is not rewritten when no retarget occurs")
+	})
 })
 
 var _ = Describe("stabilizationKey", func() {
 	It("omits the role for non-disaggregated variants", func() {
-		Expect(stabilizationKey(&interfaces.VariantDecision{Namespace: "ns", VariantName: "v"})).To(Equal("ns/v"))
+		Expect(stabilizationKey(&interfaces.VariantDecision{Namespace: "ns", ModelID: "m", VariantName: "v"})).To(Equal("ns/m/v"))
 	})
 
 	It("includes the role for disaggregated variants", func() {
-		Expect(stabilizationKey(&interfaces.VariantDecision{Namespace: "ns", VariantName: "v", Role: "prefill"})).To(Equal("ns/v/prefill"))
+		Expect(stabilizationKey(&interfaces.VariantDecision{Namespace: "ns", ModelID: "m", VariantName: "v", Role: "prefill"})).To(Equal("ns/m/v/prefill"))
 	})
 })
 

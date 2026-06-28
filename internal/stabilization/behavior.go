@@ -31,12 +31,19 @@ func behaviorScaleDown(b *autoscalingv2.HorizontalPodAutoscalerBehavior) *autosc
 	return b.ScaleDown
 }
 
-// resolveRules fills in HPA defaults for any unset field of an HPAScalingRules.
+// resolveRules fills in default values for any unset field of an HPAScalingRules.
 // A nil rules value resolves entirely to the direction's defaults.
 //
 // Scale-up defaults: no stabilization window; allow the higher of +4 pods or
 // +100% per 60s. Scale-down defaults: a 300s stabilization window; allow -100%
-// per 60s. These mirror the upstream HorizontalPodAutoscaler.
+// per 60s, and a Max select policy.
+//
+// The pod/percent magnitudes (4, 100%) and the 300s scale-down window match the
+// HorizontalPodAutoscaler. The policy period is 60s rather than the HPA
+// controller's 15s default because WVA's optimize loop runs every ~30s, so a 60s
+// window spans a couple of cycles whereas 15s would make the per-period budget a
+// near no-op. (The autoscaling/v2 API documentation itself states the default as
+// "per 60 seconds", while the controller's defaulting uses 15s.)
 func resolveRules(rules *autoscalingv2.HPAScalingRules, scaleUp bool) resolvedRules {
 	out := resolvedRules{selectPolicy: autoscalingv2.MaxChangePolicySelect}
 	if scaleUp {

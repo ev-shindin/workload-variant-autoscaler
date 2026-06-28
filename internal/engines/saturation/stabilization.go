@@ -87,10 +87,12 @@ func (e *Engine) applyStabilization(ctx context.Context, decisions []interfaces.
 	}
 }
 
-// stabilizationKey identifies a scale target across cycles. Disaggregated P/D
-// variants have one scale target per role, so the role is part of the key.
+// stabilizationKey identifies a scale target across cycles. It includes the
+// model so that, even if two models in a namespace ever expose a same-named
+// variant, their histories never collide. Disaggregated P/D variants have one
+// scale target per role, so the role is part of the key too.
 func stabilizationKey(d *interfaces.VariantDecision) string {
-	key := d.Namespace + "/" + d.VariantName
+	key := d.Namespace + "/" + d.ModelID + "/" + d.VariantName
 	if d.Role != "" {
 		key += "/" + d.Role
 	}

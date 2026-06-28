@@ -92,6 +92,30 @@ var _ = Describe("Stabilizer", func() {
 			clock.Advance(61 * time.Second)
 			Expect(s.Stabilize(args).Replicas).To(Equal(int32(5)), "after the window passes, scale-up proceeds")
 		})
+
+		It("freezes the current count when it sits inside the historical band", func() {
+			// Both directions windowed at 60s with generous rate policies, so only
+			// the trailing band governs.
+			up := rulesFor(60, autoscalingv2.MaxChangePolicySelect, podsPolicy(1000))
+			down := rulesFor(60, autoscalingv2.MaxChangePolicySelect, podsPolicy(1000))
+			args := Args{Key: "ns/v", Behavior: behaviorFor(up, down), MinReplicas: 0, MaxReplicas: 0}
+
+			// Seed the window with 5 then 10, so the band becomes [upRec=5, downRec=10].
+			args.CurrentReplicas, args.DesiredReplicas = 5, 5
+			s.Stabilize(args)
+			clock.Advance(20 * time.Second)
+			args.CurrentReplicas, args.DesiredReplicas = 5, 10
+			s.Stabilize(args)
+
+			// current=8 sits inside [5,10]; desired=7 is below current but still in
+			// the band, so neither the floor nor the ceiling clamp fires.
+			clock.Advance(20 * time.Second)
+			args.CurrentReplicas, args.DesiredReplicas = 8, 7
+			res := s.Stabilize(args)
+			Expect(res.Stabilized).To(Equal(int32(8)), "current inside the band is held, not the desired 7")
+			Expect(res.Replicas).To(Equal(int32(8)))
+			Expect(res.Reason).To(ContainSubstring("stabilization window applied"))
+		})
 	})
 
 	Describe("rate policies", func() {
@@ -139,6 +163,46 @@ var _ = Describe("Stabilizer", func() {
 			Entry("Min picks the most conservative (highest)", autoscalingv2.MinChangePolicySelect, int32(6)),
 			Entry("Disabled holds current", autoscalingv2.DisabledPolicySelect, int32(10)),
 		)
+
+		It("grants a fresh percent budget each period for scale-down", func() {
+			down := rulesFor(0, autoscalingv2.MaxChangePolicySelect, percentPolicy(50))
+			args := Args{Key: "ns/v", Behavior: behaviorFor(nil, down), MinReplicas: 0, MaxReplicas: 100}
+
+			args.CurrentReplicas, args.DesiredReplicas = 10, 0
+			Expect(s.Stabilize(args).Replicas).To(Equal(int32(5)), "first cycle: at most -50% -> 5")
+
+			clock.Advance(10 * time.Second)
+			args.CurrentReplicas, args.DesiredReplicas = 5, 0
+			Expect(s.Stabilize(args).Replicas).To(Equal(int32(5)), "budget already spent this period")
+
+			clock.Advance(61 * time.Second)
+			Expect(s.Stabilize(args).Replicas).To(Equal(int32(2)), "new period: -50% of current 5 -> 2")
+		})
+
+		It("reconstructs the period start from both directions (cross-direction budgeting)", func() {
+			// Scale-up +4 pods/60s; scale-down unlimited and un-stabilized so the
+			// intervening down actuates immediately and records a down event.
+			up := rulesFor(0, autoscalingv2.MaxChangePolicySelect, podsPolicy(4))
+			down := rulesFor(0, autoscalingv2.MaxChangePolicySelect, percentPolicy(100))
+			b := behaviorFor(up, down)
+			args := Args{Key: "ns/v", Behavior: b, MinReplicas: 0, MaxReplicas: 100}
+
+			// t0: 2 -> 6 (records +4 up event).
+			args.CurrentReplicas, args.DesiredReplicas = 2, 6
+			Expect(s.Stabilize(args).Replicas).To(Equal(int32(6)))
+
+			// t20: load drops, 6 -> 2 (records -4 down event).
+			clock.Advance(20 * time.Second)
+			args.CurrentReplicas, args.DesiredReplicas = 6, 2
+			Expect(s.Stabilize(args).Replicas).To(Equal(int32(2)))
+
+			// t40: load spikes again, 2 -> 6. Both events are still in the 60s
+			// window: periodStart = 2 - 4(added) + 4(removed) = 2, so +4 reaches 6.
+			// (Same-direction-only accounting would wrongly pin this at 2.)
+			clock.Advance(20 * time.Second)
+			args.CurrentReplicas, args.DesiredReplicas = 2, 6
+			Expect(s.Stabilize(args).Replicas).To(Equal(int32(6)), "cross-direction term must restore the legitimate scale-up")
+		})
 	})
 
 	Describe("tolerance deadband", func() {
@@ -157,6 +221,23 @@ var _ = Describe("Stabilizer", func() {
 			clock.Advance(time.Second)
 			args.CurrentReplicas, args.DesiredReplicas = 10, 20
 			Expect(s.Stabilize(args).Replicas).To(Equal(int32(20)), "+100% exceeds the deadband")
+		})
+
+		It("suppresses a scale-down within the down-direction tolerance", func() {
+			down := &autoscalingv2.HPAScalingRules{
+				StabilizationWindowSeconds: ptr[int32](0),
+				SelectPolicy:               ptr(autoscalingv2.MaxChangePolicySelect),
+				Policies:                   []autoscalingv2.HPAScalingPolicy{podsPolicy(1000)},
+				Tolerance:                  ptr(resource.MustParse("0.5")),
+			}
+			args := Args{Key: "ns/v", Behavior: behaviorFor(nil, down), MinReplicas: 0, MaxReplicas: 20}
+
+			args.CurrentReplicas, args.DesiredReplicas = 10, 9
+			Expect(s.Stabilize(args).Replicas).To(Equal(int32(10)), "-10% is within the 50% down deadband")
+
+			clock.Advance(time.Second)
+			args.CurrentReplicas, args.DesiredReplicas = 10, 4
+			Expect(s.Stabilize(args).Replicas).To(Equal(int32(4)), "-60% exceeds the down deadband")
 		})
 
 		It("does not suppress scale-from-zero even when a tolerance is set", func() {
@@ -261,6 +342,23 @@ var _ = Describe("Stabilizer", func() {
 			Expect(res.Stabilized).To(Equal(int32(9)), "Stabilized is the window output, before rate limiting")
 			Expect(res.Replicas).To(Equal(int32(3)), "Replicas is rate-limited to +1")
 		})
+
+		DescribeTable("Reason names the stage responsible for the final value",
+			func(args Args, want string) {
+				Expect(s.Stabilize(args).Reason).To(ContainSubstring(want))
+			},
+			Entry("unchanged target",
+				Args{Key: "ns/v", CurrentReplicas: 4, DesiredReplicas: 4, MinReplicas: 1, MaxReplicas: 10},
+				"no stabilization applied"),
+			Entry("rate-limited",
+				Args{Key: "ns/v", Behavior: behaviorFor(rulesFor(0, autoscalingv2.MaxChangePolicySelect, podsPolicy(1)), nil),
+					CurrentReplicas: 2, DesiredReplicas: 9, MinReplicas: 1, MaxReplicas: 100},
+				"rate-limited"),
+			Entry("clamped to max",
+				Args{Key: "ns/c", Behavior: behaviorFor(rulesFor(0, autoscalingv2.MaxChangePolicySelect, podsPolicy(1000)), nil),
+					CurrentReplicas: 1, DesiredReplicas: 100, MinReplicas: 1, MaxReplicas: 5},
+				"clamped to bounds"),
+		)
 	})
 })
 
