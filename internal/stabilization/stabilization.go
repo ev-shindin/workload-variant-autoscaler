@@ -13,8 +13,8 @@
 // (HorizontalPodAutoscalerBehavior, HPAScalingRules, HPAScalingPolicy) so an
 // operator expresses stabilization the familiar HPA way. The algorithm is a
 // clean-room implementation of the behavior documented at
-// https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/#configurable-scaling-behavior
-// it does not import k8s.io/kubernetes, which is not consumable as a module.
+// https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/#configurable-scaling-behavior.
+// It does not import k8s.io/kubernetes, which is not consumable as a module.
 package stabilization
 
 import (
@@ -98,8 +98,8 @@ func New(opts ...Option) *Stabilizer {
 // Args is the input to a single Stabilize call for one scale target.
 type Args struct {
 	// Key uniquely identifies the scale target across cycles (e.g.
-	// "namespace/variant" or "namespace/variant/role"). History is retained
-	// per Key.
+	// "namespace/model/variant" or "namespace/model/variant/role"). History is
+	// retained per Key.
 	Key string
 	// CurrentReplicas is the scale target's current replica count.
 	CurrentReplicas int32

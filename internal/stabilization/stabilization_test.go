@@ -203,6 +203,37 @@ var _ = Describe("Stabilizer", func() {
 			args.CurrentReplicas, args.DesiredReplicas = 2, 6
 			Expect(s.Stabilize(args).Replicas).To(Equal(int32(6)), "cross-direction term must restore the legitimate scale-up")
 		})
+
+		It("reconstructs the period start from both directions for scale-down", func() {
+			// Symmetric to the scale-up case: an intervening up event must not
+			// inflate the down period-start baseline and block a legitimate down.
+			down := rulesFor(0, autoscalingv2.MaxChangePolicySelect, podsPolicy(4))
+			up := rulesFor(0, autoscalingv2.MaxChangePolicySelect, podsPolicy(1000))
+			b := behaviorFor(up, down)
+			args := Args{Key: "ns/v", Behavior: b, MinReplicas: 0, MaxReplicas: 100}
+
+			// t0: 10 -> 6 (records -4 down event).
+			args.CurrentReplicas, args.DesiredReplicas = 10, 6
+			Expect(s.Stabilize(args).Replicas).To(Equal(int32(6)))
+
+			// t20: load recovers, 6 -> 10 (records +4 up event).
+			clock.Advance(20 * time.Second)
+			args.CurrentReplicas, args.DesiredReplicas = 6, 10
+			Expect(s.Stabilize(args).Replicas).To(Equal(int32(10)))
+
+			// t40: load drops again, 10 -> 6. periodStart = 10 - 4(added) + 4(removed)
+			// = 10, so -4 reaches 6. (Same-direction-only would inflate to 14, block at 10.)
+			clock.Advance(20 * time.Second)
+			args.CurrentReplicas, args.DesiredReplicas = 10, 6
+			Expect(s.Stabilize(args).Replicas).To(Equal(int32(6)), "cross-direction up event must not inflate the down baseline")
+		})
+
+		It("floors the scale-down limit to 0 when a policy would reach negative replicas", func() {
+			// Pods policy removes more than the period-start count: 3 - 10 = -7 -> 0.
+			down := rulesFor(0, autoscalingv2.MaxChangePolicySelect, podsPolicy(10))
+			res := s.Stabilize(Args{Key: "ns/v", Behavior: behaviorFor(nil, down), CurrentReplicas: 3, DesiredReplicas: 0, MinReplicas: 0, MaxReplicas: 20})
+			Expect(res.Replicas).To(Equal(int32(0)), "a negative scale-down limit is floored to 0")
+		})
 	})
 
 	Describe("tolerance deadband", func() {
