@@ -33,6 +33,15 @@ type SaturationScalingConfig struct {
 	// Default is false (limiter disabled).
 	EnableLimiter bool `yaml:"enableLimiter,omitempty"`
 
+	// EnableStabilization: When true, applies HPA-style stabilization (a trailing
+	// scale-down window plus per-period rate policies) to the optimizer's
+	// per-variant targets before they are emitted, damping flapping. The
+	// HorizontalPodAutoscaler defaults are used: immediate scale-up rate-limited
+	// to the higher of +4 pods or +100% per 60s, and scale-down held by a 300s
+	// stabilization window. Default is false, preserving the prior behavior of
+	// emitting the optimizer's raw recommendation each cycle.
+	EnableStabilization bool `yaml:"enableStabilization,omitempty"`
+
 	// AnalyzerName selects which saturation analyzer to use.
 	// "saturation" uses the V2 token-based analyzer.
 	// Empty string (default) uses the V1 percentage-based analyzer.
@@ -218,6 +227,9 @@ func (c *SaturationScalingConfig) Merge(override SaturationScalingConfig) {
 	}
 	if override.EnableLimiter {
 		c.EnableLimiter = override.EnableLimiter
+	}
+	if override.EnableStabilization {
+		c.EnableStabilization = override.EnableStabilization
 	}
 	if override.Priority != 0 {
 		c.Priority = override.Priority

@@ -47,6 +47,7 @@ import (
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/logging"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/metrics"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/saturation"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/stabilization"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/utils"
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/utils/scaletarget"
 	llmdVariantAutoscalingV1alpha1 "github.com/llm-d/llm-d-workload-variant-autoscaler/internal/variant"
@@ -149,6 +150,12 @@ type Engine struct {
 	// ScaleToZeroEnforcer applies scale-to-zero and minimum replica enforcement
 	ScaleToZeroEnforcer *pipeline.Enforcer
 
+	// stabilizer damps the optimizer's raw per-variant targets with HPA-style
+	// scaling behavior. It is long-lived so its trailing recommendation windows
+	// and per-period rate budgets persist across optimize cycles. Applied only
+	// when EnableStabilization is set in the saturation config.
+	stabilizer *stabilization.Stabilizer
+
 	// GPULimiter constrains scaling decisions based on available GPU resources.
 	// Only applied when EnableLimiter is true in the saturation config.
 	GPULimiter pipeline.Limiter
@@ -242,6 +249,7 @@ func NewEngine(client client.Client, apiReader client.Reader, scheme *runtime.Sc
 		Config:                  cfg,
 		ReplicaMetricsCollector: collector.NewReplicaMetricsCollector(promSource, client, recorder, podLocator),
 		ScaleToZeroEnforcer:     pipeline.NewEnforcer(requestCountFunc),
+		stabilizer:              stabilization.New(),
 		GPULimiter:              gpuLimiter,
 		metricsRegistry:         metricsRegistry,
 		saturationV2Analyzer:    satV2,
@@ -909,6 +917,10 @@ func (e *Engine) optimizeV2(
 		"optimizer", optimizer.Name(),
 		"decisionCount", len(allDecisions),
 		"modelCount", len(requests))
+
+	// Damp the raw recommendations with HPA-style stabilization before the
+	// enforcer and emit path see them. No-op unless enabled in config.
+	e.applyStabilization(ctx, allDecisions)
 
 	// Stage 3: Apply enforcer per-model (directly on decisions)
 	for _, req := range requests {
