@@ -20,6 +20,7 @@ package stabilization
 import (
 	"fmt"
 	"math"
+	"slices"
 	"sync"
 	"time"
 
@@ -136,14 +137,19 @@ func (s *Stabilizer) Stabilize(args Args) Result {
 	up := resolveRules(behaviorScaleUp(args.Behavior), true)
 	down := resolveRules(behaviorScaleDown(args.Behavior), false)
 
-	stabilized := s.applyStabilizationWindow(args.Key, args.CurrentReplicas, args.DesiredReplicas, now, up.window, down.window)
+	// One critical section for the whole operation so concurrent calls — even on
+	// the same key — observe and update the per-key history atomically.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	stabilized := s.stabilizationWindowLocked(args.Key, args.CurrentReplicas, args.DesiredReplicas, now, up.window, down.window)
 	stabilized = applyTolerance(args.CurrentReplicas, stabilized, up.tolerance, down.tolerance)
 
-	rateLimited := s.applyRatePolicies(args.Key, args.CurrentReplicas, stabilized, now, up, down)
+	rateLimited := s.ratePoliciesLocked(args.Key, args.CurrentReplicas, stabilized, now, up, down)
 
 	final := clamp(rateLimited, args.MinReplicas, args.MaxReplicas)
 
-	s.recordScaleEvent(args.Key, args.CurrentReplicas, final, now)
+	s.recordScaleEventLocked(args.Key, args.CurrentReplicas, final, now)
 
 	return Result{
 		Replicas:   final,
@@ -152,16 +158,29 @@ func (s *Stabilizer) Stabilize(args Args) Result {
 	}
 }
 
-// applyStabilizationWindow records the raw recommendation and returns the
+// Forget drops all retained history for keys not present in active. The engine
+// calls it each cycle with the keys it is about to stabilize, bounding the
+// per-key maps to the live set of scale targets (variants come and go).
+func (s *Stabilizer) Forget(active map[string]struct{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for k := range s.recommendations {
+		if _, ok := active[k]; !ok {
+			delete(s.recommendations, k)
+			delete(s.upEvents, k)
+			delete(s.downEvents, k)
+		}
+	}
+}
+
+// stabilizationWindowLocked records the raw recommendation and returns the
 // current replica count clamped into the band [min recent (up window), max
 // recent (down window)]. The smallest recommendation over the scale-up window
 // is a floor (scale up only when every recent recommendation agrees); the
 // largest recommendation over the scale-down window is a ceiling (scale down
 // only after the window has decayed).
-func (s *Stabilizer) applyStabilizationWindow(key string, current, desired int32, now time.Time, upWindow, downWindow time.Duration) int32 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
+// stabilizationWindowLocked must be called with s.mu held.
+func (s *Stabilizer) stabilizationWindowLocked(key string, current, desired int32, now time.Time, upWindow, downWindow time.Duration) int32 {
 	upCutoff := now.Add(-upWindow)
 	downCutoff := now.Add(-downWindow)
 	pruneCutoff := now.Add(-max(upWindow, downWindow))
@@ -212,18 +231,17 @@ func applyTolerance(current, stabilized int32, upTolerance, downTolerance float6
 	return stabilized
 }
 
-// applyRatePolicies caps the per-period change permitted by the scaling
+// ratePoliciesLocked caps the per-period change permitted by the scaling
 // policies, budgeting against the changes already actuated within each policy's
 // period.
-func (s *Stabilizer) applyRatePolicies(key string, current, desired int32, now time.Time, up, down resolvedRules) int32 {
+// ratePoliciesLocked must be called with s.mu held.
+func (s *Stabilizer) ratePoliciesLocked(key string, current, desired int32, now time.Time, up, down resolvedRules) int32 {
 	if desired == current {
 		return desired
 	}
 
-	s.mu.Lock()
 	upEvents := s.upEvents[key]
 	downEvents := s.downEvents[key]
-	s.mu.Unlock()
 
 	if desired > current {
 		limit := calculateScaleUpLimit(current, upEvents, now, up)
@@ -332,33 +350,25 @@ func replicasChangePerPeriod(periodSeconds int32, events []scaleEvent, now time.
 	return sum
 }
 
-// recordScaleEvent records an actuation's replica delta so future cycles can
-// budget rate policies against it. Stale events (older than the longest policy
-// period seen, capped at the stabilization ceiling) are pruned opportunistically.
-func (s *Stabilizer) recordScaleEvent(key string, from, to int32, now time.Time) {
+// recordScaleEventLocked records an actuation's replica delta so future cycles
+// can budget rate policies against it. Events older than the stabilization
+// ceiling are pruned opportunistically. Must be called with s.mu held.
+//
+// The delta is recorded against the value this stage produced (final), so the
+// rate budget stays accurate only while stabilization is the last stage that
+// determines the actuated replica count. Any future post-stabilization clamp in
+// the V2 path must update this event instead, or the budget will desync.
+func (s *Stabilizer) recordScaleEventLocked(key string, from, to int32, now time.Time) {
 	if to == from {
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	pruneCutoff := now.Add(-maxStabilizationWindow)
+	stale := func(e scaleEvent) bool { return !e.timestamp.After(pruneCutoff) }
 	if to > from {
-		s.upEvents[key] = append(pruneEvents(s.upEvents[key], pruneCutoff), scaleEvent{timestamp: now, replicas: to - from})
+		s.upEvents[key] = append(slices.DeleteFunc(s.upEvents[key], stale), scaleEvent{timestamp: now, replicas: to - from})
 	} else {
-		s.downEvents[key] = append(pruneEvents(s.downEvents[key], pruneCutoff), scaleEvent{timestamp: now, replicas: from - to})
+		s.downEvents[key] = append(slices.DeleteFunc(s.downEvents[key], stale), scaleEvent{timestamp: now, replicas: from - to})
 	}
-}
-
-// pruneEvents drops events at or before cutoff, reusing the backing array.
-func pruneEvents(events []scaleEvent, cutoff time.Time) []scaleEvent {
-	kept := events[:0]
-	for _, e := range events {
-		if e.timestamp.After(cutoff) {
-			kept = append(kept, e)
-		}
-	}
-	return kept
 }
 
 // clamp bounds v to [min, max]. The max bound is ignored when max <= 0.

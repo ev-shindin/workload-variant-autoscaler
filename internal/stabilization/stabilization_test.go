@@ -127,6 +127,18 @@ var _ = Describe("Stabilizer", func() {
 			Entry("Min picks the most conservative", autoscalingv2.MinChangePolicySelect, int32(14)),
 			Entry("Disabled holds current", autoscalingv2.DisabledPolicySelect, int32(10)),
 		)
+
+		DescribeTable("selectPolicy combines competing scale-down policies",
+			func(sel autoscalingv2.ScalingPolicySelect, want int32) {
+				// From 10: Pods(-4) proposes 6; Percent(-50%) proposes 5.
+				down := rulesFor(0, sel, podsPolicy(4), percentPolicy(50))
+				res := s.Stabilize(Args{Key: "ns/v", Behavior: behaviorFor(nil, down), CurrentReplicas: 10, DesiredReplicas: 1, MinReplicas: 0, MaxReplicas: 100})
+				Expect(res.Replicas).To(Equal(want))
+			},
+			Entry("Max picks the most permissive (lowest)", autoscalingv2.MaxChangePolicySelect, int32(5)),
+			Entry("Min picks the most conservative (highest)", autoscalingv2.MinChangePolicySelect, int32(6)),
+			Entry("Disabled holds current", autoscalingv2.DisabledPolicySelect, int32(10)),
+		)
 	})
 
 	Describe("tolerance deadband", func() {
@@ -145,6 +157,17 @@ var _ = Describe("Stabilizer", func() {
 			clock.Advance(time.Second)
 			args.CurrentReplicas, args.DesiredReplicas = 10, 20
 			Expect(s.Stabilize(args).Replicas).To(Equal(int32(20)), "+100% exceeds the deadband")
+		})
+
+		It("does not suppress scale-from-zero even when a tolerance is set", func() {
+			up := &autoscalingv2.HPAScalingRules{
+				StabilizationWindowSeconds: ptr[int32](0),
+				SelectPolicy:               ptr(autoscalingv2.MaxChangePolicySelect),
+				Policies:                   []autoscalingv2.HPAScalingPolicy{podsPolicy(1000)},
+				Tolerance:                  ptr(resource.MustParse("0.9")),
+			}
+			res := s.Stabilize(Args{Key: "ns/v", Behavior: behaviorFor(up, nil), CurrentReplicas: 0, DesiredReplicas: 2, MinReplicas: 0, MaxReplicas: 100})
+			Expect(res.Replicas).To(Equal(int32(2)), "current=0 must not divide-by-zero into a suppressed change")
 		})
 	})
 
@@ -185,6 +208,29 @@ var _ = Describe("Stabilizer", func() {
 
 			byA := s.Stabilize(Args{Key: "ns/a", CurrentReplicas: 8, DesiredReplicas: 2, MinReplicas: 1, MaxReplicas: 20})
 			Expect(byA.Replicas).To(Equal(int32(8)), "key a is still held by its own window")
+		})
+	})
+
+	Describe("Forget", func() {
+		It("drops history for keys not in the active set", func() {
+			// Build a high down-window history for key a.
+			s.Stabilize(Args{Key: "ns/a", CurrentReplicas: 8, DesiredReplicas: 8, MinReplicas: 0, MaxReplicas: 20})
+			clock.Advance(10 * time.Second)
+
+			// Forget it (only key b is active this cycle).
+			s.Forget(map[string]struct{}{"ns/b": {}})
+
+			// With its window gone, key a's scale-down is no longer held at 8.
+			got := s.Stabilize(Args{Key: "ns/a", CurrentReplicas: 8, DesiredReplicas: 2, MinReplicas: 0, MaxReplicas: 20}).Replicas
+			Expect(got).To(Equal(int32(2)), "forgotten history must not damp the next decision")
+		})
+
+		It("retains history for keys still in the active set", func() {
+			s.Stabilize(Args{Key: "ns/a", CurrentReplicas: 8, DesiredReplicas: 8, MinReplicas: 0, MaxReplicas: 20})
+			clock.Advance(10 * time.Second)
+			s.Forget(map[string]struct{}{"ns/a": {}})
+			got := s.Stabilize(Args{Key: "ns/a", CurrentReplicas: 8, DesiredReplicas: 2, MinReplicas: 0, MaxReplicas: 20}).Replicas
+			Expect(got).To(Equal(int32(8)), "retained window still holds the recent max")
 		})
 	})
 

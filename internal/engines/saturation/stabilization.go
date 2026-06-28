@@ -3,6 +3,7 @@ package saturation
 import (
 	"context"
 
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/interfaces"
@@ -29,6 +30,14 @@ func (e *Engine) applyStabilization(ctx context.Context, decisions []interfaces.
 	logger := ctrl.LoggerFrom(ctx)
 	behavior := stabilization.DefaultBehavior()
 
+	// Bound the stabilizer's per-key history to the variants live this cycle, so
+	// keys for deleted variants do not accumulate.
+	active := make(map[string]struct{}, len(decisions))
+	for i := range decisions {
+		active[stabilizationKey(&decisions[i])] = struct{}{}
+	}
+	e.stabilizer.Forget(active)
+
 	type stabilizationEntry struct {
 		Name  string `json:"name"`
 		Role  string `json:"role,omitempty"`
@@ -45,8 +54,8 @@ func (e *Engine) applyStabilization(ctx context.Context, decisions []interfaces.
 			Key:             stabilizationKey(d),
 			CurrentReplicas: int32(d.CurrentReplicas),
 			DesiredReplicas: int32(d.TargetReplicas),
-			MinReplicas:     intPtrOrZero(d.MinReplicas),
-			MaxReplicas:     intPtrOrZero(d.MaxReplicas),
+			MinReplicas:     int32(ptr.Deref(d.MinReplicas, 0)),
+			MaxReplicas:     int32(ptr.Deref(d.MaxReplicas, 0)),
 			Behavior:        behavior,
 		})
 
@@ -89,29 +98,14 @@ func stabilizationKey(d *interfaces.VariantDecision) string {
 // retargetDecision recomputes a decision's Action after stabilization changed
 // its TargetReplicas, preserving the original reason category so the decision is
 // not mis-attributed in the reason metric label.
+//
+// A nil MinReplicas/MaxReplicas is passed to the stabilizer as 0, where a zero
+// MaxReplicas means "no cap" and a zero MinReplicas means "no floor" —
+// scale-to-zero and minimum-replica enforcement remain the enforcer's job.
 func retargetDecision(d *interfaces.VariantDecision) {
-	var action interfaces.SaturationAction
-	switch {
-	case d.TargetReplicas > d.CurrentReplicas:
-		action = interfaces.ActionScaleUp
-	case d.TargetReplicas < d.CurrentReplicas:
-		action = interfaces.ActionScaleDown
-	default:
-		action = interfaces.ActionNoChange
-	}
 	category := d.ReasonCategory()
 	if category == "" {
 		category = interfaces.DecisionReasonV2
 	}
-	d.SetDecisionReason(action, category, string(category)+" (stabilized)")
-}
-
-// intPtrOrZero dereferences an optional replica bound, returning 0 when unset.
-// A zero MaxReplicas means "no cap"; a zero MinReplicas means "no floor"
-// (scale-to-zero and minimum-replica enforcement remain the enforcer's job).
-func intPtrOrZero(v *int) int32 {
-	if v == nil {
-		return 0
-	}
-	return int32(*v)
+	d.SetDecisionReason(d.ActionForTarget(), category, string(category)+" (stabilized)")
 }

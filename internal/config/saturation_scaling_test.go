@@ -446,6 +446,19 @@ var _ = Describe("SaturationScalingConfig", func() {
 			Expect(base.ModelID).To(Equal("llama-70b"))
 			Expect(base.Namespace).To(Equal("production"))
 		})
+
+		It("should propagate EnableStabilization from the override", func() {
+			base := SaturationScalingConfig{}
+			base.Merge(SaturationScalingConfig{EnableStabilization: true})
+			Expect(base.EnableStabilization).To(BeTrue())
+		})
+
+		It("should not clear EnableStabilization already set to true", func() {
+			base := SaturationScalingConfig{EnableStabilization: true}
+			base.Merge(SaturationScalingConfig{EnableStabilization: false})
+			Expect(base.EnableStabilization).To(BeTrue(),
+				"a false override must not revert an enabled flag (matches EnableLimiter semantics)")
+		})
 	})
 
 	Context("IsV2", func() {

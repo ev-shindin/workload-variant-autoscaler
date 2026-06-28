@@ -1,0 +1,76 @@
+package saturation
+
+import (
+	"context"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/config"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/interfaces"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/stabilization"
+)
+
+func newStabilizationEngine(enabled bool) *Engine {
+	cfg := config.NewTestConfig()
+	cfg.UpdateSaturationConfig(map[string]config.SaturationScalingConfig{
+		"default": {EnableStabilization: enabled},
+	})
+	return &Engine{stabilizer: stabilization.New(), Config: cfg}
+}
+
+func scaleDecision(ns, name, role string, current, target int) interfaces.VariantDecision {
+	d := interfaces.VariantDecision{
+		Namespace:       ns,
+		VariantName:     name,
+		Role:            role,
+		CurrentReplicas: current,
+		TargetReplicas:  target,
+	}
+	d.SetDecisionReason(d.ActionForTarget(), interfaces.DecisionReasonV2, "V2 (optimizer: cost-aware)")
+	return d
+}
+
+var _ = Describe("applyStabilization", func() {
+	It("is a no-op when EnableStabilization is false", func() {
+		e := newStabilizationEngine(false)
+		decisions := []interfaces.VariantDecision{scaleDecision("ns", "v", "", 2, 10)}
+		e.applyStabilization(context.Background(), decisions)
+		Expect(decisions[0].TargetReplicas).To(Equal(10), "raw optimizer target must pass through unchanged")
+	})
+
+	It("damps the target and recomputes the action when enabled", func() {
+		e := newStabilizationEngine(true)
+		// Default scale-up rate caps a 2->10 spike to max(+4 pods, +100%) = 6.
+		decisions := []interfaces.VariantDecision{scaleDecision("ns", "v", "", 2, 10)}
+		e.applyStabilization(context.Background(), decisions)
+		Expect(decisions[0].TargetReplicas).To(Equal(6))
+		Expect(decisions[0].Action).To(Equal(interfaces.ActionScaleUp))
+	})
+})
+
+var _ = Describe("stabilizationKey", func() {
+	It("omits the role for non-disaggregated variants", func() {
+		Expect(stabilizationKey(&interfaces.VariantDecision{Namespace: "ns", VariantName: "v"})).To(Equal("ns/v"))
+	})
+
+	It("includes the role for disaggregated variants", func() {
+		Expect(stabilizationKey(&interfaces.VariantDecision{Namespace: "ns", VariantName: "v", Role: "prefill"})).To(Equal("ns/v/prefill"))
+	})
+})
+
+var _ = Describe("retargetDecision", func() {
+	It("recomputes the action from the new target", func() {
+		d := scaleDecision("ns", "v", "", 5, 10) // initially scale-up
+		d.TargetReplicas = 3
+		retargetDecision(&d)
+		Expect(d.Action).To(Equal(interfaces.ActionScaleDown))
+	})
+
+	It("falls back to the V2 reason category when unset", func() {
+		d := &interfaces.VariantDecision{CurrentReplicas: 5, TargetReplicas: 3}
+		retargetDecision(d)
+		Expect(d.ReasonCategory()).To(Equal(interfaces.DecisionReasonV2))
+		Expect(d.Action).To(Equal(interfaces.ActionScaleDown))
+	})
+})

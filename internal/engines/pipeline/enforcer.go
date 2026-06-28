@@ -182,15 +182,7 @@ func (e *Enforcer) ensureMinimumReplicasOnDecisions(
 // CurrentReplicas after enforcement and refreshes its reason. SetDecisionReason
 // is the single place that writes d.Action.
 func updateDecisionAction(d *domain.VariantDecision, optimizerName, policyType string, metricsEmitter *metrics.MetricsEmitter) {
-	var action domain.SaturationAction
-	switch {
-	case d.TargetReplicas > d.CurrentReplicas:
-		action = domain.ActionScaleUp
-	case d.TargetReplicas < d.CurrentReplicas:
-		action = domain.ActionScaleDown
-	default:
-		action = domain.ActionNoChange
-	}
+	action := d.ActionForTarget()
 	// Preserve the decision's original reason category (e.g. saturation-only on
 	// the V1 path) instead of hardcoding V2, so an enforced decision is not
 	// mis-attributed in the reason metric label. Fall back to V2 if it was unset.

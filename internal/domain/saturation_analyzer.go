@@ -362,6 +362,20 @@ func (d *VariantDecision) ReasonCategory() DecisionReason {
 	return d.decisionReason
 }
 
+// ActionForTarget returns the scaling action implied by comparing the
+// decision's TargetReplicas to its CurrentReplicas. Pipeline stages that adjust
+// TargetReplicas use it to recompute Action consistently.
+func (d *VariantDecision) ActionForTarget() SaturationAction {
+	switch {
+	case d.TargetReplicas > d.CurrentReplicas:
+		return ActionScaleUp
+	case d.TargetReplicas < d.CurrentReplicas:
+		return ActionScaleDown
+	default:
+		return ActionNoChange
+	}
+}
+
 // Reason returns the detailed human-readable reason for this decision.
 func (d *VariantDecision) Reason() string {
 	return d.reason

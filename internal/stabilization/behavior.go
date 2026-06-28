@@ -83,18 +83,21 @@ func defaultScaleDownPolicies() []autoscalingv2.HPAScalingPolicy {
 // and scale-down damped by a 300s stabilization window. Callers may use it as a
 // starting point and override individual fields.
 func DefaultBehavior() *autoscalingv2.HorizontalPodAutoscalerBehavior {
-	maxSelect := autoscalingv2.MaxChangePolicySelect
-	downWindow := int32(DefaultDownscaleStabilizationWindow / time.Second)
+	// Each direction gets its own pointers so a caller overriding one field via
+	// dereference (e.g. *b.ScaleUp.SelectPolicy = ...) cannot corrupt the other.
+	upSelect := autoscalingv2.MaxChangePolicySelect
+	downSelect := autoscalingv2.MaxChangePolicySelect
 	upWindow := int32(0)
+	downWindow := int32(DefaultDownscaleStabilizationWindow / time.Second)
 	return &autoscalingv2.HorizontalPodAutoscalerBehavior{
 		ScaleUp: &autoscalingv2.HPAScalingRules{
 			StabilizationWindowSeconds: &upWindow,
-			SelectPolicy:               &maxSelect,
+			SelectPolicy:               &upSelect,
 			Policies:                   defaultScaleUpPolicies(),
 		},
 		ScaleDown: &autoscalingv2.HPAScalingRules{
 			StabilizationWindowSeconds: &downWindow,
-			SelectPolicy:               &maxSelect,
+			SelectPolicy:               &downSelect,
 			Policies:                   defaultScaleDownPolicies(),
 		},
 	}
