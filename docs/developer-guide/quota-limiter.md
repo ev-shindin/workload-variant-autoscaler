@@ -48,6 +48,14 @@ The limiter is declared via a ConfigMap parsed into `QuotaLimiterEntries`. The
 top-level `limiters` key holds a list of entries; each entry has a `scope` of
 either `cluster` or `namespace`.
 
+> **`type:` vs `--limiter-type`.** Which limiter *implementation* runs is chosen
+> globally at startup by `--limiter-type` (see [Startup wiring](#startup-wiring)),
+> not per entry. The per-entry `type:` field is a forward-looking discriminator
+> that must currently always be `"quota"` — `type: inventory` is **not** valid
+> inside this YAML and the config is rejected if any other value is used (see
+> [Validation](#validation)). The field exists so future limiter types (e.g.
+> `reservation`) can share this schema.
+
 ### Cluster scope
 
 A cluster-scoped entry caps the total GPUs of a given accelerator type across
@@ -134,6 +142,18 @@ When the allocator evaluates a request for namespace `N` and type `T` in
 It returns a non-fatal **warning** when a namespace appears in both `exclude`
 and `namespaceQuotas`. `exclude` wins; the warning surfaces a likely
 configuration mistake without rejecting the ConfigMap.
+
+### Reload lifecycle
+
+The quota configuration is read **once at startup** (from `--quota-config-file` /
+`QUOTA_CONFIG_FILE`, or the unified config file) and held in memory for the life
+of the process. The running controller does **not** watch the file or reload it.
+
+This matters when the quota file is mounted from a ConfigMap: Kubernetes updates
+the file on disk as the ConfigMap changes, but the controller keeps using the
+values it loaded at startup. A quota change therefore takes effect only after the
+controller pod restarts (e.g. `kubectl rollout restart deployment/...`). Plan
+quota edits accordingly — there is no hot reload.
 
 ## Pipeline integration
 
@@ -232,6 +252,40 @@ Remaining boundaries:
   benign under-provision, not an isolation breach; configure a finite cluster or
   per-namespace cap for any type you expect to scale under V2.
 
+### Fair-share interaction
+
+Quotas are **hard ceilings applied on top of** the optimizer's fair-share loop,
+not inputs to it. Two properties follow from that:
+
+- The fair-share mean each round is `cluster GPUs / number of active models` — it
+  is **not** quota-weighted. Quotas only clamp each model after the mean is
+  computed.
+- Fairness is **per-model**, not per-namespace. Two models in one namespace each
+  get their own fair-share slot; the namespace quota bounds each of them (and
+  their running sum) but does not pool one model's allowance for the other.
+
+When a model is capped below its fair-share slot it takes only up to its quota;
+the unused remainder is **released to subsequent rounds**, where the
+still-hungry models split it — it is not handed to other models within the same
+round.
+
+Worked example — cluster of 8 GPUs, three models:
+
+| Model | Wants | Quota |
+|-------|-------|-------|
+| M1    | 3     | 2     |
+| M2    | 4     | 4     |
+| M3    | 4     | 4     |
+
+- **Round 1:** mean ≈ 8 / 3 ≈ 2.67. M2 and M3 each take ≈ 2.67 (under their
+  quotas); M1 is capped at its quota of 2, leaving ≈ 0.67 of its slot unused.
+- **Round 2:** that leftover ≈ 0.67 is split between the still-hungry M2 and M3.
+
+Final allocation: **M1 = 2, M2 ≈ 3, M3 ≈ 3** (total 8). The outcome respects
+every quota and exhausts the cluster budget; the multi-round path is why a
+quota-constrained model's slack flows to later rounds rather than to its
+round-mates.
+
 ## Interaction with `TypeInventory`
 
 `QuotaInventory` is composed with `TypeInventory` by the limiter chain. The
@@ -272,7 +326,7 @@ startup via the `--limiter-type` flag (or `LIMITER_TYPE` env var):
 | Value | Behavior |
 |-------|----------|
 | `inventory` (default) | Today's path — `TypeInventory` discovers physical GPUs via the GPU operator and caps decisions at `min(physical, requested)`. |
-| `quota` | Loads operator-declared quotas from `--quota-config-file` (or `QUOTA_CONFIG_FILE` env var). The two are mutually exclusive in PR-1 — quota mode does **not** consult physical inventory. |
+| `quota` | Loads operator-declared quotas from `--quota-config-file` (or `QUOTA_CONFIG_FILE` env var). The two are mutually exclusive in the initial implementation (composing with physical inventory as `min(physical, quota)` is tracked in [#1003](https://github.com/llm-d/llm-d-workload-variant-autoscaler/issues/1003)) — quota mode does **not** consult physical inventory. |
 
 The selector lives on `*config.Config` (`LimiterType()`, `QuotaConfigFile()`,
 `QuotaLimiterEntries()`). The factory in

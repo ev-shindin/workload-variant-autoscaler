@@ -22,8 +22,11 @@ import (
 //   - Empty constituents -> a no-op (Limit returns nil; useful for tests).
 //   - One constituent -> behaves identically to that constituent.
 //   - On error from any constituent, Limit returns immediately; decisions
-//     made by earlier constituents stay applied (TryAllocate's in-memory
-//     usage updates are per-allocator, so partial commits do not leak).
+//     made by earlier constituents stay applied. TryAllocate's in-memory usage
+//     state is per-allocator, so usage accounting never leaks across
+//     constituents; the TargetReplicas mutations earlier constituents already
+//     wrote to the shared slice do persist, which is benign because an error
+//     aborts the whole optimize cycle.
 //
 // LimitedBy semantics: when more than one constituent caps the same decision,
 // the LAST one to run wins on LimitedBy. The DecisionStep history preserves
@@ -55,9 +58,11 @@ func (c *CompositeLimiter) Constituents() []Limiter {
 }
 
 // Limit applies each constituent's Limit method in order against the shared
-// decisions slice. The decisions slice is the source of usage truth (see
-// DefaultLimiter.calculateUsedGPUs), so each constituent sees the
-// already-capped TargetReplicas from earlier constituents.
+// decisions slice. Each constituent recomputes its baseline usage from
+// CurrentReplicas (DefaultLimiter.calculateUsedGPUs), but its TryAllocate runs
+// against the already-capped TargetReplicas that earlier constituents mutated in
+// place — so the most-restrictive cap wins as each successive constituent sees a
+// lower target.
 func (c *CompositeLimiter) Limit(ctx context.Context, decisions []*interfaces.VariantDecision) error {
 	if len(decisions) == 0 || len(c.limiters) == 0 {
 		return nil

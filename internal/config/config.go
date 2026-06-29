@@ -38,9 +38,9 @@ type coordinatorConfig struct {
 
 // LimiterType selects which pipeline.Limiter implementation
 // pipeline.NewLimiterFromConfig builds at startup. The two values are
-// mutually exclusive in PR-1 — composing physical and quota bounds
-// (min(physical, quota)) is the limiter chain's job, tracked in
-// sub-issue #1003.
+// mutually exclusive in the initial implementation — composing physical and
+// quota bounds (min(physical, quota)) is the limiter chain's job, tracked in
+// issue #1003.
 type LimiterType string
 
 const (

@@ -452,6 +452,12 @@ func (a *quotaAllocator) tryAllocateNamespace(ns, accType string, gpusRequested 
 // Remaining returns the sum of available GPUs across all pools the allocator
 // tracks. Unlimited (-1) entries contribute 0 — the value is reserved for
 // post-allocation reporting, not for capacity comparisons.
+//
+// Namespace scope caveat: this sums only the explicitly-listed NamespaceQuotas
+// keys. Headroom consumed by unlisted namespaces that allocate via the "default"
+// per-namespace fallback is not subtracted here, so the namespace-scope total
+// can over-report remaining headroom. This affects reporting only — allocation
+// is unaffected, since TryAllocate tracks each namespace's own budget.
 func (a *quotaAllocator) Remaining() int {
 	total := 0
 	switch a.scope {
