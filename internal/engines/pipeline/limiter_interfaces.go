@@ -151,7 +151,7 @@ type ResourcePool struct {
 //
 // Available is only meaningful for a FINITE pool (Limit >= 0). A pool carrying
 // the unlimited sentinel (Limit < 0, emitted per-(namespace, type) by
-// GetNamespaceResourcePools) would clamp to 0 here, which reads as "deny" —
+// NamespaceResourcePools) would clamp to 0 here, which reads as "deny" —
 // the opposite of "unlimited". Callers that may see the sentinel must branch on
 // Limit < 0 first (see nsPoolBudget and mergeConstraints); do not call
 // Available on such a pool.
@@ -273,7 +273,7 @@ type NamespaceAwareInventory interface {
 	// Should be called before CreateAllocator, alongside SetUsed.
 	SetUsedByNamespace(usedByNS map[string]map[string]int)
 
-	// GetNamespaceResourcePools returns per-(namespace, accelerator type) pools
+	// NamespaceResourcePools returns per-(namespace, accelerator type) pools
 	// for the given active namespaces as a CLOSED allowlist, resolving each
 	// namespace's caps via the inventory's lookup rules (e.g. explicit entry →
 	// default fall-through → exclude). Outer key: namespace; inner key:
@@ -284,5 +284,5 @@ type NamespaceAwareInventory interface {
 	// sentinel pool with Limit < 0 (so it stays distinct from a type the
 	// namespace does not list, which the optimizer must deny). SetUsedByNamespace
 	// should be called first so the returned pools carry current usage.
-	GetNamespaceResourcePools(activeNamespaces []string) map[string]map[string]ResourcePool
+	NamespaceResourcePools(activeNamespaces []string) map[string]map[string]ResourcePool
 }

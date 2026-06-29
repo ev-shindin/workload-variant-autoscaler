@@ -179,7 +179,7 @@ func (l *DefaultLimiter) buildStepReason(d *interfaces.VariantDecision) string {
 // active namespaces (the keys of usageByNamespace) as a closed allowlist; the
 // optimizer caps a model's allocation at min(per-type pool, that namespace's
 // pool) for listed types and denies types the namespace does not list (full
-// V1/V2 parity — see GetNamespaceResourcePools). Multi-entry quotas are handled
+// V1/V2 parity — see NamespaceResourcePools). Multi-entry quotas are handled
 // by the engine computing constraints from each constituent of a CompositeLimiter.
 //
 // The keys of usageByNamespace define the active-namespace set: a namespace with
@@ -220,7 +220,7 @@ func (l *DefaultLimiter) ComputeConstraints(ctx context.Context, usageByType map
 	if nai, ok := l.inventory.(NamespaceAwareInventory); ok {
 		nai.SetUsedByNamespace(usageByNamespace)
 		activeNamespaces := slices.Collect(maps.Keys(usageByNamespace))
-		if nsPools := nai.GetNamespaceResourcePools(activeNamespaces); len(nsPools) > 0 {
+		if nsPools := nai.NamespaceResourcePools(activeNamespaces); len(nsPools) > 0 {
 			rc.NamespacePools = nsPools
 			rc.Pools = aggregateNamespacePools(nsPools)
 			rc.TotalLimit, rc.TotalUsed, rc.TotalAvail = poolTotals(rc.Pools)

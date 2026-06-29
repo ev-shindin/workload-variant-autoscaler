@@ -365,7 +365,7 @@ var _ = Describe("QuotaInventory", func() {
 		})
 	})
 
-	Describe("GetNamespaceResourcePools", func() {
+	Describe("NamespaceResourcePools", func() {
 		It("returns per-(namespace,type) caps, applying default fall-through and excludes, with unlimited as a sentinel", func() {
 			inv := newNamespaceQuotaInv(map[string]map[string]int{
 				"team-a":                                {"H100": 4, "A100": config.QuotaUnlimited},
@@ -376,7 +376,7 @@ var _ = Describe("QuotaInventory", func() {
 
 			// team-a explicit; team-z unlisted (falls through to default);
 			// kube-system excluded.
-			pools := inv.GetNamespaceResourcePools([]string{"team-a", "team-z", "kube-system"})
+			pools := inv.NamespaceResourcePools([]string{"team-a", "team-z", "kube-system"})
 
 			Expect(pools["team-a"]).To(HaveKeyWithValue("H100", ResourcePool{Limit: 4, Used: 1}))
 			Expect(pools["team-a"]).To(HaveKeyWithValue("A100", ResourcePool{Limit: config.QuotaUnlimited, Used: 0}),
@@ -391,7 +391,7 @@ var _ = Describe("QuotaInventory", func() {
 			}, nil)
 
 			// team-z is unlisted and there is no "default" fall-through.
-			pools := inv.GetNamespaceResourcePools([]string{"team-a", "team-z"})
+			pools := inv.NamespaceResourcePools([]string{"team-a", "team-z"})
 
 			Expect(pools).To(HaveKey("team-z"), "present (closed allowlist) so the optimizer denies it")
 			Expect(pools["team-z"]).To(BeEmpty(), "no listed types — a real deny-all")
@@ -399,7 +399,7 @@ var _ = Describe("QuotaInventory", func() {
 
 		It("returns nil for cluster scope", func() {
 			inv := newClusterQuotaInv(map[string]int{"H100": 8})
-			Expect(inv.GetNamespaceResourcePools([]string{"team-a"})).To(BeNil())
+			Expect(inv.NamespaceResourcePools([]string{"team-a"})).To(BeNil())
 		})
 	})
 
@@ -456,6 +456,25 @@ var _ = Describe("QuotaInventory", func() {
 			// team-a H100 (4) only; A100 unlimited contributes 0; excluded
 			// kube-system and the reserved default key contribute 0.
 			Expect(alloc.Remaining()).To(Equal(4))
+		})
+
+		It("namespace scope: over-reports when a default-fallback namespace allocates (documented limitation)", func() {
+			inv := newNamespaceQuotaInv(map[string]map[string]int{
+				"team-a":                                {"H100": 4},
+				config.QuotaLimiterReservedNamespaceKey: {"H100": 2},
+			}, nil)
+			alloc := inv.CreateAllocator(ctx)
+
+			// team-z is unlisted and allocates 2 via the "default" fallback.
+			got, err := alloc.TryAllocate(ctx, quotaDecisionFor("team-z", "H100"), 2)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(got).To(Equal(2))
+
+			// Remaining iterates the listed NamespaceQuotas keys only (team-a, and
+			// the reserved default key which is skipped), so team-z's usage is not
+			// subtracted. It reports team-a's full 4 — the documented over-report.
+			Expect(alloc.Remaining()).To(Equal(4),
+				"default-fallback namespace usage is not subtracted from Remaining")
 		})
 	})
 

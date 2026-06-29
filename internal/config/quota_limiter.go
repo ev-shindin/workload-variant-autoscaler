@@ -19,6 +19,13 @@ const QuotaLimiterReservedNamespaceKey = "default"
 // convention of -1 = no limit (e.g., `terminationGracePeriodSeconds: -1`).
 const QuotaUnlimited = -1
 
+// MaxQuotaValue is the largest finite quota a single entry may declare. It is
+// far above any realistic GPU count (a million accelerators) and exists only to
+// keep the aggregate sum (summed across namespaces in aggregateNamespacePools)
+// well clear of int64 overflow — an overflowed sum could wrap negative and be
+// misread as the QuotaUnlimited (-1) sentinel.
+const MaxQuotaValue = 1 << 20 // 1,048,576
+
 // QuotaScope identifies whether a quota limiter applies cluster-wide or
 // per-namespace. Both scopes can coexist; each acts independently.
 type QuotaScope string
@@ -250,6 +257,10 @@ func validateTypeQuotaMap(quotas map[string]int, location string) error {
 		if value < QuotaUnlimited {
 			errs = append(errs, fmt.Errorf("%s[%q]: quota value %d is invalid; must be >= %d (only -1 is allowed as negative — means unlimited)",
 				location, accType, value, QuotaUnlimited))
+		}
+		if value > MaxQuotaValue {
+			errs = append(errs, fmt.Errorf("%s[%q]: quota value %d exceeds the maximum of %d",
+				location, accType, value, MaxQuotaValue))
 		}
 	}
 	return errors.Join(errs...)

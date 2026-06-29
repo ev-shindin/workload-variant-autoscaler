@@ -212,6 +212,20 @@ var _ = Describe("QuotaLimiterEntries.Validate", func() {
 					ClusterQuotas: map[string]int{"H100": -5},
 				},
 			}}, "only -1 is allowed as negative"),
+		Entry("value < -1 in namespaceQuotas inner map rejected",
+			&QuotaLimiterEntries{Limiters: []QuotaLimiterConfig{
+				{
+					Name: "x", Type: "quota", Scope: QuotaScopeNamespace,
+					NamespaceQuotas: map[string]map[string]int{"team-a": {"H100": -5}},
+				},
+			}}, "only -1 is allowed as negative"),
+		Entry("value above MaxQuotaValue rejected",
+			&QuotaLimiterEntries{Limiters: []QuotaLimiterConfig{
+				{
+					Name: "x", Type: "quota", Scope: QuotaScopeCluster,
+					ClusterQuotas: map[string]int{"H100": MaxQuotaValue + 1},
+				},
+			}}, "exceeds the maximum"),
 		Entry("empty accelerator type rejected",
 			&QuotaLimiterEntries{Limiters: []QuotaLimiterConfig{
 				{

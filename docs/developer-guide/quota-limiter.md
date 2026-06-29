@@ -120,12 +120,20 @@ When the allocator evaluates a request for namespace `N` and type `T` in
 1. If `N` appears in `exclude`, the limiter **passes through** — the request is
    returned unchanged and no usage is recorded. Other limiters in the chain
    still apply.
-2. If `namespaceQuotas[N][T]` is set, that cap is used.
-3. Otherwise, if `namespaceQuotas["default"][T]` is set, that cap is used as
-   the **per-namespace** default — each unlisted namespace consumes its own
-   budget at this level. This matches the Kubernetes `LimitRange` default
-   semantic; it is *not* a shared pool across unlisted namespaces.
+2. If `N` is listed in `namespaceQuotas`, that namespace's **whole map is a
+   closed allowlist**: `namespaceQuotas[N][T]` is the cap if present, and a type
+   `T` that `N` does **not** list is **denied** (granted = 0). A listed namespace
+   never falls through to `default` for a missing type — listing a namespace opts
+   it into "only the types I name".
+3. Otherwise (`N` is not listed), if `namespaceQuotas["default"]` is present, the
+   **`default` map** becomes `N`'s per-namespace budget: each unlisted namespace
+   gets its own copy of those caps (a type absent from `default` is still
+   denied). This matches the Kubernetes `LimitRange` default semantic; it is
+   *not* a shared pool across unlisted namespaces.
 4. Otherwise, the request is denied (granted = 0).
+
+The fall-through to `default` is therefore at the **namespace** granularity, not
+per `(namespace, type)`: it applies only when `N` is wholly unlisted.
 
 ### Validation
 
@@ -184,11 +192,12 @@ source.
 `TryAllocate` returns the number of GPUs that may be allocated, which is
 `min(gpusRequested, remaining)`. Specifically:
 
-- **Unresolved accelerator** (empty `AcceleratorName`): pass-through. The
-  upstream sentinel-resolution path (PR #1026) is expected to resolve the
-  accelerator before the chain reaches a limiter that depends on it; if the
-  allocator sees an unresolved decision it logs at DEBUG level and returns the
-  full request unchanged, deferring enforcement to a later stage.
+- **Unresolved accelerator** (empty `AcceleratorName`): **deny — fail closed**
+  (granted = 0, with a `WasConstrained` DecisionStep). The allocator cannot match
+  a per-type quota without a resolved type, and passing through would let an
+  unattributed request bypass the cap. `DefaultLimiter` runs accelerator
+  resolution first and resolves single-type inventories; a multi-type quota
+  config can still leave the type unresolved here, so denial is the safe default.
 - **Unlimited (`-1`)**: pass-through. No usage is recorded because there is no
   finite budget to track.
 - **Cluster scope**: cap is `ClusterQuotas[type]`. Missing entry → 0.
@@ -202,7 +211,7 @@ For the cluster scope it is one pool per configured type. For the namespace
 scope it is the per-type **sum** across explicitly-listed (non-excluded,
 non-`default`) namespaces — the aggregate cluster budget that the per-namespace
 caps then partition. The per-`(namespace, type)` breakdown is exposed separately
-via `GetNamespaceResourcePools` (see *V2 enforcement* below).
+via `NamespaceResourcePools` (see *V2 enforcement* below).
 
 Unlimited (`-1`) entries impose no constraint and are **omitted** from the map
 entirely — an absent pool means "no cap", and the allocator's `TryAllocate`
@@ -219,7 +228,7 @@ the optimizer's `ResourceConstraints`, built from
 **same closed-allowlist semantics as the V1 `Limit()` path** (`tryAllocateNamespace`):
 
 - **Per-type / cluster** caps come from `GetResourcePools` (`ResourceConstraints.Pools`).
-- **Per-namespace** caps come from `GetNamespaceResourcePools`
+- **Per-namespace** caps come from `NamespaceResourcePools`
   (`ResourceConstraints.NamespacePools`, keyed namespace → type). Each non-excluded
   active namespace is a **closed allowlist**: the optimizer may scale a model
   onto a type only if that namespace lists it. For a listed type, the bound is
@@ -251,6 +260,10 @@ Remaining boundaries:
   fair-share loop stops when the finite cluster aggregate is zero). This is a
   benign under-provision, not an isolation breach; configure a finite cluster or
   per-namespace cap for any type you expect to scale under V2.
+- The same applies to an **unlimited (`-1`) cluster-scope** quota: `GetResourcePools`
+  omits unlimited entries, so under V2 that type has no aggregate budget and does
+  **not** scale up (whereas V1 `Limit` passes it through unbounded). If you want a
+  type to scale under V2, give it a finite cap rather than `-1`.
 
 ### Fair-share interaction
 
@@ -263,6 +276,17 @@ not inputs to it. Two properties follow from that:
 - Fairness is **per-model**, not per-namespace. Two models in one namespace each
   get their own fair-share slot; the namespace quota bounds each of them (and
   their running sum) but does not pool one model's allowance for the other.
+
+> **Ceilings, not reservations.** A finite per-namespace cap guarantees a tenant
+> will never *exceed* it — it does **not** guarantee the tenant can *reach* it.
+> Under V2 the cluster aggregate is the **sum of the finite namespace caps**, and
+> an **unlimited (`-1`)** or **excluded** namespace competing for the same
+> accelerator type draws from that shared aggregate without contributing to it,
+> so it can consume budget a finite-capped peer would otherwise have used (no
+> isolation breach — nobody exceeds their own authorization — but a real fairness
+> footgun). If you need a tenant's cap to behave like a floor, avoid mixing
+> unlimited/excluded namespaces on the same type, and give every type a finite
+> cluster-scope cap.
 
 When a model is capped below its fair-share slot it takes only up to its quota;
 the unused remainder is **released to subsequent rounds**, where the
@@ -296,11 +320,13 @@ intended model:
 - `QuotaInventory` knows what is **administratively allowed**.
 - The chain takes the minimum: a decision must fit under both.
 
-Used standalone, `QuotaInventory` does **not** enforce physical bounds — a
-deployment with no `TypeInventory` in the chain will happily allocate beyond
-the cluster's actual capacity if the quota permits. Always pair the two in
-production. The chain composition itself is tracked in sub-issue #1003 and is
-out of scope for the initial PR.
+In the initial implementation the two are **mutually exclusive**, not composed:
+`--limiter-type` selects either physical inventory **or** quota. There is no
+`min(physical, quota)` chain yet (tracked in sub-issue #1003), so quota mode does
+**not** enforce physical bounds at all — a deployment in quota mode will allocate
+beyond the cluster's actual capacity if the quota permits (the surplus simply
+yields `Pending` pods, not an isolation breach). Set quota caps at or below real
+capacity until composition with `TypeInventory` lands.
 
 ## DecisionStep trace
 
@@ -313,8 +339,11 @@ with the reason formatted as:
 
 The step's `Name` field is the limiter's `name` (e.g., `cluster-quota`) and
 `WasConstrained` is `true`. Pass-through paths (excluded namespace, unlimited
-quota, unresolved accelerator) do **not** record a step because they did not
-constrain the decision. The chain's `updateDecisionMetadata` separately sets
+quota) do **not** record a step because they did not constrain the decision. An
+**unresolved accelerator** is the exception among the "did not allocate" paths:
+it is a fail-closed **deny** and *does* record a `WasConstrained` step (reason
+`denied by quota[...]: accelerator type unresolved`). The chain's
+`updateDecisionMetadata` separately sets
 `WasLimited` / `LimitedBy` per limiter; the DecisionStep here carries the
 finer-grained scope/type detail.
 
@@ -328,8 +357,8 @@ startup via the `--limiter-type` flag (or `LIMITER_TYPE` env var):
 | `inventory` (default) | Today's path — `TypeInventory` discovers physical GPUs via the GPU operator and caps decisions at `min(physical, requested)`. |
 | `quota` | Loads operator-declared quotas from `--quota-config-file` (or `QUOTA_CONFIG_FILE` env var). The two are mutually exclusive in the initial implementation (composing with physical inventory as `min(physical, quota)` is tracked in [#1003](https://github.com/llm-d/llm-d-workload-variant-autoscaler/issues/1003)) — quota mode does **not** consult physical inventory. |
 
-The selector lives on `*config.Config` (`LimiterType()`, `QuotaConfigFile()`,
-`QuotaLimiterEntries()`). The factory in
+The selector lives on `*config.Config` (`LimiterMode()`, `QuotaConfigFile()`,
+`QuotaEntries()`). The factory in
 `internal/engines/pipeline/limiter_factory.go` translates the selection into a
 concrete `pipeline.Limiter`:
 

@@ -210,7 +210,7 @@ func (q *QuotaInventory) TotalAvailable() int {
 // SUM across explicitly-listed (non-excluded, non-"default") namespaces — i.e.
 // the aggregate cluster budget that the per-namespace caps partition. The
 // per-(namespace, type) breakdown is exposed separately via
-// GetNamespaceResourcePools; the optimizer combines them as
+// NamespaceResourcePools; the optimizer combines them as
 // min(per-type total, that namespace's cap).
 //
 // Quota value semantics on the emitted Limit:
@@ -256,7 +256,7 @@ func (q *QuotaInventory) GetResourcePools() map[string]ResourcePool {
 	return pools
 }
 
-// GetNamespaceResourcePools implements NamespaceAwareInventory. For the cluster
+// NamespaceResourcePools implements NamespaceAwareInventory. For the cluster
 // scope it returns nil (no namespace dimension). For the namespace scope it
 // exposes each active namespace as a CLOSED allowlist that mirrors the V1
 // tryAllocateNamespace contract, so namespace quota is enforced identically on
@@ -278,7 +278,7 @@ func (q *QuotaInventory) GetResourcePools() map[string]ResourcePool {
 //     to the cluster aggregate (that fall-through was the cross-namespace leak).
 //
 // Used counts come from the most recent SetUsedByNamespace call.
-func (q *QuotaInventory) GetNamespaceResourcePools(activeNamespaces []string) map[string]map[string]ResourcePool {
+func (q *QuotaInventory) NamespaceResourcePools(activeNamespaces []string) map[string]map[string]ResourcePool {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
 	if q.cfg.Scope != config.QuotaScopeNamespace {

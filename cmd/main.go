@@ -482,6 +482,19 @@ func main() {
 		}
 		setupLog.Info("GPU limiter constructed", "type", cfg.LimiterMode(), "name", gpuLimiter.Name())
 
+		// The GPU limiter is only consulted on the limited optimizer path, which
+		// the engine selects per-model when enableLimiter is true in the
+		// saturation-scaling ConfigMap. That flag lives in a different ConfigMap
+		// than the quota config and is not visible to config.Validate at startup,
+		// so warn explicitly: choosing --limiter-type=quota alone does NOT enforce
+		// quotas unless enableLimiter is also set.
+		if cfg.LimiterMode() == config.LimiterTypeQuota {
+			setupLog.Info("Quota limiter selected; quota caps are enforced ONLY when " +
+				"enableLimiter: true is set in the saturation-scaling ConfigMap. " +
+				"With the default enableLimiter: false the engine runs the unlimited " +
+				"optimizer and quota caps are not applied.")
+		}
+
 		// Quota mode means "no physical-capacity discovery" — including the
 		// inventory-collection call in the saturation engine. We honor that
 		// at the call site (see saturation.shouldCollectClusterInventory),

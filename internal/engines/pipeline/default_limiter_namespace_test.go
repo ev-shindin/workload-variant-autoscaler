@@ -16,8 +16,8 @@ type namespaceAwareMockInventory struct {
 	mockInventory
 	usedByNS                map[string]map[string]int
 	setUsedByNamespaceCalls int
-	nsPools                 map[string]map[string]ResourcePool // returned by GetNamespaceResourcePools
-	lastActiveNamespaces    []string                           // arg captured from the last GetNamespaceResourcePools call
+	nsPools                 map[string]map[string]ResourcePool // returned by NamespaceResourcePools
+	lastActiveNamespaces    []string                           // arg captured from the last NamespaceResourcePools call
 }
 
 func newNamespaceAwareMockInventory(limitByType map[string]int) *namespaceAwareMockInventory {
@@ -35,7 +35,7 @@ func (m *namespaceAwareMockInventory) SetUsedByNamespace(usedByNS map[string]map
 	m.usedByNS = usedByNS
 }
 
-func (m *namespaceAwareMockInventory) GetNamespaceResourcePools(activeNamespaces []string) map[string]map[string]ResourcePool {
+func (m *namespaceAwareMockInventory) NamespaceResourcePools(activeNamespaces []string) map[string]map[string]ResourcePool {
 	m.lastActiveNamespaces = activeNamespaces
 	return m.nsPools
 }
@@ -156,10 +156,10 @@ var _ = Describe("DefaultLimiter namespace-aware feature detection", func() {
 
 	It("ComputeConstraints falls back to GetResourcePools when no namespace pools are produced", func() {
 		// e.g. a cluster-scoped quota, or an active set that is entirely excluded:
-		// GetNamespaceResourcePools returns empty, so Pools/Totals stay the static
+		// NamespaceResourcePools returns empty, so Pools/Totals stay the static
 		// per-type GetResourcePools result and NamespacePools is nil.
 		inv := newNamespaceAwareMockInventory(map[string]int{"H100": 8})
-		inv.nsPools = nil // GetNamespaceResourcePools returns empty
+		inv.nsPools = nil // NamespaceResourcePools returns empty
 		limiter := NewDefaultLimiter("test", inv, algorithm)
 
 		rc, err := limiter.ComputeConstraints(ctx,

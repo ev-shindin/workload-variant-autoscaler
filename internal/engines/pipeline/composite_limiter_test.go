@@ -111,6 +111,22 @@ var _ = Describe("CompositeLimiter", func() {
 		Expect(c.invocations).To(Equal(0))
 	})
 
+	It("preserves mutations from earlier constituents when a later one errors", func() {
+		a := &recordingLimiter{name: "a", cap: 4} // caps TargetReplicas to 4
+		b := &recordingLimiter{name: "b", err: errors.New("boom")}
+		comp := NewCompositeLimiter("composite", []Limiter{a, b})
+
+		decisions := []*interfaces.VariantDecision{{TargetReplicas: 10}}
+		err := comp.Limit(ctx, decisions)
+		Expect(err).To(HaveOccurred())
+
+		// a's cap must survive b's error: CompositeLimiter does not roll back
+		// earlier constituents' mutations (the contract — an error aborts the
+		// optimize cycle, so the partial mutation is benign).
+		Expect(decisions[0].TargetReplicas).To(Equal(4),
+			"earlier constituent's cap must persist after a later constituent errors")
+	})
+
 	It("exposes its constituents in declaration order", func() {
 		a := &recordingLimiter{name: "a"}
 		b := &recordingLimiter{name: "b"}
