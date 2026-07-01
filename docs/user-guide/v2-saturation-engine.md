@@ -88,19 +88,23 @@ instead derives its per-replica capacity from the variant's deployment/engine ar
 from a compatible sibling variant on the same accelerator. This is what lets V2 compute a target
 for a variant that currently runs zero replicas.
 
-### 2. Demand — the tokens the model needs to serve
+### 2. Demand calculation — the tokens the model needs to serve
 
-Demand is also in KV-cache tokens and sums three sources:
+The total tokens the model needs to serve is the sum of three sources, all in KV-cache tokens:
 
 ```
-demand = tokens_in_use          (live: kv_cache_usage × capacity)
-       + local_queue_tokens     (requests waiting on the pod × avg input tokens)
-       + scheduler_queue_tokens  (requests still queued upstream in the EPP flow-control layer,
-                                   before they reach any pod)
+demand = tokens_in_use + local_queue_tokens + scheduler_queue_tokens
 ```
 
-The upstream scheduler-queue term accounts for load that hasn't landed on a pod yet; its
-input-token portion is discounted by the observed prefix-cache hit rate when available.
+where:
+
+- **`tokens_in_use`** — tokens for the requests **currently running** on the model's replicas
+  (`kv_cache_usage × capacity`).
+- **`local_queue_tokens`** — tokens for the requests **queued on the replicas** themselves
+  (`num_requests_waiting × avg input tokens`).
+- **`scheduler_queue_tokens`** — tokens for the requests **still queued upstream** in the EPP
+  flow-control layer, before they reach any pod. Its input-token portion is discounted by the
+  observed prefix-cache hit rate when available.
 
 ### 3. The scaling signal
 
@@ -149,6 +153,40 @@ When `enableLimiter: true`, the desired counts are capped by actually-available 
 across competing models weighted by each model's `priority`. Without the limiter (the default),
 scale-up is unconstrained and the optimizer simply minimizes cost. Priority weighting applies
 **only** in limiter mode.
+
+## Why V2 — advantages over V1
+
+V1 (percentage-based) reasons about each replica's *current* KV-cache utilization as a fraction and
+scales by counting how many replicas "look saturated." V2's absolute token model unlocks scaling
+behaviors V1 cannot express:
+
+- **Right-sized steps, not one replica at a time.** V1 nudges the count by the number of saturated
+  replicas; V2 computes the exact token deficit and adds `ceil(RequiredCapacity / per-replica
+  capacity)` replicas — so it can jump 2 → 5 in a single cycle instead of creeping up one replica
+  per cycle (and, on scale-down, removes `floor(SpareCapacity / per-replica capacity)` at once).
+- **Compares and sizes heterogeneous accelerators.** Because capacity is an absolute token count
+  per variant, V2 can weigh an A100 variant against an H100 variant and place replicas where they
+  are most cost-effective. V1's per-replica *percentages* are not comparable across replicas of
+  different capacity.
+- **Scales up from zero.** V2 derives a variant's per-replica capacity from its deployment/engine
+  args (or a compatible sibling) when there are no running pods to measure, so it can size a variant
+  that currently has zero replicas. V1 can only adjust replicas that already exist.
+- **Anticipates queued load instead of only reacting.** V2's demand includes requests still queued
+  locally and upstream in the EPP flow-control layer — load that has not reached a pod yet — so it
+  scales up *before* a backlog turns into latency. V1 only sees the KV-cache fraction already on the
+  pods.
+- **Models the compute ceiling, not just memory.** V2 caps per-replica capacity at the smaller of
+  the memory and compute ceilings, so it will not over-provision KV memory for a workload that is
+  actually compute-bound (e.g. long generations).
+- **Avoids double-scaling and oscillation.** V2 counts pending (still-booting) replicas as
+  *anticipated* supply, so an in-flight scale-up suppresses further scale-up until it lands; and the
+  band between `scaleUpThreshold` and `scaleDownBoundary` is a stable no-change region.
+- **Respects GPU scarcity and P/D roles.** With the limiter, V2 fair-shares scarce GPUs across
+  competing models by `priority`; for prefill/decode-disaggregated models it sizes and couples the
+  two roles. V1 does neither.
+- **Explains its decisions in the same units it uses.** V2 emits token-level signals —
+  `wva_saturation_utilization`, `wva_required_capacity`, `wva_spare_capacity` — so an operator can
+  see *why* it scaled.
 
 ## Thresholds
 
