@@ -19,7 +19,7 @@ complete metrics catalog see
 |---|---|
 | **Model** | A served model (a `modelID`, e.g. `Qwen/Qwen3-0.6B`) in a namespace. The unit WVA makes a scaling decision for. |
 | **Variant** | One deployable configuration of a model — a Deployment/LeaderWorkerSet, typically pinned to an accelerator type (and, for disaggregated serving, a role). A model may have several variants (e.g. A100 vs H100, or prefill vs decode). |
-| **Replica** | One running pod of a variant. |
+| **Replica** | One running instance of a variant. For a Deployment that is a single pod; for a LeaderWorkerSet it is one **group** — a leader pod plus zero or more worker pods (capacity and GPUs are counted per group). |
 | **Role** | For prefill/decode-**disaggregated** serving, a variant serves the `prefill` or `decode` stage; non-disaggregated variants are `both`. |
 | **EPP** | *Endpoint Picker* — the request router in the llm-d inference scheduler ([Gateway API Inference Extension](https://github.com/kubernetes-sigs/gateway-api-inference-extension)). EPP spreads requests across replicas; WVA decides how many replicas exist. |
 | **Capacity / supply** | How much work a replica (or the whole model) can serve, measured in **KV-cache tokens**. |
@@ -39,8 +39,9 @@ WVA ships two saturation analyzers:
 | GPU-constrained fair-share | not supported | supported (with the limiter) |
 
 V2 is the preferred engine going forward (V1 is the legacy path). It builds an explicit capacity
-model in units of KV-cache tokens, so a single decision can jump from, say, 2 → 5 replicas, or
-size a variant that currently has **zero** replicas.
+model in units of KV-cache tokens, so a single decision can add several replicas at once (e.g.
+2 → 5) and can even scale a variant **up from zero** — computing a replica target for a variant
+that has no running pods to measure (see [step 1](#1-per-replica-capacity-calculation)).
 
 ### Enabling V2
 
@@ -51,17 +52,19 @@ analyzerName: "saturation"     # the empty string "" is the legacy V1 default
 ```
 
 Engine selection is read from the `default` entry only — it is **global**. Per-model and
-per-namespace entries can override *thresholds*, but not which engine runs.
+per-namespace entries can override *thresholds*, but not which engine runs. The active engine is
+exposed in the `wva_config_info` metric's `analyzer_name` label, so you can confirm it on a
+dashboard (see [Verify V2 is active](#verify-v2-is-active)).
 
 ## How it works
 
 Each cycle, for every model, V2 runs four core steps (plus an optional fifth when the GPU
 limiter is enabled).
 
-### 1. Per-replica capacity = the tighter of two ceilings
+### 1. Per-replica capacity calculation
 
-A replica can't serve past whichever wall it hits first — **memory** or **compute** — so its
-usable capacity is the **smaller** of two ceilings, both in KV-cache tokens:
+A replica can't serve past whichever wall it hits first — **memory** or **compute** — so **one
+replica's** capacity is the **smaller** of two ceilings, both in KV-cache tokens:
 
 - **Memory ceiling** = `KV_token_capacity × kvCacheThreshold`.
   `KV_token_capacity` (= `num_gpu_blocks × block_size`) is the pod's physical KV-cache size,
@@ -74,10 +77,16 @@ usable capacity is the **smaller** of two ceilings, both in KV-cache tokens:
   otherwise from recent history, otherwise from the deployment's batch/sequence limits. *(The
   detailed estimation chain is in the [developer guide](../developer-guide/saturation-scaling-config.md).)*
 
-A variant's per-replica capacity is the **median** of its ready replicas' capacities (median so
-one outlier pod doesn't skew it). A variant with no ready replicas borrows capacity derived from
-its deployment args or from a compatible sibling variant — this is what lets V2 size a
-zero-replica variant.
+The two ceilings above give **one replica's** capacity. A variant usually runs several replicas,
+so V2 needs a single representative figure for it: the variant's **per-replica capacity** is the
+**median** across its *ready* replicas' capacities. *Ready* here means a replica that is running
+and past start-up — i.e. current replicas minus any still-pending (booting) ones; the median
+keeps one outlier pod from skewing the value.
+
+When a variant has **no ready replicas to measure** (for example, scaling up from zero), V2
+instead derives its per-replica capacity from the variant's deployment/engine args, or borrows it
+from a compatible sibling variant on the same accelerator. This is what lets V2 compute a target
+for a variant that currently runs zero replicas.
 
 ### 2. Demand — the tokens the model needs to serve
 
