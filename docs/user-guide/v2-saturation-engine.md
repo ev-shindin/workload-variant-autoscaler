@@ -114,9 +114,11 @@ V2 aggregates to model level:
 - **`TotalAnticipatedSupply`** = Σ ((ready + **pending**) replicas × per-replica capacity)
 - **`TotalDemand`** = the demand above
 
-We want demand to sit at the target utilization of supply — so the supply we *need* is
-`demand ÷ scaleUpThreshold` (e.g. at 0.85, demand should be 85% of supply). That gives two
-signals:
+We want demand to sit at a target fraction of supply — the **`scaleUpThreshold`** (default `0.85`)
+— so the supply we *need* is `demand ÷ scaleUpThreshold` (at 0.85, demand should be 85% of supply).
+The matching floor for safe scale-down is **`scaleDownBoundary`** (default `0.70`). Both are set in
+the `wva-saturation-scaling-config` ConfigMap (full reference under [Thresholds](#thresholds)).
+That gives two signals:
 
 ```
 RequiredCapacity  = max(0, TotalDemand / scaleUpThreshold  − TotalAnticipatedSupply)   → scale up
@@ -124,18 +126,28 @@ SpareCapacity     = max(0, TotalSupply  − TotalDemand / scaleDownBoundary)    
 ```
 
 - **`RequiredCapacity > 0`** → the supply we need exceeds what's already in flight → **scale up**.
-  Because *anticipated* supply counts pending replicas, an in-flight scale-up shrinks
-  `RequiredCapacity` — this avoids counting the same scale-up twice.
+  *Anticipated* supply counts **pending** (still-booting) replicas, so an in-flight scale-up shrinks
+  `RequiredCapacity` — the target won't keep growing while a slow-loading GPU replica boots, avoiding
+  the overshoot a plain metric-threshold loop can hit during long cold starts.
 - **`SpareCapacity > 0`** → even after inflating demand to the `scaleDownBoundary`, supply is
   left over → **scale-down is safe**.
-- Neither → **no change**. The band between the two thresholds is a stable no-change region;
-  note WVA has no time-based stabilization window yet, so keeping the band wide is what reduces
-  flapping.
+- Neither → **no change**. Using **two** thresholds rather than a single one is deliberate: with a
+  single threshold the system would flap — cross it and add a replica, utilization drops just under
+  it, remove the replica, utilization climbs back over it, and so on every cycle. The gap between
+  `scaleUpThreshold` (0.85) and `scaleDownBoundary` (0.70) is a hysteresis **dead-band** that stops
+  that oscillation: scale-up needs utilization above 0.85, scale-down below 0.70, and anything in
+  between holds steady. (WVA has no time-based stabilization window yet, so a wider band is the main
+  lever for reducing flapping.)
 
 > V2 also reports a model `utilization = TotalDemand / TotalSupply` for observability, but the
 > decision is driven by `RequiredCapacity`/`SpareCapacity` above — **not** by comparing that
 > ratio to the thresholds. (On V2 the `wva_spare_capacity` metric reports this token surplus;
 > see [Metrics](#metrics).)
+
+> **How this relates to HPA/KEDA.** WVA does not replace HPA or KEDA — it *computes* the desired
+> replica target from this token model and emits it for HPA/KEDA to enforce. Crediting *pending*
+> replicas (above) keeps that target stable through slow GPU cold starts, complementing — not
+> competing with — the actuator's own stabilization window.
 
 ### 4. Replica target
 
@@ -144,8 +156,10 @@ scale-up replicas   = ceil(RequiredCapacity / per_replica_capacity)
 scale-down replicas = floor(SpareCapacity   / per_replica_capacity)
 ```
 
-Scale-down respects each variant's `minReplicas`, removes highest-cost replicas first, and (for
-prefill/decode-disaggregated models) keeps the two roles coupled so the model stays functional.
+Scale-down respects each variant's `minReplicas`; when a model has **multiple variants** it removes
+the highest-cost variant's replicas first. For prefill/decode-**disaggregated** models it scales the
+two roles **together** — dropping decode replicas without matching prefill (or vice-versa) would
+unbalance the pipeline and can leave the model non-functional, so V2 never scales one role on its own.
 
 ### 5. (Optional) GPU-constrained fair-share
 
