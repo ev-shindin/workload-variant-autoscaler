@@ -534,19 +534,19 @@ With WVA metrics, the value for the label `namespace` is the WVA controller name
 
 ### `wva_spare_capacity`
 - **Type**: Gauge
-- **Description**: Per-variant spare KV-cache capacity (0.0-1.0) from saturation analysis. V1 path: threshold-relative spare (kvCacheThreshold - avg KV usage). V2 path: 1.0 - utilization.
+- **Description**: Spare capacity from saturation analysis; >0 indicates scale-down headroom. Use the `unit` label to interpret the value: `continuous` (V2) = absolute spare in KV-cache **tokens**, `max(0, TotalSupply - TotalDemand/scaleDownBoundary)` — the companion to `wva_required_capacity`; otherwise (V1) = a 0.0-1.0 threshold-relative fraction (`kvCacheThreshold - avg KV usage`).
 - **Labels**:
   - `variant_name`: Name of the variant
   - `namespace`: Kubernetes namespace
   - `model_name`: Model name served by the variant
-  - `accelerator_type`: Type of accelerator being used
+  - `unit`: `continuous` (V2, token value) or empty (V1, 0.0-1.0 fraction)
 - **Use Case**: Track available capacity headroom to prevent saturation and optimize resource allocation
 - **Example**:
   ```
   {
     "metric": {
       "__name__": "wva_spare_capacity",
-      "accelerator_type": "H100",
+      "unit": "continuous",
       "container": "manager",
       "endpoint": "https",
       "exported_namespace": "llm-d-sim-dual",
@@ -560,14 +560,14 @@ With WVA metrics, the value for the label `namespace` is the WVA controller name
     },
     "value": [
       1778846184.925,
-      "0.8"
+      "12000"
     ]
   }
   ```
 
 ### `wva_required_capacity`
 - **Type**: Gauge
-- **Description**: Model-level required capacity; >0 indicates scale-up needed. Use the `unit` label to interpret the value: `binary` → 0/1 scale-up signal (V1), `continuous` → token demand (V2).
+- **Description**: Required capacity; >0 indicates scale-up needed (V2: per-role for P/D-disaggregated models, model-level otherwise). Use the `unit` label to interpret the value: `binary` → 0/1 scale-up signal (V1), `continuous` → token demand (V2).
 - **Labels**:
   - `variant_name`: Name of the variant
   - `namespace`: Kubernetes namespace
@@ -909,8 +909,12 @@ wva_saturation_utilization
 # Variants requiring scale-up (V1 binary signal)
 wva_required_capacity{unit="binary"} > 0
 
-# Spare capacity below threshold (potential scale-up needed)
-wva_spare_capacity < 0.2
+# High utilization — scale-up likely (V1 and V2)
+wva_saturation_utilization > 0.85
+
+# Low spare capacity, V1 fractional signal only.
+# On V2 wva_spare_capacity is an absolute token count, not a 0-1 ratio — use utilization above.
+wva_spare_capacity{unit=""} < 0.2
 
 # Models processed over time
 wva_models_processed

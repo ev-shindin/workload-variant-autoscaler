@@ -166,12 +166,16 @@ const (
 	// Labels: variant_name, namespace, model_name, accelerator_type
 	WVASaturationUtilization = "wva_saturation_utilization"
 
-	// WVASpareCapacity is a gauge that tracks per-variant spare capacity (0.0-1.0).
-	// Labels: variant_name, namespace, model_name, accelerator_type
+	// WVASpareCapacity is a gauge that tracks spare capacity from saturation analysis.
+	// >0 means scale-down headroom.
+	// Value semantics differ by analyzer (use the "unit" label to distinguish):
+	//   - unit="continuous" (V2): absolute spare in KV-cache tokens
+	//   - otherwise         (V1): 0.0-1.0 threshold-relative KV-cache fraction
+	// Labels: variant_name, namespace, model_name, unit
 	WVASpareCapacity = "wva_spare_capacity"
 
-	// WVARequiredCapacity is a gauge that tracks model-level required capacity.
-	// >0 means scale-up needed.
+	// WVARequiredCapacity is a gauge that tracks required capacity; >0 means scale-up
+	// needed (V2: per-role for P/D-disaggregated models, model-level otherwise).
 	// Value semantics differ by analyzer (use the "unit" label to distinguish):
 	//   - unit="binary"     (V1): 0.0 = no scale-up, 1.0 = scale-up needed
 	//   - unit="continuous" (V2): continuous token-based demand
@@ -223,9 +227,9 @@ const (
 	LabelScaleToZeroEnabled = "scale_to_zero_enabled"
 	LabelQueryType          = "query_type"
 	// LabelUnit distinguishes the unit of a metric value when a single metric name
-	// carries values with different semantic units. Currently applied to
-	// wva_required_capacity, whose value is either a binary scale-up signal (V1)
-	// or a continuous token-demand value (V2).
+	// carries values with different semantic units. Applied to wva_required_capacity
+	// and wva_spare_capacity, whose values are either a "binary" 0/1 signal (V1) or a
+	// "continuous" token magnitude (V2).
 	LabelUnit = "unit"
 )
 
