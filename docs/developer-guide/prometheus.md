@@ -534,12 +534,12 @@ With WVA metrics, the value for the label `namespace` is the WVA controller name
 
 ### `wva_spare_capacity`
 - **Type**: Gauge
-- **Description**: Spare capacity from saturation analysis; >0 indicates scale-down headroom. Use the `unit` label to interpret the value: `continuous` (V2) = absolute spare in KV-cache **tokens**, `max(0, TotalSupply - TotalDemand/scaleDownBoundary)` — the companion to `wva_required_capacity`; otherwise (V1) = a 0.0-1.0 threshold-relative fraction (`kvCacheThreshold - avg KV usage`).
+- **Description**: Spare capacity; >0 indicates scale-down headroom (per-role for P/D-disaggregated models, model-level otherwise). Use the `unit` label to interpret the value: `continuous` → **token surplus** from the **Token-based analyzer** (`max(0, TotalSupply - TotalDemand/scaleDownBoundary)`); empty → a 0.0-1.0 threshold-relative fraction from the **Percentage-based analyzer** (`kvCacheThreshold - avg KV usage`).
 - **Labels**:
   - `variant_name`: Name of the variant
   - `namespace`: Kubernetes namespace
   - `model_name`: Model name served by the variant
-  - `unit`: `continuous` (V2, token value) or empty (V1, 0.0-1.0 fraction)
+  - `unit`: `continuous` (Token-based analyzer — a token magnitude) or empty (Percentage-based analyzer — 0.0-1.0 fraction)
 - **Use Case**: Track available capacity headroom to prevent saturation and optimize resource allocation
 - **Example**:
   ```
@@ -567,12 +567,12 @@ With WVA metrics, the value for the label `namespace` is the WVA controller name
 
 ### `wva_required_capacity`
 - **Type**: Gauge
-- **Description**: Required capacity; >0 indicates scale-up needed (V2: per-role for P/D-disaggregated models, model-level otherwise). Use the `unit` label to interpret the value: `binary` → 0/1 scale-up signal (V1), `continuous` → token demand (V2).
+- **Description**: Required capacity; >0 indicates scale-up needed (per-role for P/D-disaggregated models, model-level otherwise). Use the `unit` label to interpret the value: `continuous` → **token demand** from the **Token-based analyzer**; `binary` → 0/1 scale-up signal from the **Percentage-based analyzer**.
 - **Labels**:
   - `variant_name`: Name of the variant
   - `namespace`: Kubernetes namespace
   - `model_name`: Model name served by the variant
-  - `unit`: Interpretation of the value (`binary` or `continuous`)
+  - `unit`: `continuous` (Token-based analyzer — a token magnitude) or `binary` (Percentage-based analyzer — 0/1 signal)
 - **Use Case**: Identify when additional capacity is needed and understand the magnitude of demand
 - **Example**:
   ```

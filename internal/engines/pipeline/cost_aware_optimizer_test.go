@@ -134,6 +134,36 @@ var _ = Describe("CostAwareOptimizer", func() {
 			Expect(dm["d"].SpareCapacity).To(Equal(20.0))
 		})
 
+		It("maps an empty-role variant to the \"both\" RoleCapacities entry", func() {
+			// Role "" normalizes to RoleBoth, so the "both" entry (not the model-level
+			// totals) must be used. Model-level 9999/8888 are decoys.
+			r := &interfaces.AnalyzerResult{
+				ModelID:          "model-1",
+				Namespace:        "default",
+				RequiredCapacity: 9999,
+				SpareCapacity:    8888,
+				RoleCapacities: map[string]interfaces.RoleCapacity{
+					"both": {Role: "both", RequiredCapacity: 300, SpareCapacity: 30},
+				},
+				VariantCapacities: []interfaces.VariantCapacity{
+					{VariantName: "v", Role: "", Cost: 5.0, ReplicaCount: 1, PerReplicaCapacity: 10000, Utilization: 0.5},
+				},
+			}
+			requests := []ModelScalingRequest{
+				withSatEntry(r, ModelScalingRequest{
+					ModelID:   "model-1",
+					Namespace: "default",
+					VariantStates: []interfaces.VariantReplicaState{
+						{VariantName: "v", Role: "", CurrentReplicas: 1},
+					},
+				}),
+			}
+
+			dm := decisionMap(optimizer.Optimize(ctx, requests, nil))
+			Expect(dm["v"].RequiredCapacity).To(Equal(300.0)) // "both" entry, not model-level 9999
+			Expect(dm["v"].SpareCapacity).To(Equal(30.0))     // "both" entry, not model-level 8888
+		})
+
 		It("should not skip variants with pending replicas", func() {
 			r := &interfaces.AnalyzerResult{
 				RequiredCapacity: 5000,

@@ -166,14 +166,14 @@ func InitMetrics(registry prometheus.Registerer) error {
 	spareCapacity = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: constants.WVASpareCapacity,
-			Help: fmt.Sprintf("Spare capacity from saturation analysis; >0 indicates safe scale-down headroom. The %q label (shared with wva_required_capacity) interprets the value: %q → absolute spare in KV-cache tokens, max(0, TotalSupply - TotalDemand/scaleDownBoundary) (V2 path); otherwise a 0.0-1.0 threshold-relative fraction (V1 path).", constants.LabelUnit, constants.UnitContinuous),
+			Help: fmt.Sprintf("Spare capacity; >0 indicates safe scale-down headroom (per-role for P/D-disaggregated models, model-level otherwise). The %q label (shared with wva_required_capacity) interprets the value: %q → token surplus from the Token-based analyzer, max(0, TotalSupply - TotalDemand/scaleDownBoundary); empty → a 0.0-1.0 threshold-relative fraction from the Percentage-based analyzer.", constants.LabelUnit, constants.UnitContinuous),
 		},
 		requiredCapacityLabels,
 	)
 	requiredCapacity = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: constants.WVARequiredCapacity,
-			Help: fmt.Sprintf("Required capacity; >0 indicates scale-up needed (V2: per-role for P/D-disaggregated models, model-level otherwise). Use the %q label to interpret the value: %q → 0/1 scale-up signal (V1), %q → token demand (V2).", constants.LabelUnit, constants.UnitBinary, constants.UnitContinuous),
+			Help: fmt.Sprintf("Required capacity; >0 indicates scale-up needed (per-role for P/D-disaggregated models, model-level otherwise). Use the %q label to interpret the value: %q → token demand from the Token-based analyzer, %q → 0/1 scale-up signal from the Percentage-based analyzer.", constants.LabelUnit, constants.UnitContinuous, constants.UnitBinary),
 		},
 		requiredCapacityLabels,
 	)

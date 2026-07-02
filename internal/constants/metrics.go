@@ -166,19 +166,19 @@ const (
 	// Labels: variant_name, namespace, model_name, accelerator_type
 	WVASaturationUtilization = "wva_saturation_utilization"
 
-	// WVASpareCapacity is a gauge that tracks spare capacity from saturation analysis.
-	// >0 means scale-down headroom.
+	// WVASpareCapacity is a gauge that tracks spare capacity; >0 means scale-down
+	// headroom (per-role for P/D-disaggregated models, model-level otherwise).
 	// Value semantics differ by analyzer (use the "unit" label to distinguish):
-	//   - unit="continuous" (V2): absolute spare in KV-cache tokens
-	//   - otherwise         (V1): 0.0-1.0 threshold-relative KV-cache fraction
+	//   - unit="continuous" (Token-based analyzer):       token surplus
+	//   - unit="" (empty)   (Percentage-based analyzer): 0.0-1.0 threshold-relative fraction
 	// Labels: variant_name, namespace, model_name, unit
 	WVASpareCapacity = "wva_spare_capacity"
 
 	// WVARequiredCapacity is a gauge that tracks required capacity; >0 means scale-up
-	// needed (V2: per-role for P/D-disaggregated models, model-level otherwise).
+	// needed (per-role for P/D-disaggregated models, model-level otherwise).
 	// Value semantics differ by analyzer (use the "unit" label to distinguish):
-	//   - unit="binary"     (V1): 0.0 = no scale-up, 1.0 = scale-up needed
-	//   - unit="continuous" (V2): continuous token-based demand
+	//   - unit="continuous" (Token-based analyzer):       token demand
+	//   - unit="binary"     (Percentage-based analyzer): 0.0 = no scale-up, 1.0 = scale-up
 	// Labels: variant_name, namespace, model_name, unit
 	WVARequiredCapacity = "wva_required_capacity"
 
