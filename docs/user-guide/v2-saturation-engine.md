@@ -33,8 +33,8 @@ complete metrics catalog see
 | **Capacity / supply** | How much work a replica (or the whole model) can serve, measured in **KV-cache tokens**. |
 | **Demand** | How much work the model currently needs to serve, also in KV-cache tokens. |
 | **Cost** | A per-replica price for a variant that the `cost-aware` optimizer uses to prefer cheaper variants. Set on the `VariantAutoscaling` resource, or via the `llm-d.ai/variant-cost` annotation on the HPA/KEDA object (annotation mode); defaults to `10.0`. |
-| **Score** | A non-negative weight (default `1.0`) on an analyzer's contribution, used only when **several** analyzers run — it sets how their signals combine, and (under the limiter) feeds the cross-model fair-share ranking. With a single analyzer every model carries the same score, so it cancels out and changes nothing. |
-| **Priority** | The relative weight a model gets when the `greedy-by-score` optimizer fair-shares scarce GPUs across models (default `1.0`). Applies **only** when the limiter is on; ignored otherwise. |
+| **Score** | A non-negative weight (default `1.0`) on an analyzer's contribution, used only when **several** analyzers run — it sets how their signals combine, and (under the capacity engine's limiter) feeds the cross-model fair-share ranking. With a single analyzer every model carries the same score, so it cancels out and changes nothing. |
+| **Priority** | The relative weight a model gets when the `greedy-by-score` optimizer fair-shares scarce GPUs across models (default `1.0`). Applies **only** on the capacity engine (V2) with the limiter on; ignored when the limiter is off, and ignored on V1 (whose limiter shares GPUs by saturation, not priority). |
 
 ## Overview
 
@@ -48,7 +48,7 @@ WVA ships two scaling engines:
 | Multi-replica jumps | limited | native |
 | Heterogeneous accelerators | not modeled | first-class (per-variant capacity) |
 | Sizing a scaled-to-zero variant | 0→1 wake-up only¹ | 0→N — target computed from deployment args |
-| GPU-constrained fair-share | not supported | supported (with the limiter) |
+| GPU limiter (`enableLimiter`) | trims decisions post-hoc to fit GPUs (most-saturated-first, no `priority`) | GPU limits constrain the optimizer's placement (`priority` + `score`) |
 
 ¹ Waking a scaled-to-zero variant to a single replica on incoming traffic is handled by a **separate
 scale-from-zero engine** that runs regardless of which saturation engine is active — so V1 workloads
@@ -101,10 +101,12 @@ wva_config_info{analyzer_name="saturation"}   # == 1 when the engine is running
 ```
 
 If it shows a different `analyzer_name` (or the metric is absent), the engine is not selected — confirm
-the ConfigMap's `default` entry sets `analyzerName: "saturation"`. With the limiter on,
-`wva_optimizer_active{optimizer_name="greedy-by-score"} == 1` confirms fair-share mode (otherwise
-`optimizer_name="cost-aware"`) — the optimizers are described in
-[Inside the engine](#inside-the-engine-analyzers-optimizer-limiter).
+the ConfigMap's `default` entry sets `analyzerName: "saturation"`. On the capacity engine with the
+limiter on, `wva_optimizer_active{optimizer_name="greedy-by-score"} == 1` confirms fair-share mode
+(otherwise `optimizer_name="cost-aware"`) — the optimizers are described in
+[Inside the engine](#inside-the-engine-analyzers-optimizer-limiter). V1 has no optimizer, so there is
+no `greedy-by-score` series there; to confirm the limiter is active on either engine, watch
+`wva_decisions_limited_total`.
 
 ### Why isn't it scaling?
 
@@ -114,7 +116,7 @@ Work down this list:
 2. **Collection errors.** `wva_metrics_collection_errors_total` climbing — a query is failing (labeled by `query_type`).
 3. **Not saturated.** `wva_saturation_utilization` is below `scaleUpThreshold` and `wva_required_capacity == 0` — expected no-change.
 4. **Scale-up already in flight.** Pending replicas count toward *anticipated* supply (see [step 3](#3-the-scaling-signal)), so `wva_required_capacity` stays `0` until they become ready.
-5. **Capped by GPUs.** With `enableLimiter: true` (the [limiter](#inside-the-engine-analyzers-optimizer-limiter)), `wva_available_gpus` at/near 0 (or namespace quota exhausted) blocks scale-up even when demand warrants it. GPU discovery runs **only while the limiter is enabled**, so if you turn it on and scale-up freezes, check `wva_available_gpus`: an **absent or zero** series means WVA discovered no accelerators (wrong node labels, no GPU operator) and is capping every model to `0` additional replicas.
+5. **Capped by GPUs.** With `enableLimiter: true` (the [limiter](#inside-the-engine-analyzers-optimizer-limiter)), `wva_available_gpus` at/near 0 (or namespace quota exhausted) blocks scale-up even when demand warrants it. GPU discovery runs **only while the limiter is enabled**, so if you turn it on and scale-up freezes, check `wva_available_gpus`: an **absent or zero** series means WVA discovered no accelerators (wrong node labels, no GPU operator) and is capping every model to `0` additional replicas. `rate(wva_decisions_limited_total[5m]) > 0` confirms the limiter is actively cutting targets (cap-by-saturation on V1, fair-share on the capacity engine).
 6. **Actuation.** `wva_desired_ratio > 1` but replicas don't change → the HPA/KEDA object consuming the signal isn't acting; check the actuator, not WVA.
 
 ## Inside the engine: analyzers, optimizer, limiter
@@ -147,18 +149,26 @@ algorithms automatically:
   — so no single model monopolizes the GPUs. The fair-share weight combines a model's `priority`,
   its analyzers' `score`, and its remaining unmet need (the code name reflects the `score` factor).
 
-**3. Limiter** *(optional)* — caps the optimizer's targets so they fit real resource limits. Division
-of labor: the **limiter** discovers and enforces the GPU budget; the **`greedy-by-score` optimizer**
-(which the limiter turns on) distributes that budget across models. The limiter says *how many GPUs
-exist*; the optimizer decides *who gets them*.
-- **Today** there is one limiter: a **GPU capacity limiter** (`enableLimiter: true`) that
-  discovers the cluster's accelerators and prevents scaling beyond what's available.
-- **The limiter is pluggable** — it pairs a resource **inventory** (e.g. the discovered GPUs) with
-  an **allocation policy** (how to divide them across models) — so **more limiters are planned**,
-  e.g. operator-declared **quota caps** per accelerator type or namespace.
+**3. Limiter** *(optional)* — keeps scaling within the cluster's real GPU budget when
+`enableLimiter: true`. It discovers the cluster's accelerators automatically (no quota object
+required). The **key difference** is *when* GPU availability enters the decision:
+- **Capacity engine (V2):** GPU availability is fed to the **optimizer** as a *constraint before it
+  decides*, so the optimizer chooses which variant to scale with the GPU budget already in hand —
+  fair-sharing scarce GPUs across models by `priority` (and `score`) via `greedy-by-score`. GPU
+  limits shape the placement itself.
+- **Percentage-based engine (V1):** the analyzer picks per-variant targets *first*, then the limiter
+  **post-processes** those decisions — trimming them to fit the budget, granting to the
+  **most-saturated** variants first. It only *cuts* existing decisions; it does **not** re-route a
+  scale-up to a different variant, and it does **not** honor `priority`. (Same `enableLimiter` flag —
+  V1 has no optimizer to fold GPU limits into the decision.) Still worth enabling on V1 as a
+  **safety cap** against over-provisioning; for `priority`-weighted placement, use the capacity engine.
+- **Pluggable:** a limiter pairs a resource **inventory** (the discovered GPUs) with an **allocation
+  policy**, so **more limiters are planned** — e.g. operator-declared **quota caps** per accelerator
+  type or namespace.
 
-The percentage-based engine (V1) has none of this structure — it is a single fixed
-analyzer with no separate optimizer or limiter.
+Whichever engine, `wva_decisions_limited_total` increments whenever the limiter cut a target.
+Everything else in this section (the optimizer, per-analyzer scoring, `priority` fair-share) is
+capacity-engine-only.
 
 ## How it works
 
@@ -312,11 +322,11 @@ unlocks scaling behaviors V1 cannot express:
 - **Avoids double-scaling and oscillation.** The capacity engine counts pending (still-booting) replicas as
   *anticipated* supply, so an in-flight scale-up suppresses further scale-up until it lands; and the
   band between `scaleUpThreshold` and `scaleDownBoundary` is a stable no-change region.
-- **Places replicas across variants, and can enforce resource limits.** The capacity engine runs an **optimizer**
-  that decides *which* variant scales — cheapest-first (`cost-aware`), or GPU fair-share across
-  competing models by `priority` (`greedy-by-score`) — and an optional **limiter** that caps
-  targets to available GPUs (quota-based limiters are planned). V1 has neither: it counts saturated
-  replicas with no cross-variant placement and no resource ceiling.
+- **Places replicas across variants, and fair-shares by priority.** The capacity engine runs an **optimizer**
+  that decides *which* variant scales — cheapest-first (`cost-aware`), or, with the limiter on, GPU
+  fair-share across competing models by `priority` and `score` (`greedy-by-score`). V1 has no
+  optimizer: it counts saturated replicas with no cross-variant placement, and its limiter can only
+  *trim* those decisions to fit GPUs (most-saturated-first) — it never re-routes or honors `priority`.
 - **Handles P/D disaggregation.** For prefill/decode-disaggregated models the capacity engine sizes and couples the
   two roles so the model stays balanced; V1 has no role model.
 - **Extensible.** Because it is a pipeline (analyzers → optimizer → limiter), new capabilities —
@@ -339,8 +349,8 @@ per-model/per-namespace overrides).
 | `queueLengthThreshold` | `5` | ≥ 0 | Local waiting-queue depth at/above which a replica is "queue-saturated," letting its current token load set the **compute ceiling**. **Agree with EPP — [see below](#aligning-thresholds-with-epp).** |
 | `scaleUpThreshold` | `0.85` | (0, 1], `> scaleDownBoundary` | Target peak utilization. Drives **`RequiredCapacity`**. Lower = scale up earlier. |
 | `scaleDownBoundary` | `0.70` | (0, 1], `< scaleUpThreshold` | Utilization floor for safe scale-down. Drives **`SpareCapacity`**. The gap to `scaleUpThreshold` is the no-change band. |
-| `enableLimiter` | `false` | bool | Turns on step 5 (GPU-constrained fair-share). WVA discovers the cluster's accelerators automatically — no quota object required; confirm `wva_available_gpus` reports series once enabled. |
-| `priority` | `1.0` | ≥ 0 | Relative weight when fair-sharing scarce GPUs (**limiter mode only**). |
+| `enableLimiter` | `false` | bool | Turns on the GPU limiter (step 5) — fair-shares GPUs across models on the capacity engine, cap-only on V1. WVA discovers the cluster's accelerators automatically — no quota object required; confirm `wva_available_gpus` reports series once enabled. |
+| `priority` | `1.0` | ≥ 0 | Relative weight when the capacity engine (V2) fair-shares scarce GPUs (V2 + limiter only; inert on V1, which shares by saturation). |
 | `analyzerName` / `analyzers` | `""` / — | — | Selects the engine (`"saturation"`) and, via the `analyzers` list, per-analyzer scores and threshold overrides. |
 
 > **Not used by the capacity engine:** `kvSpareTrigger` and `queueSpareTrigger` are **V1-only**
@@ -420,6 +430,7 @@ Deployment/LeaderWorkerSet — **not** Prometheus — and feed the derived-capac
 | `wva_config_optimization_interval_seconds` | gauge | Decision cadence. |
 | `wva_models_processed` | gauge | Models handled last cycle. |
 | `wva_available_gpus` | gauge | GPUs available (limiter input). |
+| `wva_decisions_limited_total` | counter | Times the limiter cut a target (by `variant_name`/`namespace`/`limiter_name`) — the signal the GPU budget bit. Fires on both engines. |
 | `wva_metrics_freshness_status`, `wva_metrics_pods_discovered`, `wva_metrics_collection_errors_total` | gauges / counter | **Input health** — check these first when scaling looks stuck. |
 
 > Both `wva_required_capacity` and `wva_spare_capacity` carry a `unit` label — `continuous` on the
