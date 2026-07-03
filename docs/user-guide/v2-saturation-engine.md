@@ -1,11 +1,19 @@
-# V2 Saturation Engine (Token-Based Scaling)
+# Multi-Analyzer Capacity Engine (V2)
 
-The Workload Variant Autoscaler (WVA) is a **global optimizer**: each cycle it builds a
-capacity model for your inference workloads and computes how many replicas each one should
-have. It does not patch replica counts directly — it emits a target that HPA or KEDA actuate.
-This guide explains, at a high level, the **V2 saturation engine**: the terms it uses, the
-metrics it reads, the thresholds that govern it, and the algorithm that turns those into replica
-targets.
+The Workload Variant Autoscaler (WVA) is a **global optimizer**: each cycle it computes how many
+replicas each inference workload should have. It does not patch replica counts directly — it
+**recommends a target** that HPA or KEDA actuate.
+
+WVA has two scaling engines. This guide covers the newer **multi-analyzer capacity engine**
+(hereafter *the capacity engine*; called **V2** in code and metrics), which builds a capacity model
+in absolute KV-cache tokens. It is a small pipeline: an **analyzer** produces a *capacity view* (a
+supply-vs-demand computation), an **optimizer** turns that into per-variant replica targets, and an
+optional **limiter** caps those targets to real resource limits. It runs a single analyzer by
+default; more can be enabled (see
+[Inside the engine](#inside-the-engine-analyzers-optimizer-limiter)). The older **percentage-based
+engine** (**V1**) is a single fixed analyzer that reasons in per-replica utilization percentages.
+This guide explains the terms the capacity engine uses, the metrics it reads, the thresholds that
+govern it, and the algorithm that turns those into replica targets.
 
 It is aimed at operators tuning and observing WVA. For the full configuration field reference and
 the EPP coordination workflow, see
@@ -20,46 +28,143 @@ complete metrics catalog see
 | **Model** | A served model (a `modelID`, e.g. `Qwen/Qwen3-0.6B`) in a namespace. The unit WVA makes a scaling decision for. |
 | **Variant** | One deployable configuration of a model — a Deployment/LeaderWorkerSet, typically pinned to an accelerator type (and, for disaggregated serving, a role). A model may have several variants (e.g. A100 vs H100, or prefill vs decode). |
 | **Replica** | One running instance of a variant. For a Deployment that is a single pod; for a LeaderWorkerSet it is one **group** — a leader pod plus zero or more worker pods (capacity and GPUs are counted per group). |
-| **Role** | For prefill/decode-**disaggregated** serving, a variant serves the `prefill` or `decode` stage; non-disaggregated variants are `both`. |
-| **EPP** | *Endpoint Picker* — the request router in the llm-d inference scheduler ([Gateway API Inference Extension](https://github.com/kubernetes-sigs/gateway-api-inference-extension)). EPP spreads requests across replicas; WVA decides how many replicas exist. |
+| **Role** | For prefill/decode-**disaggregated** serving, a variant serves the `prefill` or `decode` stage; non-disaggregated variants are `both`. WVA infers the role from the variant's (leader) pod label **`llm-d.ai/role`** — `prefill` or `decode`; any other value, or no label, means `both`. |
+| **EPP** | *Endpoint Picker* — the request router in the llm-d inference scheduler ([Gateway API Inference Extension](https://github.com/kubernetes-sigs/gateway-api-inference-extension)). EPP spreads requests across replicas; WVA recommends how many replicas should exist. |
 | **Capacity / supply** | How much work a replica (or the whole model) can serve, measured in **KV-cache tokens**. |
 | **Demand** | How much work the model currently needs to serve, also in KV-cache tokens. |
+| **Cost** | A per-replica price for a variant that the `cost-aware` optimizer uses to prefer cheaper variants. Set on the `VariantAutoscaling` resource, or via the `llm-d.ai/variant-cost` annotation on the HPA/KEDA object (annotation mode); defaults to `10.0`. |
+| **Score** | A non-negative weight (default `1.0`) on an analyzer's contribution, used only when **several** analyzers run — it sets how their signals combine, and (under the limiter) feeds the cross-model fair-share ranking. With a single analyzer every model carries the same score, so it cancels out and changes nothing. |
+| **Priority** | The relative weight a model gets when the `greedy-by-score` optimizer fair-shares scarce GPUs across models (default `1.0`). Applies **only** when the limiter is on; ignored otherwise. |
 
 ## Overview
 
-WVA ships two saturation analyzers:
+WVA ships two scaling engines:
 
-| Aspect | **V1 (percentage-based)** | **V2 (token-based)** |
+| Aspect | **Percentage-based engine (V1)** | **Multi-analyzer capacity engine (V2)** |
 |---|---|---|
 | Reasons in | KV-cache utilization *fractions* per replica | Absolute **KV-cache tokens** (supply vs. demand) |
+| Structure | a single fixed analyzer | pluggable **analyzers** → **optimizer** → optional **limiter** |
 | Scale-up size | count of replicas that "look saturated" | a division: `ceil(required tokens / per-replica capacity)` |
 | Multi-replica jumps | limited | native |
 | Heterogeneous accelerators | not modeled | first-class (per-variant capacity) |
-| Zero-replica sizing | not supported | supported (capacity derived from deployment args) |
+| Sizing a scaled-to-zero variant | 0→1 wake-up only¹ | 0→N — target computed from deployment args |
 | GPU-constrained fair-share | not supported | supported (with the limiter) |
 
-V2 is the preferred engine going forward (V1 is the legacy path). It builds an explicit capacity
-model in units of KV-cache tokens, so a single decision can add several replicas at once (e.g.
-2 → 5) and can even scale a variant **up from zero** — computing a replica target for a variant
-that has no running pods to measure (see [step 1](#1-per-replica-capacity-calculation)).
+¹ Waking a scaled-to-zero variant to a single replica on incoming traffic is handled by a **separate
+scale-from-zero engine** that runs regardless of which saturation engine is active — so V1 workloads
+scale from zero too. What V2 adds is *sizing* a zero-replica variant to the right number of replicas
+(0→N) rather than only 0→1.
 
-### Enabling V2
+The multi-analyzer capacity engine (V2) is the preferred engine going forward (the
+percentage-based one is the legacy path), but it is **opt-in**: the shipped default
+(`analyzerName: ""`) still runs V1, so you enable V2 explicitly (below). It builds an explicit
+capacity model in units of KV-cache tokens, so a single decision can raise the target by several
+replicas at once (e.g. 2 → 5) and can even **size a variant up from zero** (0→N) — computing a
+multi-replica target for a variant that has no running pods to measure (see [step 1](#1-per-replica-capacity-calculation)).
 
-V2 runs when the saturation-scaling ConfigMap's global `default` entry sets:
+## Enabling and operating the engine
+
+### Enabling the engine
+
+Enable the engine from the saturation-scaling ConfigMap's global `default` entry, either way:
 
 ```yaml
-analyzerName: "saturation"     # the empty string "" is the legacy V1 default
+analyzerName: "saturation"     # "" selects the percentage-based engine (V1)
 ```
 
+or, equivalently, with the **multi-analyzer list form** — the same field you use to add more
+analyzers as they land (each with a `score` weight that sets its influence on the combined result):
+
+```yaml
+analyzers:
+  - name: saturation
+    score: 1.0
+```
+
+Both forms are equivalent — WVA back-fills the `analyzers:` list from `analyzerName`, and both report
+`analyzer_name="saturation"` on the `wva_config_info` metric (see
+[Verify the engine is active](#verify-the-engine-is-active)). Use `analyzerName: "saturation"` for
+the common case; use the `analyzers:` list when you want to set a per-analyzer `score` or threshold
+override, or to enable a second analyzer. The list ships with `saturation` only — an experimental
+throughput analyzer exists but is off by default (see
+[Inside the engine](#inside-the-engine-analyzers-optimizer-limiter)).
+
 Engine selection is read from the `default` entry only — it is **global**. Per-model and
-per-namespace entries can override *thresholds*, but not which engine runs. The active engine is
-exposed in the `wva_config_info` metric's `analyzer_name` label, so you can confirm it on a
-dashboard (see [Verify V2 is active](#verify-v2-is-active)).
+per-namespace entries can override *thresholds*, but not which engine runs.
+
+### Verify the engine is active
+
+Check `wva_config_info` — the active engine appears in the `analyzer_name` label:
+
+```promql
+wva_config_info{analyzer_name="saturation"}   # == 1 when the engine is running
+```
+
+If it shows a different `analyzer_name` (or the metric is absent), the engine is not selected — confirm
+the ConfigMap's `default` entry sets `analyzerName: "saturation"`. With the limiter on,
+`wva_optimizer_active{optimizer_name="greedy-by-score"} == 1` confirms fair-share mode (otherwise
+`optimizer_name="cost-aware"`) — the optimizers are described in
+[Inside the engine](#inside-the-engine-analyzers-optimizer-limiter).
+
+### Why isn't it scaling?
+
+Work down this list:
+
+1. **No inputs.** `wva_metrics_pods_discovered == 0`, or `wva_metrics_freshness_status{status="stale"|"missing"}` — WVA isn't getting fresh metrics. Check pod discovery / scraping.
+2. **Collection errors.** `wva_metrics_collection_errors_total` climbing — a query is failing (labeled by `query_type`).
+3. **Not saturated.** `wva_saturation_utilization` is below `scaleUpThreshold` and `wva_required_capacity == 0` — expected no-change.
+4. **Scale-up already in flight.** Pending replicas count toward *anticipated* supply (see [step 3](#3-the-scaling-signal)), so `wva_required_capacity` stays `0` until they become ready.
+5. **Capped by GPUs.** With `enableLimiter: true` (the [limiter](#inside-the-engine-analyzers-optimizer-limiter)), `wva_available_gpus` at/near 0 (or namespace quota exhausted) blocks scale-up even when demand warrants it. GPU discovery runs **only while the limiter is enabled**, so if you turn it on and scale-up freezes, check `wva_available_gpus`: an **absent or zero** series means WVA discovered no accelerators (wrong node labels, no GPU operator) and is capping every model to `0` additional replicas.
+6. **Actuation.** `wva_desired_ratio > 1` but replicas don't change → the HPA/KEDA object consuming the signal isn't acting; check the actuator, not WVA.
+
+## Inside the engine: analyzers, optimizer, limiter
+
+The multi-analyzer capacity engine is a small pipeline. Each cycle, per model, it runs three
+stages:
+
+**1. Analyzers** — each analyzer builds a *capacity view* (a supply-vs-demand computation in
+KV-cache tokens) and carries a per-analyzer `score`.
+- **By default** the engine runs a single analyzer, the **token-based saturation analyzer**
+  (`analyzerName: "saturation"`) — its algorithm is the [How it works](#how-it-works) section below.
+- **The engine can run several analyzers**, declared under the `analyzers:` list in the ConfigMap.
+  Each entry has a `name`, an `enabled` flag (default `true` — so you can turn an analyzer off
+  without removing its entry), a `score` weight, and optional per-analyzer `scaleUpThreshold` /
+  `scaleDownBoundary` overrides. A **throughput analyzer** exists but is **experimental** — it is
+  **off by default and not recommended for use yet** — and is not covered by this guide. When more
+  than one analyzer runs, the engine combines their signals — `score` weights each analyzer's
+  contribution to the fair-share ranking (see the optimizer below).
+
+**2. Optimizer** — turns the analyzers' required/spare capacity into concrete per-variant replica
+targets, deciding *where* to place replicas across a model's variants. WVA picks one of two
+algorithms automatically:
+- **`cost-aware`** *(default — used when the limiter is off).* Minimizes total cost while meeting
+  the required capacity: it places replicas on the variant with the best capacity-per-cost (cheapest
+  per token) and, on scale-down, sheds the most expensive variant first. Scale-up is unconstrained
+  — it assumes GPUs are available.
+- **`greedy-by-score`** *(used when the limiter is on).* Built for GPU scarcity. Each cycle it ranks
+  the competing models by a **fair-share weight** and hands the next available GPU to the
+  highest-ranked (most-starved, highest-priority) model, repeating until the GPU budget is exhausted
+  — so no single model monopolizes the GPUs. The fair-share weight combines a model's `priority`,
+  its analyzers' `score`, and its remaining unmet need (the code name reflects the `score` factor).
+
+**3. Limiter** *(optional)* — caps the optimizer's targets so they fit real resource limits. Division
+of labor: the **limiter** discovers and enforces the GPU budget; the **`greedy-by-score` optimizer**
+(which the limiter turns on) distributes that budget across models. The limiter says *how many GPUs
+exist*; the optimizer decides *who gets them*.
+- **Today** there is one limiter: a **GPU capacity limiter** (`enableLimiter: true`) that
+  discovers the cluster's accelerators and prevents scaling beyond what's available.
+- **The limiter is pluggable** — it pairs a resource **inventory** (e.g. the discovered GPUs) with
+  an **allocation policy** (how to divide them across models) — so **more limiters are planned**,
+  e.g. operator-declared **quota caps** per accelerator type or namespace.
+
+The percentage-based engine (V1) has none of this structure — it is a single fixed
+analyzer with no separate optimizer or limiter.
 
 ## How it works
 
-Each cycle, for every model, V2 runs four core steps (plus an optional fifth when the GPU
-limiter is enabled).
+The rest of this section describes the **token-based saturation analyzer** — the one analyzer the engine
+runs today. Each cycle, for every model, it produces the capacity view in four core steps (1–4);
+the engine's optimizer and optional limiter (step 5) then place and cap the replicas.
 
 ### 1. Per-replica capacity calculation
 
@@ -73,19 +178,21 @@ replica's** capacity is the **smaller** of two ceilings, both in KV-cache tokens
   cache is treated as usable.
 - **Compute ceiling** = how many concurrent tokens the GPU can actually *process* before
   scheduling throughput — not memory — becomes the bottleneck (common for long-generation
-  workloads). V2 estimates it from live queue behavior when a replica is queue-saturated,
+  workloads). The engine estimates it from live queue behavior when a replica is queue-saturated,
   otherwise from recent history, otherwise from the deployment's batch/sequence limits. *(The
   detailed estimation chain is in the [developer guide](../developer-guide/saturation-scaling-config.md).)*
 
 The two ceilings above give **one replica's** capacity. A variant usually runs several replicas,
-so V2 needs a single representative figure for it: the variant's **per-replica capacity** is the
+so the engine needs a single representative figure for it: the variant's **per-replica capacity** is the
 **median** across its *ready* replicas' capacities. *Ready* here means a replica that is running
-and past start-up — i.e. current replicas minus any still-pending (booting) ones; the median
-keeps one outlier pod from skewing the value.
+and past start-up — i.e. current replicas minus any still-pending (booting) ones (WVA reads the
+workload's ready-replica status; for a LeaderWorkerSet that is the count of **fully-ready groups**,
+where the leader and all its workers are ready). The median keeps one outlier pod from skewing the
+value.
 
-When a variant has **no ready replicas to measure** (for example, scaling up from zero), V2
+When a variant has **no ready replicas to measure** (for example, scaling up from zero), the engine
 instead derives its per-replica capacity from the variant's deployment/engine args, or borrows it
-from a compatible sibling variant on the same accelerator. This is what lets V2 compute a target
+from a compatible sibling variant on the same accelerator. This is what lets the engine compute a target
 for a variant that currently runs zero replicas.
 
 ### 2. Demand calculation — the tokens the model needs to serve
@@ -108,7 +215,7 @@ where:
 
 ### 3. The scaling signal
 
-V2 aggregates to model level:
+The engine aggregates to model level:
 
 - **`TotalSupply`** = Σ (ready replicas × per-replica capacity)
 - **`TotalAnticipatedSupply`** = Σ ((ready + **pending**) replicas × per-replica capacity)
@@ -132,16 +239,16 @@ SpareCapacity     = max(0, TotalSupply  − TotalDemand / scaleDownBoundary)    
 - **`SpareCapacity > 0`** → even after inflating demand to the `scaleDownBoundary`, supply is
   left over → **scale-down is safe**.
 - Neither → **no change**. Using **two** thresholds rather than a single one is deliberate: with a
-  single threshold the system would flap — cross it and add a replica, utilization drops just under
-  it, remove the replica, utilization climbs back over it, and so on every cycle. The gap between
+  single threshold the system would flap — cross it and the target goes up, utilization drops just
+  under it, the target comes back down, utilization climbs back over it, and so on every cycle. The gap between
   `scaleUpThreshold` (0.85) and `scaleDownBoundary` (0.70) is a hysteresis **dead-band** that stops
   that oscillation: scale-up needs utilization above 0.85, scale-down below 0.70, and anything in
   between holds steady. (WVA has no time-based stabilization window yet, so a wider band is the main
   lever for reducing flapping.)
 
-> V2 also reports a model `utilization = TotalDemand / TotalSupply` for observability, but the
+> The engine also reports a model `utilization = TotalDemand / TotalSupply` for observability, but the
 > decision is driven by `RequiredCapacity`/`SpareCapacity` above — **not** by comparing that
-> ratio to the thresholds. (On V2 the `wva_spare_capacity` metric reports this token surplus;
+> ratio to the thresholds. (On the capacity engine the `wva_spare_capacity` metric reports this token surplus;
 > see [Metrics](#metrics).)
 
 > **How this relates to HPA/KEDA.** WVA does not replace HPA or KEDA — it *computes* the desired
@@ -157,48 +264,66 @@ scale-down replicas = floor(SpareCapacity   / per_replica_capacity)
 ```
 
 Scale-down respects each variant's `minReplicas`; when a model has **multiple variants** it removes
-the highest-cost variant's replicas first. For prefill/decode-**disaggregated** models it scales the
-two roles **together** — dropping decode replicas without matching prefill (or vice-versa) would
-unbalance the pipeline and can leave the model non-functional, so V2 never scales one role on its own.
+the highest-cost variant's replicas first.
 
-### 5. (Optional) GPU-constrained fair-share
+For prefill/decode-**disaggregated** models, capacity is computed **per role**: WVA groups the
+model's variants by their `llm-d.ai/role` pod label (`prefill` / `decode`), builds a separate
+supply-vs-demand view for each role, and reports `wva_required_capacity` / `wva_spare_capacity`
+per role. It then scales the two roles **together** — dropping decode replicas without matching
+prefill (or vice-versa) would unbalance the pipeline and can leave the model non-functional, so the
+engine never scales one role on its own.
 
-When `enableLimiter: true`, the desired counts are capped by actually-available GPUs, fair-shared
-across competing models weighted by each model's `priority`. Without the limiter (the default),
-scale-up is unconstrained and the optimizer simply minimizes cost. Priority weighting applies
-**only** in limiter mode.
+### 5. Optimizer and (optional) limiter
 
-## Why V2 — advantages over V1
+Steps 1–4 produced the token capacity view. The **optimizer** now turns it into per-variant replica
+targets, and — with `enableLimiter: true` — the **GPU limiter** caps those targets to available
+accelerators. Which optimizer runs, and how GPUs are fair-shared under the limiter, is covered in
+[Inside the engine](#inside-the-engine-analyzers-optimizer-limiter) (the one that ran is visible in
+`wva_optimizer_active`). Both optimizers share the same scale-down math
+(`floor(SpareCapacity / per-replica capacity)`) and differ only in scale-*up* placement.
 
-V1 (percentage-based) reasons about each replica's *current* KV-cache utilization as a fraction and
-scales by counting how many replicas "look saturated." V2's absolute token model unlocks scaling
-behaviors V1 cannot express:
+## Why the multi-analyzer capacity engine — advantages over the percentage-based engine (V1)
+
+The percentage-based engine (V1) reasons about each replica's *current* KV-cache utilization as a
+fraction and scales by counting how many replicas "look saturated." The capacity engine's absolute token model
+unlocks scaling behaviors V1 cannot express:
 
 - **Right-sized steps, not one replica at a time.** V1 nudges the count by the number of saturated
-  replicas; V2 computes the exact token deficit and adds `ceil(RequiredCapacity / per-replica
-  capacity)` replicas — so it can jump 2 → 5 in a single cycle instead of creeping up one replica
-  per cycle (and, on scale-down, removes `floor(SpareCapacity / per-replica capacity)` at once).
+  replicas; the capacity engine computes the exact token deficit and sets a target
+  `ceil(RequiredCapacity / per-replica capacity)` replicas higher — so it can jump 2 → 5 in a single
+  cycle instead of creeping up one replica per cycle (and, on scale-down, drops it by
+  `floor(SpareCapacity / per-replica capacity)` at once).
 - **Compares and sizes heterogeneous accelerators.** Because capacity is an absolute token count
-  per variant, V2 can weigh an A100 variant against an H100 variant and place replicas where they
+  per variant, the capacity engine can weigh an A100 variant against an H100 variant and place replicas where they
   are most cost-effective. V1's per-replica *percentages* are not comparable across replicas of
   different capacity.
-- **Scales up from zero.** V2 derives a variant's per-replica capacity from its deployment/engine
-  args (or a compatible sibling) when there are no running pods to measure, so it can size a variant
-  that currently has zero replicas. V1 can only adjust replicas that already exist.
-- **Anticipates queued load instead of only reacting.** V2's demand includes requests still queued
+- **Sizes up from zero, not just 0→1.** The capacity engine derives a variant's per-replica capacity
+  from its deployment/engine args (or a compatible sibling) when there are no running pods to measure,
+  so it can compute a full multi-replica target (0→N) for a variant that currently has zero replicas.
+  (Waking a scaled-to-zero variant to a single replica is handled for *both* engines by the separate
+  scale-from-zero engine; V1 just can't size beyond that first replica.)
+- **Anticipates queued load instead of only reacting.** The capacity engine's demand includes requests still queued
   locally and upstream in the EPP flow-control layer — load that has not reached a pod yet — so it
   scales up *before* a backlog turns into latency. V1 only sees the KV-cache fraction already on the
   pods.
-- **Models the compute ceiling, not just memory.** V2 caps per-replica capacity at the smaller of
+- **Models the compute ceiling, not just memory.** The capacity engine caps per-replica capacity at the smaller of
   the memory and compute ceilings, so it will not over-provision KV memory for a workload that is
   actually compute-bound (e.g. long generations).
-- **Avoids double-scaling and oscillation.** V2 counts pending (still-booting) replicas as
+- **Avoids double-scaling and oscillation.** The capacity engine counts pending (still-booting) replicas as
   *anticipated* supply, so an in-flight scale-up suppresses further scale-up until it lands; and the
   band between `scaleUpThreshold` and `scaleDownBoundary` is a stable no-change region.
-- **Respects GPU scarcity and P/D roles.** With the limiter, V2 fair-shares scarce GPUs across
-  competing models by `priority`; for prefill/decode-disaggregated models it sizes and couples the
-  two roles. V1 does neither.
-- **Explains its decisions in the same units it uses.** V2 emits token-level signals —
+- **Places replicas across variants, and can enforce resource limits.** The capacity engine runs an **optimizer**
+  that decides *which* variant scales — cheapest-first (`cost-aware`), or GPU fair-share across
+  competing models by `priority` (`greedy-by-score`) — and an optional **limiter** that caps
+  targets to available GPUs (quota-based limiters are planned). V1 has neither: it counts saturated
+  replicas with no cross-variant placement and no resource ceiling.
+- **Handles P/D disaggregation.** For prefill/decode-disaggregated models the capacity engine sizes and couples the
+  two roles so the model stays balanced; V1 has no role model.
+- **Extensible.** Because it is a pipeline (analyzers → optimizer → limiter), new capabilities —
+  additional analyzers (throughput/SLO) and additional limiters (quota caps) — plug into the same
+  engine as they ship, rather than needing a new one. The percentage-based engine is a single fixed
+  analyzer.
+- **Explains its decisions in the same units it uses.** The capacity engine emits token-level signals —
   `wva_saturation_utilization`, `wva_required_capacity`, `wva_spare_capacity` — so an operator can
   see *why* it scaled.
 
@@ -208,18 +333,19 @@ Set these in the saturation-scaling ConfigMap (see the
 [configuration reference](../developer-guide/saturation-scaling-config.md) for structure and
 per-model/per-namespace overrides).
 
-| Key | Default | Range | Effect on V2 |
+| Key | Default | Range | Effect |
 |---|---|---|---|
 | `kvCacheThreshold` | `0.80` | 0–1 | Fraction of physical KV cache treated as usable → sets the **memory ceiling**. Lower = more headroom. **Agree with EPP — [see below](#aligning-thresholds-with-epp).** |
 | `queueLengthThreshold` | `5` | ≥ 0 | Local waiting-queue depth at/above which a replica is "queue-saturated," letting its current token load set the **compute ceiling**. **Agree with EPP — [see below](#aligning-thresholds-with-epp).** |
 | `scaleUpThreshold` | `0.85` | (0, 1], `> scaleDownBoundary` | Target peak utilization. Drives **`RequiredCapacity`**. Lower = scale up earlier. |
 | `scaleDownBoundary` | `0.70` | (0, 1], `< scaleUpThreshold` | Utilization floor for safe scale-down. Drives **`SpareCapacity`**. The gap to `scaleUpThreshold` is the no-change band. |
-| `enableLimiter` | `false` | bool | Turns on step 5 (GPU-constrained fair-share). Requires GPU quota configuration. |
+| `enableLimiter` | `false` | bool | Turns on step 5 (GPU-constrained fair-share). WVA discovers the cluster's accelerators automatically — no quota object required; confirm `wva_available_gpus` reports series once enabled. |
 | `priority` | `1.0` | ≥ 0 | Relative weight when fair-sharing scarce GPUs (**limiter mode only**). |
-| `analyzerName` / `analyzers` | `""` / — | — | Selects V2 (`"saturation"`) and, via the `analyzers` list, per-analyzer scores and threshold overrides. |
+| `analyzerName` / `analyzers` | `""` / — | — | Selects the engine (`"saturation"`) and, via the `analyzers` list, per-analyzer scores and threshold overrides. |
 
-> **Not used by V2:** `kvSpareTrigger` and `queueSpareTrigger` are **V1-only** signals. V2 still
-> accepts and exports them as config metrics, but its decision does not consult them.
+> **Not used by the capacity engine:** `kvSpareTrigger` and `queueSpareTrigger` are **V1-only**
+> signals. The capacity engine still accepts and exports them as config metrics, but does not
+> consult them in its decision.
 
 **Tuning guidance**
 - Keep `scaleUpThreshold` and `scaleDownBoundary` apart (e.g. 0.85 / 0.70): a narrow gap risks
@@ -233,12 +359,12 @@ per-model/per-namespace overrides).
 they should be **agreed with EPP** (the request router). EPP and WVA read the **same two
 model-server metrics** — `vllm:kv_cache_usage_perc` and `vllm:num_requests_waiting` — but act at
 different layers: EPP routes and, under load, queues/sheds requests as endpoints approach
-saturation; WVA decides when the pool is saturated and adds replicas. EPP's Saturation Detector
-exposes two thresholds that map one-to-one to WVA's:
+saturation; WVA decides when the pool is saturated and recommends adding replicas. EPP's Saturation
+Detector exposes two thresholds that map one-to-one to WVA's:
 
-| EPP (`saturationDetector` / `utilization-detector`) | Default | WVA V2 | Default |
+| EPP (`saturationDetector`) | Default | WVA | Default |
 |---|---|---|---|
-| `kvCacheUtilThreshold` | `0.8` | `kvCacheThreshold` | `0.80` |
+| `kvCacheUtilThreshold` | `0.80` | `kvCacheThreshold` | `0.80` |
 | `queueDepthThreshold` | `5` | `queueLengthThreshold` | `5` |
 
 If the two disagree, routing and scaling fight each other:
@@ -259,12 +385,12 @@ for the full apply/verify workflow.
 
 ## Metrics
 
-### Input — what V2 reads from your inference engines
+### Input — what the engine reads from your inference engines
 
-Scraped from vLLM and the EPP scheduler. If these are missing or stale, V2 degrades or skips the
+Scraped from vLLM and the EPP scheduler. If these are missing or stale, the engine degrades or skips the
 model — check the health metrics below.
 
-| Metric | Type | V2 uses it for |
+| Metric | Type | Used for |
 |---|---|---|
 | `vllm:cache_config_info` (`num_gpu_blocks`, `block_size`) | info gauge | KV token capacity → **memory ceiling** |
 | `vllm:kv_cache_usage_perc` | gauge | live tokens-in-use → **demand** |
@@ -278,46 +404,27 @@ Deployment engine args (`--max-num-seqs`, `--gpu-memory-utilization`, `--block-s
 `--max-model-len`, `--max-num-batched-tokens`, `--num-gpu-blocks-override`, …) are read from the
 Deployment/LeaderWorkerSet — **not** Prometheus — and feed the derived-capacity path.
 
-### Output — WVA metrics to observe V2 decisions
+### Output — WVA metrics to observe the engine's decisions
 
 | Metric | Type | Meaning |
 |---|---|---|
 | `wva_saturation_utilization` | gauge | Utilization = demand / capacity (0–1). |
-| `wva_required_capacity` | gauge | > 0 ⇒ scale-up needed; V2 value is the KV-cache **token** deficit (per-role for P/D-disaggregated models). `unit=continuous`. |
-| `wva_spare_capacity` | gauge | > 0 ⇒ safe scale-down headroom; V2 value is the KV-cache **token** surplus — the companion to `wva_required_capacity`. |
+| `wva_required_capacity` | gauge | > 0 ⇒ scale-up needed; value is the KV-cache **token** deficit (per-role for P/D-disaggregated models). |
+| `wva_spare_capacity` | gauge | > 0 ⇒ safe scale-down headroom; value is the KV-cache **token** surplus (per-role for P/D-disaggregated models) — the companion to `wva_required_capacity`. |
 | `wva_kv_cache_tokens_used` / `_capacity` | gauges | Total KV tokens in use vs. total capacity across replicas. |
-| `wva_desired_replicas` / `wva_current_replicas` | gauges | What V2 wants vs. what's running. |
+| `wva_desired_replicas` / `wva_current_replicas` | gauges | What the engine wants vs. what's running. |
 | `wva_desired_ratio` | gauge | desired / current — the value HPA/KEDA actuate on. |
 | `wva_replica_scaling_total` | counter | Scale actions, labeled by `direction` and `reason`. |
-| `wva_config_info` | gauge | Active `analyzer_name` + feature flags — confirm V2 is selected. |
+| `wva_config_info` | gauge | Active `analyzer_name` + feature flags — confirm the engine is selected. |
+| `wva_optimizer_active` | gauge | Which optimizer ran (`optimizer_name` = `cost-aware` or `greedy-by-score`). |
 | `wva_config_optimization_interval_seconds` | gauge | Decision cadence. |
 | `wva_models_processed` | gauge | Models handled last cycle. |
 | `wva_available_gpus` | gauge | GPUs available (limiter input). |
 | `wva_metrics_freshness_status`, `wva_metrics_pods_discovered`, `wva_metrics_collection_errors_total` | gauges / counter | **Input health** — check these first when scaling looks stuck. |
 
-## Operating V2
-
-### Verify V2 is active
-
-Check `wva_config_info` — the active engine appears in the `analyzer_name` label:
-
-```promql
-wva_config_info{analyzer_name="saturation"}   # == 1 when V2 is running
-```
-
-If it shows a different `analyzer_name` (or the metric is absent), V2 is not selected — confirm
-the ConfigMap's `default` entry sets `analyzerName: "saturation"`.
-
-### Why isn't it scaling?
-
-Work down this list:
-
-1. **No inputs.** `wva_metrics_pods_discovered == 0`, or `wva_metrics_freshness_status{status="stale"|"missing"}` — WVA isn't getting fresh metrics. Check pod discovery / scraping.
-2. **Collection errors.** `wva_metrics_collection_errors_total` climbing — a query is failing (labeled by `query_type`).
-3. **Not saturated.** `wva_saturation_utilization` is below `scaleUpThreshold` and `wva_required_capacity == 0` — expected no-change.
-4. **Scale-up already in flight.** Pending replicas count toward *anticipated* supply, so `wva_required_capacity` stays `0` until they become ready.
-5. **Capped by GPUs.** With `enableLimiter: true`, `wva_available_gpus` at/near 0 (or namespace quota exhausted) blocks scale-up even when demand warrants it.
-6. **Actuation.** `wva_desired_ratio > 1` but replicas don't change → the HPA/KEDA object consuming the signal isn't acting; check the actuator, not WVA.
+> Both `wva_required_capacity` and `wva_spare_capacity` carry a `unit` label — `continuous` on the
+> capacity engine, marking a token-valued gauge (a real number of KV-cache tokens, not a replica
+> count). The percentage-based engine (V1) uses `binary` / a 0–1 fraction instead.
 
 ## Example configuration
 
@@ -329,7 +436,7 @@ metadata:
   namespace: workload-variant-autoscaler-system   # WVA controller namespace
 data:
   default: |
-    analyzerName: "saturation"   # enable V2
+    analyzerName: "saturation"   # enable the engine (or the analyzers: list form — see "Enabling the engine")
     kvCacheThreshold: 0.80
     queueLengthThreshold: 5
     scaleUpThreshold: 0.85
