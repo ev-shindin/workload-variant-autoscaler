@@ -114,7 +114,7 @@ Work down this list:
 
 1. **No inputs.** `wva_metrics_pods_discovered == 0`, or `wva_metrics_freshness_status{status="stale"|"missing"}` — WVA isn't getting fresh metrics. Check pod discovery / scraping.
 2. **Collection errors.** `wva_metrics_collection_errors_total` climbing — a query is failing (labeled by `query_type`).
-3. **Not saturated.** `wva_saturation_utilization` is below `scaleUpThreshold` and `wva_required_capacity == 0` — expected no-change.
+3. **Not saturated.** `wva_required_capacity == 0` (roughly, utilization below `scaleUpThreshold`) — expected no-change.
 4. **Scale-up already in flight.** Pending replicas count toward *anticipated* supply (see [step 3](#3-the-scaling-signal)), so `wva_required_capacity` stays `0` until they become ready.
 5. **Capped by GPUs.** With `enableLimiter: true` (the [limiter](#inside-the-engine-analyzers-optimizer-limiter)), `wva_available_gpus` at/near 0 (or namespace quota exhausted) blocks scale-up even when demand warrants it. GPU discovery runs **only while the limiter is enabled**, so if you turn it on and scale-up freezes, check `wva_available_gpus`: an **absent or zero** series means WVA discovered no accelerators (wrong node labels, no GPU operator) and is capping every model to `0` additional replicas. `rate(wva_decisions_limited_total[5m]) > 0` confirms the limiter is actively cutting targets (cap-by-saturation on V1, fair-share on the capacity engine).
 6. **Actuation.** `wva_desired_ratio > 1` but replicas don't change → the HPA/KEDA object consuming the signal isn't acting; check the actuator, not WVA.
@@ -248,23 +248,24 @@ SpareCapacity     = max(0, TotalSupply  − TotalDemand / scaleDownBoundary)    
   the overshoot a plain metric-threshold loop can hit during long cold starts.
 - **`SpareCapacity > 0`** → even after inflating demand to the `scaleDownBoundary`, supply is
   left over → **scale-down is safe**.
-- Neither → **no change**. Using **two** thresholds rather than a single one is deliberate: with a
-  single threshold the system would flap — cross it and the target goes up, utilization drops just
-  under it, the target comes back down, utilization climbs back over it, and so on every cycle. The gap between
-  `scaleUpThreshold` (0.85) and `scaleDownBoundary` (0.70) is a hysteresis **dead-band** that stops
-  that oscillation: scale-up needs utilization above 0.85, scale-down below 0.70, and anything in
-  between holds steady. (WVA has no time-based stabilization window yet, so a wider band is the main
-  lever for reducing flapping.)
+- Neither → **no change**. Two thresholds rather than one is deliberate: a single threshold would
+  flap (cross it → scale up → utilization dips below → scale down → repeat). The gap between
+  `scaleUpThreshold` (0.85) and `scaleDownBoundary` (0.70) is a hysteresis **dead-band** — scale-up
+  needs utilization above 0.85, scale-down below 0.70, in between holds steady. (WVA has no
+  time-based stabilization window of its own yet; for time-based smoothing, set a
+  `stabilizationWindowSeconds` on the consuming HPA/KEDA object. Within WVA, a wider dead-band is the
+  main lever against flapping.)
+
+> **Pending replicas that never schedule.** A pod stuck `Pending` (e.g. no free GPU) stays in
+> `TotalAnticipatedSupply` with no timeout, holding `RequiredCapacity` at `0` and freezing scale-up
+> until it becomes ready or is removed — symptom: `wva_required_capacity == 0` with `Pending` pods on
+> the variant. `enableLimiter: true` avoids creating such replicas; see
+> [Why isn't it scaling?](#why-isnt-it-scaling) item 5.
 
 > The engine also reports a model `utilization = TotalDemand / TotalSupply` for observability, but the
 > decision is driven by `RequiredCapacity`/`SpareCapacity` above — **not** by comparing that
 > ratio to the thresholds. (On the capacity engine the `wva_spare_capacity` metric reports this token surplus;
 > see [Metrics](#metrics).)
-
-> **How this relates to HPA/KEDA.** WVA does not replace HPA or KEDA — it *computes* the desired
-> replica target from this token model and emits it for HPA/KEDA to enforce. Crediting *pending*
-> replicas (above) keeps that target stable through slow GPU cold starts, complementing — not
-> competing with — the actuator's own stabilization window.
 
 ### 4. Replica target
 
@@ -273,7 +274,16 @@ scale-up replicas   = ceil(RequiredCapacity / per_replica_capacity)
 scale-down replicas = floor(SpareCapacity   / per_replica_capacity)
 ```
 
-Scale-down respects each variant's `minReplicas`; when a model has **multiple variants** it removes
+`RequiredCapacity` is in KV-cache **tokens**, and any positive value rounds *up* to at least one
+replica — so in principle a 1-token deficit adds a replica. That's intended: the buffer is the
+`scaleUpThreshold` itself, not a token dead-band. `RequiredCapacity` only goes positive once demand
+exceeds `scaleUpThreshold × anticipated supply` (85% by default), so a small positive value means
+demand has *already* crossed that target; from there `ceil(...)` rounds up because a whole replica is
+the smallest unit you can add. If you don't want to scale on a small deficit, **raise
+`scaleUpThreshold`** (that alone sets scale-up eagerness) — widening the gap to `scaleDownBoundary`
+only changes the no-change band against flapping, not the scale-up trigger.
+
+Scale-down respects each variant's `minReplicas` (set on the `VariantAutoscaling` resource); when a model has **multiple variants** it removes
 the highest-cost variant's replicas first.
 
 For prefill/decode-**disaggregated** models, capacity is computed **per role**: WVA groups the
@@ -357,11 +367,31 @@ per-model/per-namespace overrides).
 > signals. The capacity engine still accepts and exports them as config metrics, but does not
 > consult them in its decision.
 
-**Tuning guidance**
-- Keep `scaleUpThreshold` and `scaleDownBoundary` apart (e.g. 0.85 / 0.70): a narrow gap risks
-  flapping, a wide gap makes scaling sluggish.
-- Lower `kvCacheThreshold` if you see pressure near the KV-cache limit — and mirror it in EPP.
-- Set values globally (`default`) and override per model (`{modelID}#{namespace}`).
+**Tuning guidance** — each threshold is a knob; here's when to turn it:
+- **`scaleUpThreshold`** — the target peak utilization. *Lower it* (e.g. 0.75) for latency-sensitive
+  workloads or bursty traffic, so WVA scales up earlier with more headroom. *Raise it* (e.g. 0.90) to
+  pack more load onto each replica — fewer replicas, lower cost — accepting less burst headroom.
+- **`scaleDownBoundary`** — the utilization floor for reclaiming replicas. *Raise it* (closer to
+  `scaleUpThreshold`) to shed idle replicas sooner and save GPUs; *lower it* to hold replicas longer
+  for stability. The **gap** between the two is the no-change band: *narrow it* if scaling feels too
+  sluggish, *widen it* if you observe flapping (repeated up/down every few cycles). Note the tension:
+  raising it toward `scaleUpThreshold` reclaims GPUs faster but also narrows the anti-flap band.
+- **`priority`** — *raise it* on a model that should win GPUs under contention; leave at `1.0` for
+  equal fair-share. Takes effect only on the capacity engine (V2) with the limiter on — inert on V1
+  and when the limiter is off.
+- **`enableLimiter`** — *turn it on* whenever GPUs are contended, or as a hard safety cap against
+  recommending more replicas than there are free GPUs; also required for `priority` to have any
+  effect.
+
+The next two are **coordination** knobs, not free-tuning ones — move them only in lockstep with EPP
+(see [Aligning thresholds with EPP](#aligning-thresholds-with-epp)):
+- **`kvCacheThreshold`** — *lower it* if you see KV-cache pressure or OOM risk near the limit (more
+  headroom), *raise it* to use more of the cache.
+- **`queueLengthThreshold`** — *lower it* to treat a replica as compute-saturated at a shorter local
+  queue (react to queueing sooner); *raise it* to tolerate deeper queues before it counts.
+
+- Set values globally (`default`) and override per model (`{modelID}#{namespace}`) — e.g. a higher
+  `scaleUpThreshold` for a cost-sensitive model, a lower one for a latency-critical one.
 
 ### Aligning thresholds with EPP
 
@@ -456,7 +486,7 @@ data:
     priority: 1.0
   # optional per-model override:
   "my-model#my-namespace": |
-    scaleUpThreshold: 0.90       # let this model run hotter before scaling
+    scaleUpThreshold: 0.90       # let this model run at higher utilization before scaling
 ```
 
 ## See also
