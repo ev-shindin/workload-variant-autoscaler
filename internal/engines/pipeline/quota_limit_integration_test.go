@@ -85,6 +85,28 @@ var _ = Describe("Quota limiter V1 enforcement (integration)", func() {
 			"attribution goes to the constituent that actually reduced the target")
 	})
 
+	It("attributes a quota cap even when a MinReplicas floor keeps the target from dropping", func() {
+		// The quota denies GPUs (only +1 of the +3 requested replicas is
+		// schedulable) but a MinReplicas floor restores the target to the
+		// requested value. WasLimited still transitions to true, so the cap must
+		// be attributed (LimitedBy set, step marked limited) — the before/after
+		// target alone would miss this.
+		inv := NewQuotaInventory(config.QuotaLimiterConfig{
+			Name: "cluster-quota", Type: "quota", Scope: config.QuotaScopeCluster,
+			ClusterQuotas: map[string]int{"H100": 6}, // 6 - 4 used = +1 replica
+		})
+		limiter := NewDefaultLimiter("cluster-quota", inv, NewGreedyBySaturation())
+
+		minReplicas := 5
+		d := newDecision()
+		d.MinReplicas = &minReplicas
+		Expect(limiter.Limit(ctx, []*interfaces.VariantDecision{d})).To(Succeed())
+
+		Expect(d.TargetReplicas).To(Equal(5), "MinReplicas floor restores the requested target")
+		Expect(d.WasLimited).To(BeTrue(), "the quota still denied GPUs")
+		Expect(d.LimitedBy).To(Equal("cluster-quota"), "the cap is attributed despite the floor")
+	})
+
 	It("does not let a later non-capping constituent steal LimitedBy", func() {
 		// Regression for the sticky-WasLimited misattribution: the namespace
 		// quota caps first; the ample cluster quota runs AFTER and must not

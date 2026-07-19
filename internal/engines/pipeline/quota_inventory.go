@@ -163,11 +163,13 @@ func (q *QuotaInventory) totalLimitLocked() int {
 	return total
 }
 
-// TotalUsed returns the sum of recorded usage. At cluster scope it counts only
-// accelerator types that carry a finite ClusterQuota — the same key set as
-// TotalLimit — so usage of unquotaed or unlimited types does not make
-// TotalAvailable under-report. At namespace scope it sums usage across all
-// tracked namespaces.
+// TotalUsed returns the sum of recorded usage, counting only the key set that
+// TotalLimit does so the two stay symmetric and TotalAvailable does not
+// under-report. At cluster scope that is the accelerator types with a finite
+// ClusterQuota; at namespace scope it is the non-excluded, non-"default"
+// namespaces and their finite-quota types. Usage of unquotaed, unlimited (-1),
+// excluded, or default-fall-through entries is therefore excluded — matching
+// TotalLimit, which does not count their caps.
 func (q *QuotaInventory) TotalUsed() int {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
@@ -175,6 +177,8 @@ func (q *QuotaInventory) TotalUsed() int {
 }
 
 // totalUsedLocked computes TotalUsed. Callers must hold q.mu (read or write).
+// Both branches iterate the SAME key set as totalLimitLocked so that TotalUsed
+// and TotalLimit cover identical entries.
 func (q *QuotaInventory) totalUsedLocked() int {
 	total := 0
 	switch q.cfg.Scope {
@@ -189,9 +193,21 @@ func (q *QuotaInventory) totalUsedLocked() int {
 			total += q.usedByType[accType]
 		}
 	case config.QuotaScopeNamespace:
-		for _, perType := range q.usedByNS {
-			for _, v := range perType {
-				total += v
+		// Mirror totalLimitLocked: skip the reserved "default" key, excluded
+		// namespaces, and unlimited types, so excluded/unlimited/default-
+		// fall-through usage is not charged against the finite namespace budget.
+		for ns, perType := range q.cfg.NamespaceQuotas {
+			if ns == config.QuotaLimiterReservedNamespaceKey {
+				continue
+			}
+			if q.cfg.IsExcluded(ns) {
+				continue
+			}
+			for accType, limit := range perType {
+				if limit == config.QuotaUnlimited {
+					continue
+				}
+				total += q.usedByNS[ns][accType]
 			}
 		}
 	}

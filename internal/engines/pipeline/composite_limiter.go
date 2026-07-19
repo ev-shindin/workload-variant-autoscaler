@@ -33,12 +33,14 @@ import (
 //     algorithm swallows TryAllocate errors), so this is a robustness note
 //     rather than a live path.
 //
-// LimitedBy semantics: attribution is scoped to the constituent that actually
-// reduced a decision (see DefaultLimiter.updateDecisionMetadata) — a constituent
-// that runs but does not cap a decision leaves its LimitedBy and the limited
-// metric untouched. When more than one constituent caps the same decision, the
-// LAST one to reduce it wins on LimitedBy. The DecisionStep history preserves
-// every constituent's contribution, so the per-step trace remains accurate.
+// LimitedBy semantics: attribution is scoped to the constituent that newly
+// constrained a decision (see DefaultLimiter.updateDecisionMetadata) — a
+// constituent that runs but does not newly limit a decision leaves its LimitedBy
+// and the limited metric untouched. When more than one constituent caps the same
+// decision, the FIRST one to constrain it wins on LimitedBy (a later constituent
+// sees WasLimited already set and does not re-attribute). The DecisionStep
+// history preserves every constituent's contribution, so the per-step trace
+// remains accurate.
 type CompositeLimiter struct {
 	name     string
 	limiters []Limiter

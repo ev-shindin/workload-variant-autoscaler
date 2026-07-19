@@ -443,6 +443,44 @@ var _ = Describe("GreedyByScoreOptimizer", func() {
 			Expect(unlimited["v1"].TargetReplicas).To(Equal(abundant["v1"].TargetReplicas),
 				"unlimited behaves like abundant finite capacity")
 		})
+
+		It("scales a finite-type model even when unlimited types were consumed first", func() {
+			// Regression for the fairShareScaleUp stop-check overflow: two
+			// unlimited (sentinel) budgets are decremented during the round but
+			// must stay recognized as unbounded, so the totalGPUs sum cannot wrap
+			// to 0 and starve a model on an unrelated finite type.
+			mk := func(id, variant, accel string) ModelScalingRequest {
+				r := &interfaces.AnalyzerResult{
+					ModelID: id, Namespace: "default", AnalyzedAt: time.Now(),
+					RequiredCapacity: 25000,
+					VariantCapacities: []interfaces.VariantCapacity{
+						{VariantName: variant, AcceleratorName: accel, Cost: 5.0, ReplicaCount: 1, PerReplicaCapacity: 10000},
+					},
+				}
+				return withSatEntry(r, ModelScalingRequest{
+					ModelID: id, Namespace: "default",
+					VariantStates: []interfaces.VariantReplicaState{
+						{VariantName: variant, CurrentReplicas: 1, GPUsPerReplica: 1},
+					},
+				})
+			}
+			requests := []ModelScalingRequest{
+				mk("model-A", "a-v1", "A100"),
+				mk("model-B", "b-v1", "H100"),
+				mk("model-C", "c-v1", "L40S"),
+			}
+			// -1 is config.QuotaUnlimited for A100/H100; L40S is finite.
+			constraints := []*ResourceConstraints{
+				{Pools: map[string]ResourcePool{
+					"A100": {Limit: -1}, "H100": {Limit: -1}, "L40S": {Limit: 4},
+				}},
+			}
+
+			dm := decisionMap(optimizer.Optimize(ctx, requests, constraints))
+			Expect(dm["a-v1"].TargetReplicas).To(BeNumerically(">", 1), "unlimited A100 scales up")
+			Expect(dm["b-v1"].TargetReplicas).To(BeNumerically(">", 1), "unlimited H100 scales up")
+			Expect(dm["c-v1"].TargetReplicas).To(BeNumerically(">", 1), "finite L40S model is not starved by an overflowed stop-check")
+		})
 	})
 
 	Context("Scale-Down", func() {

@@ -76,15 +76,19 @@ func (l *DefaultLimiter) Limit(ctx context.Context, decisions []*interfaces.Vari
 	// Step 3: Create allocator with available resources
 	allocator := l.inventory.CreateAllocator(ctx)
 
-	// Snapshot TargetReplicas so updateDecisionMetadata can tell whether THIS
-	// limiter actually reduced a decision. In a CompositeLimiter each constituent
-	// runs Limit over the same slice; attributing on the sticky WasLimited flag
-	// alone would make every constituent that runs at/after the capping one
-	// re-emit the limited metric under its own name and overwrite LimitedBy.
-	// Comparing before/after scopes attribution to the limiter that did the cap.
-	targetBefore := make([]int, len(decisions))
+	// Snapshot each decision's WasLimited so updateDecisionMetadata can tell
+	// whether THIS limiter newly constrained it. WasLimited is sticky (the
+	// algorithm only ever sets it true) and, in a CompositeLimiter, every
+	// constituent runs Limit over the same slice — so attributing on WasLimited
+	// alone would make each constituent that runs after the capping one re-emit
+	// the limited metric under its own name and overwrite LimitedBy. A limiter
+	// constrained a decision this pass iff it NEWLY set WasLimited, which the
+	// allocation algorithm does on any GPU denial (including one a MinReplicas
+	// floor later keeps from lowering the target, and excluding a MaxReplicas cap
+	// that is a user ceiling rather than a resource limit).
+	limitedBefore := make([]bool, len(decisions))
 	for i, d := range decisions {
-		targetBefore[i] = d.TargetReplicas
+		limitedBefore[i] = d.WasLimited
 	}
 
 	// Step 4: Run allocation algorithm to distribute resources
@@ -93,7 +97,7 @@ func (l *DefaultLimiter) Limit(ctx context.Context, decisions []*interfaces.Vari
 	}
 
 	// Step 5: Update decision metadata
-	l.updateDecisionMetadata(decisions, targetBefore)
+	l.updateDecisionMetadata(decisions, limitedBefore)
 
 	return nil
 }
@@ -151,37 +155,41 @@ func (l *DefaultLimiter) calculateUsedGPUsByNamespace(decisions []*interfaces.Va
 	return usedByNS
 }
 
-// updateDecisionMetadata sets LimitedBy and adds DecisionSteps. targetBefore is
-// the per-decision TargetReplicas snapshot taken before this limiter's algorithm
-// ran, indexed to match decisions.
+// updateDecisionMetadata sets LimitedBy and adds DecisionSteps. limitedBefore is
+// the per-decision WasLimited snapshot taken before this limiter's algorithm ran,
+// indexed to match decisions.
 //
-// Attribution (LimitedBy + the limited metric) is recorded only when THIS
-// limiter actually reduced the decision this pass (WasLimited is set AND the
-// target dropped). WasLimited is sticky across a CompositeLimiter's constituents,
-// so gating on it alone would double-count the metric and misattribute LimitedBy
-// to a constituent that merely ran after the one that capped.
-func (l *DefaultLimiter) updateDecisionMetadata(decisions []*interfaces.VariantDecision, targetBefore []int) {
+// Attribution (LimitedBy + the limited metric) and the DecisionStep's limited
+// flag are recorded only when THIS limiter newly constrained the decision this
+// pass (WasLimited transitioned false→true). WasLimited is sticky across a
+// CompositeLimiter's constituents, so gating on it alone would double-count the
+// metric and misattribute LimitedBy to a constituent that merely ran after the
+// one that capped.
+func (l *DefaultLimiter) updateDecisionMetadata(decisions []*interfaces.VariantDecision, limitedBefore []bool) {
 	for i, d := range decisions {
-		cappedHere := d.WasLimited && d.TargetReplicas < targetBefore[i]
+		cappedHere := d.WasLimited && !limitedBefore[i]
 		if cappedHere {
 			d.LimitedBy = l.name
 			l.metricsEmitter.RecordDecisionsLimitedTotalMetric(d.VariantName, d.Namespace, d.LimitedBy)
 		}
 
-		// Add decision step for observability
-		reason := l.buildStepReason(d)
+		// Add decision step for observability; keep the reason text consistent
+		// with the limited flag (both driven by cappedHere).
+		reason := l.buildStepReason(d, cappedHere)
 		d.AddDecisionStep(l.name, reason, cappedHere)
 	}
 }
 
-// buildStepReason creates a human-readable reason for the decision step.
-func (l *DefaultLimiter) buildStepReason(d *interfaces.VariantDecision) string {
+// buildStepReason creates a human-readable reason for the decision step. limited
+// reflects whether THIS limiter constrained the decision this pass (matching the
+// step's limited flag), not the sticky WasLimited.
+func (l *DefaultLimiter) buildStepReason(d *interfaces.VariantDecision, limited bool) string {
 	replicaChange := d.TargetReplicas - d.CurrentReplicas
 
 	if replicaChange <= 0 {
 		return fmt.Sprintf("no scale-up (target=%d, current=%d)", d.TargetReplicas, d.CurrentReplicas)
 	}
-	if d.WasLimited {
+	if limited {
 		return fmt.Sprintf("limited: allocated %d GPUs for +%d replicas", d.GPUsAllocated, replicaChange)
 	}
 	return fmt.Sprintf("allocated %d GPUs for +%d replicas", d.GPUsAllocated, replicaChange)

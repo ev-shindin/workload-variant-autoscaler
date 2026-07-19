@@ -298,7 +298,13 @@ func (o *GreedyByScoreOptimizer) allocateForModel(
 		if consumed <= 0 {
 			continue
 		}
-		if _, clusterCapped := available[accType]; clusterCapped {
+		// Decrement only a FINITE cluster budget. An unbounded (math.MaxInt)
+		// budget marks an unlimited-quota type and must stay exactly math.MaxInt:
+		// depleting it to MaxInt-consumed would (a) be meaningless (you cannot
+		// draw down infinity) and (b) defeat the fairShareScaleUp stop-check,
+		// whose `== math.MaxInt` guard would then miss it and let the totalGPUs
+		// sum overflow with two or more unlimited types.
+		if cur, clusterCapped := available[accType]; clusterCapped && cur != math.MaxInt {
 			available[accType] -= consumed
 		}
 		if nsBudget != nil {

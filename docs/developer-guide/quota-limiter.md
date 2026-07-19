@@ -217,12 +217,15 @@ non-`default`) namespaces — the aggregate cluster budget that the per-namespac
 caps then partition. The per-`(namespace, type)` breakdown is exposed separately
 via `NamespaceResourcePools` (see *V2 enforcement* below).
 
-Unlimited (`-1`) entries impose no constraint and are **omitted** from the map
-entirely — an absent pool means "no cap", and the allocator's `TryAllocate`
-passes such requests through. This keeps `Limit = 0` unambiguous: a pool
-emitted with `Limit = 0` always means a real **deny** cap (a configured quota
-of `0`), never "unlimited". (`TotalLimit`, `TotalAvailable`, and `Remaining`
-exclude unlimited entries the same way.)
+Unlimited (`-1`) entries are handled by scope. At **cluster** scope they are
+emitted as a sentinel `ResourcePool{Limit == -1}` (like the namespace branch), so
+the V2 optimizer can tell "unlimited" (allocate up to demand) apart from a type
+with no configured quota (absent → deny). At **namespace** scope an unlimited
+`(namespace, type)` is likewise emitted as a sentinel in `NamespaceResourcePools`.
+Either way `Limit = 0` stays unambiguous: a pool with `Limit = 0` always means a
+real **deny** cap (a configured quota of `0`), never "unlimited". (`TotalLimit`,
+`TotalAvailable`, and `Remaining` still exclude unlimited entries from their
+totals.)
 
 ## V2 enforcement (optimizer path)
 
@@ -277,7 +280,8 @@ Quotas are **hard ceilings applied on top of** the optimizer's fair-share loop,
 not inputs to it. Two properties follow from that:
 
 - The fair-share mean each round is the **average of the active models' remaining
-  (unmet) demand** — it is **not** `cluster GPUs / number of active models`, and
+  fair-share metric** (priority × score × unmet demand — see the worked-example
+  caveat below) — it is **not** `cluster GPUs / number of active models`, and
   **not** quota-weighted. The cluster GPU total is only the loop's stop condition
   (fair-sharing halts once the aggregate budget is exhausted). Quotas only clamp
   each model after the mean is computed.

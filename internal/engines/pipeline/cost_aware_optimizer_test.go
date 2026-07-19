@@ -967,6 +967,9 @@ var _ = Describe("CostAwareOptimizer", func() {
 		})
 
 		It("mergeConstraints lets a finite pool win over an unlimited sentinel regardless of provider order", func() {
+			// This pins the min()-across-providers ordering property (the
+			// sentinel-carry regression itself is guarded by the math.MaxInt
+			// assertion above); a finite cap must beat unlimited either way.
 			// finite before sentinel
 			m1 := mergeConstraints([]*ResourceConstraints{
 				{Pools: map[string]ResourcePool{"A100": {Limit: 5}}},
