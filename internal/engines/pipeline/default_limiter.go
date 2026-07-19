@@ -76,19 +76,25 @@ func (l *DefaultLimiter) Limit(ctx context.Context, decisions []*interfaces.Vari
 	// Step 3: Create allocator with available resources
 	allocator := l.inventory.CreateAllocator(ctx)
 
-	// Snapshot each decision's WasLimited so updateDecisionMetadata can tell
-	// whether THIS limiter newly constrained it. WasLimited is sticky (the
-	// algorithm only ever sets it true) and, in a CompositeLimiter, every
-	// constituent runs Limit over the same slice — so attributing on WasLimited
-	// alone would make each constituent that runs after the capping one re-emit
-	// the limited metric under its own name and overwrite LimitedBy. A limiter
-	// constrained a decision this pass iff it NEWLY set WasLimited, which the
-	// allocation algorithm does on any GPU denial (including one a MinReplicas
-	// floor later keeps from lowering the target, and excluding a MaxReplicas cap
-	// that is a user ceiling rather than a resource limit).
+	// Snapshot each decision's WasLimited and TargetReplicas before the algorithm
+	// runs. updateDecisionMetadata derives two DIFFERENT signals from them,
+	// because "which limiter to credit" and "did this pass tighten the target"
+	// are distinct questions in a CompositeLimiter (WasLimited is sticky — the
+	// algorithm only ever sets it true — and every constituent runs Limit over
+	// the same slice):
+	//   - Attribution (LimitedBy + the limited metric) fires on the WasLimited
+	//     false→true transition, so the FIRST constituent to constrain a decision
+	//     is credited exactly once (no double-count across constituents, and a
+	//     GPU denial a MinReplicas floor later hides is still counted).
+	//   - The DecisionStep's WasConstrained flag / "limited" wording fires when
+	//     THIS pass actually reduced the target due to a resource limit (not a
+	//     MaxReplicas user ceiling), so every constituent that tightens the target
+	//     is recorded accurately in the per-step trace.
 	limitedBefore := make([]bool, len(decisions))
+	targetBefore := make([]int, len(decisions))
 	for i, d := range decisions {
 		limitedBefore[i] = d.WasLimited
+		targetBefore[i] = d.TargetReplicas
 	}
 
 	// Step 4: Run allocation algorithm to distribute resources
@@ -97,7 +103,7 @@ func (l *DefaultLimiter) Limit(ctx context.Context, decisions []*interfaces.Vari
 	}
 
 	// Step 5: Update decision metadata
-	l.updateDecisionMetadata(decisions, limitedBefore)
+	l.updateDecisionMetadata(decisions, limitedBefore, targetBefore)
 
 	return nil
 }
@@ -155,28 +161,27 @@ func (l *DefaultLimiter) calculateUsedGPUsByNamespace(decisions []*interfaces.Va
 	return usedByNS
 }
 
-// updateDecisionMetadata sets LimitedBy and adds DecisionSteps. limitedBefore is
-// the per-decision WasLimited snapshot taken before this limiter's algorithm ran,
-// indexed to match decisions.
-//
-// Attribution (LimitedBy + the limited metric) and the DecisionStep's limited
-// flag are recorded only when THIS limiter newly constrained the decision this
-// pass (WasLimited transitioned false→true). WasLimited is sticky across a
-// CompositeLimiter's constituents, so gating on it alone would double-count the
-// metric and misattribute LimitedBy to a constituent that merely ran after the
-// one that capped.
-func (l *DefaultLimiter) updateDecisionMetadata(decisions []*interfaces.VariantDecision, limitedBefore []bool) {
+// updateDecisionMetadata sets LimitedBy and adds DecisionSteps. limitedBefore and
+// targetBefore are the per-decision WasLimited / TargetReplicas snapshots taken
+// before this limiter's algorithm ran, indexed to match decisions. See Limit for
+// why attribution and the per-step flag use different signals.
+func (l *DefaultLimiter) updateDecisionMetadata(decisions []*interfaces.VariantDecision, limitedBefore []bool, targetBefore []int) {
 	for i, d := range decisions {
-		cappedHere := d.WasLimited && !limitedBefore[i]
-		if cappedHere {
+		// Attribution: credit the first limiter that newly marks the decision
+		// resource-limited (WasLimited is sticky across composite constituents).
+		if d.WasLimited && !limitedBefore[i] {
 			d.LimitedBy = l.name
 			l.metricsEmitter.RecordDecisionsLimitedTotalMetric(d.VariantName, d.Namespace, d.LimitedBy)
 		}
 
-		// Add decision step for observability; keep the reason text consistent
-		// with the limited flag (both driven by cappedHere).
-		reason := l.buildStepReason(d, cappedHere)
-		d.AddDecisionStep(l.name, reason, cappedHere)
+		// Per-step trace: mark the step constrained (and word the reason
+		// "limited:") when THIS pass reduced the target due to a resource limit,
+		// so a later constituent that further tightens the target is still
+		// recorded. A MaxReplicas user ceiling reduces the target without setting
+		// WasLimited, so it is not counted as a resource limit here.
+		reducedHere := d.WasLimited && d.TargetReplicas < targetBefore[i]
+		reason := l.buildStepReason(d, reducedHere)
+		d.AddDecisionStep(l.name, reason, reducedHere)
 	}
 }
 
