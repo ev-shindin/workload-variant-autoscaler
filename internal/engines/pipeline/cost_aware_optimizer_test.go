@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"math"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -953,13 +954,32 @@ var _ = Describe("CostAwareOptimizer", func() {
 			Expect(merged["H100"]).To(Equal(4))
 		})
 
-		It("mergeConstraints skips an unlimited (negative) pool rather than clamping it to a deny", func() {
+		It("mergeConstraints carries an unlimited (negative) pool through as an unbounded budget", func() {
 			merged := mergeConstraints([]*ResourceConstraints{
 				{Pools: map[string]ResourcePool{"A100": {Limit: -1}, "H100": {Limit: 4}}},
 			})
 
-			Expect(merged).NotTo(HaveKey("A100"), "unlimited => no cap => absent, not 0 (deny)")
+			// Unlimited must be present as an unbounded budget, NOT absent: an
+			// absent type reads as 0 in fairShareRolePick and is silently denied,
+			// which would invert the -1 = unlimited semantic.
+			Expect(merged["A100"]).To(Equal(math.MaxInt), "unlimited => unbounded budget")
 			Expect(merged["H100"]).To(Equal(4))
+		})
+
+		It("mergeConstraints lets a finite pool win over an unlimited sentinel regardless of provider order", func() {
+			// finite before sentinel
+			m1 := mergeConstraints([]*ResourceConstraints{
+				{Pools: map[string]ResourcePool{"A100": {Limit: 5}}},
+				{Pools: map[string]ResourcePool{"A100": {Limit: -1}}},
+			})
+			Expect(m1["A100"]).To(Equal(5), "finite cap is more restrictive than unlimited")
+
+			// sentinel before finite
+			m2 := mergeConstraints([]*ResourceConstraints{
+				{Pools: map[string]ResourcePool{"A100": {Limit: -1}}},
+				{Pools: map[string]ResourcePool{"A100": {Limit: 5}}},
+			})
+			Expect(m2["A100"]).To(Equal(5), "finite cap wins even when the sentinel is seen first")
 		})
 	})
 })

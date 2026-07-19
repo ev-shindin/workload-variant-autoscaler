@@ -163,9 +163,11 @@ func (q *QuotaInventory) totalLimitLocked() int {
 	return total
 }
 
-// TotalUsed returns the sum of recorded usage across all tracked
-// accelerator-type pools (cluster scope) or all tracked namespaces
-// (namespace scope).
+// TotalUsed returns the sum of recorded usage. At cluster scope it counts only
+// accelerator types that carry a finite ClusterQuota — the same key set as
+// TotalLimit — so usage of unquotaed or unlimited types does not make
+// TotalAvailable under-report. At namespace scope it sums usage across all
+// tracked namespaces.
 func (q *QuotaInventory) TotalUsed() int {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
@@ -177,8 +179,14 @@ func (q *QuotaInventory) totalUsedLocked() int {
 	total := 0
 	switch q.cfg.Scope {
 	case config.QuotaScopeCluster:
-		for _, v := range q.usedByType {
-			total += v
+		// Count usage only for types with a finite cluster quota, mirroring
+		// totalLimitLocked. Usage of unquotaed types (real replicas with no
+		// configured cap) must not be subtracted from the quotaed budget.
+		for accType, limit := range q.cfg.ClusterQuotas {
+			if limit == config.QuotaUnlimited {
+				continue
+			}
+			total += q.usedByType[accType]
 		}
 	case config.QuotaScopeNamespace:
 		for _, perType := range q.usedByNS {
@@ -214,11 +222,13 @@ func (q *QuotaInventory) TotalAvailable() int {
 // min(per-type total, that namespace's cap).
 //
 // Quota value semantics on the emitted Limit:
-//   - Unlimited (-1) entries impose no constraint and are OMITTED (consistent
-//     with how TotalLimit/Remaining exclude them). An absent pool means "no
-//     cap"; the allocator's TryAllocate passes such requests through.
-//   - A quota of 0 is a real cap (deny) and is emitted with Limit == 0. Omitting
-//     unlimited keeps Limit == 0 unambiguous — it always means deny.
+//   - Unlimited (-1) entries are emitted as a sentinel ResourcePool{Limit ==
+//     QuotaUnlimited} (matching NamespaceResourcePools), so the V2 optimizer can
+//     tell "unlimited" (allow up to demand) apart from a type with no configured
+//     quota (absent → deny). mergeConstraints branches on Limit < 0 and treats
+//     the sentinel as unbounded; TotalLimit/TotalUsed/TotalAvailable exclude it,
+//     so the reported totals are unchanged.
+//   - A quota of 0 is a real cap (deny) and is emitted with Limit == 0.
 func (q *QuotaInventory) GetResourcePools() map[string]ResourcePool {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
@@ -226,9 +236,11 @@ func (q *QuotaInventory) GetResourcePools() map[string]ResourcePool {
 	switch q.cfg.Scope {
 	case config.QuotaScopeCluster:
 		for accType, limit := range q.cfg.ClusterQuotas {
-			if limit == config.QuotaUnlimited {
-				continue
-			}
+			// Emit every configured type, including unlimited (-1). An omitted
+			// type is read as 0 available by the V2 optimizer and silently
+			// denied, which would invert the -1 = unlimited semantic (see the
+			// function doc above). The sentinel is carried through
+			// mergeConstraints as an unbounded budget.
 			pools[accType] = ResourcePool{
 				Limit: limit,
 				Used:  q.usedByType[accType],

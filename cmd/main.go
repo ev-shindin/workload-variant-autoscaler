@@ -495,6 +495,18 @@ func main() {
 				"optimizer and quota caps are not applied.")
 		}
 
+		// Symmetric guard for the reverse misconfiguration: a quota file set while
+		// limiter-type stays at the default 'inventory' is silently ignored (the
+		// file is never parsed). QUOTA_CONFIG_FILE exported but --limiter-type=quota
+		// forgotten is an easy mistake, so warn loudly rather than starting in
+		// inventory mode as if quotas were active.
+		if cfg.LimiterMode() == config.LimiterTypeInventory && cfg.QuotaConfigFile() != "" {
+			setupLog.Info("A quota config file is set but --limiter-type is 'inventory'; "+
+				"the quota file is IGNORED and no quota caps are enforced. "+
+				"Set --limiter-type=quota (or LIMITER_TYPE=quota) to activate quota enforcement.",
+				"quotaConfigFile", cfg.QuotaConfigFile())
+		}
+
 		// Quota mode means "no physical-capacity discovery" — including the
 		// inventory-collection call in the saturation engine. We honor that
 		// at the call site (see saturation.shouldCollectClusterInventory),

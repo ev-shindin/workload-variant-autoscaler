@@ -328,9 +328,17 @@ func mergeConstraints(constraints []*ResourceConstraints) map[string]int {
 		}
 		for accType, pool := range c.Pools {
 			if pool.Limit < 0 {
-				// Unlimited sentinel: no finite cap. Skip it (an absent type
-				// imposes no cluster constraint), rather than letting
-				// Available() clamp it to 0 and silently deny the type.
+				// Unlimited sentinel: no finite cap. Represent it as an
+				// unbounded budget (math.MaxInt) so the optimizer allocates the
+				// type up to the model's fair-share demand. Leaving it absent
+				// would let fairShareRolePick read a 0 budget and silently deny
+				// the type — inverting the -1 = unlimited semantic. A finite
+				// pool from any provider still wins via the min() below, since
+				// Available() < math.MaxInt; only set the sentinel when no finite
+				// budget is present yet.
+				if _, ok := merged[accType]; !ok {
+					merged[accType] = math.MaxInt
+				}
 				continue
 			}
 			if existing, ok := merged[accType]; !ok || pool.Available() < existing {

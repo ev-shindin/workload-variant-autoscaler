@@ -108,9 +108,12 @@ limiters:
 
 | Value | Meaning |
 |-------|---------|
-| Positive integer | Cap in GPUs |
+| Positive integer (up to `MaxQuotaValue` = 1,048,576) | Cap in GPUs |
 | `-1` | Unlimited (Kubernetes convention; pass-through in the allocator) |
 | `0` or missing entry | Denied (no allocation) |
+
+A finite cap must not exceed `MaxQuotaValue` (`1 << 20` = 1,048,576) — far above any
+realistic accelerator count; a larger value is rejected at startup (see Validation).
 
 ### Namespace lookup rules
 
@@ -145,6 +148,7 @@ per `(namespace, type)`: it applies only when `N` is wholly unlisted.
 - `namespaceQuotas` or `exclude` set on a cluster-scoped entry.
 - `quotas` set on a namespace-scoped entry.
 - Negative quota values other than `-1`.
+- A quota value exceeding `MaxQuotaValue` (1,048,576).
 - Empty accelerator type or namespace key.
 
 It returns a non-fatal **warning** when a namespace appears in both `exclude`
@@ -260,19 +264,23 @@ Remaining boundaries:
   fair-share loop stops when the finite cluster aggregate is zero). This is a
   benign under-provision, not an isolation breach; configure a finite cluster or
   per-namespace cap for any type you expect to scale under V2.
-- The same applies to an **unlimited (`-1`) cluster-scope** quota: `GetResourcePools`
-  omits unlimited entries, so under V2 that type has no aggregate budget and does
-  **not** scale up (whereas V1 `Limit` passes it through unbounded). If you want a
-  type to scale under V2, give it a finite cap rather than `-1`.
+- An **unlimited (`-1`) cluster-scope** quota scales up under V2:
+  `GetResourcePools` emits it as a sentinel pool that `mergeConstraints` carries
+  through as an unbounded budget, so the type allocates up to demand — matching
+  the V1 `Limit` pass-through. (This differs from the namespace-scope
+  purely-unlimited case above, whose cluster aggregate is derived from the finite
+  namespace caps only.)
 
 ### Fair-share interaction
 
 Quotas are **hard ceilings applied on top of** the optimizer's fair-share loop,
 not inputs to it. Two properties follow from that:
 
-- The fair-share mean each round is `cluster GPUs / number of active models` — it
-  is **not** quota-weighted. Quotas only clamp each model after the mean is
-  computed.
+- The fair-share mean each round is the **average of the active models' remaining
+  (unmet) demand** — it is **not** `cluster GPUs / number of active models`, and
+  **not** quota-weighted. The cluster GPU total is only the loop's stop condition
+  (fair-sharing halts once the aggregate budget is exhausted). Quotas only clamp
+  each model after the mean is computed.
 - Fairness is **per-model**, not per-namespace. Two models in one namespace each
   get their own fair-share slot; the namespace quota bounds each of them (and
   their running sum) but does not pool one model's allowance for the other.
@@ -301,14 +309,19 @@ Worked example — cluster of 8 GPUs, three models:
 | M2    | 4     | 4     |
 | M3    | 4     | 4     |
 
-- **Round 1:** mean ≈ 8 / 3 ≈ 2.67. M2 and M3 each take ≈ 2.67 (under their
-  quotas); M1 is capped at its quota of 2, leaving ≈ 0.67 of its slot unused.
-- **Round 2:** that leftover ≈ 0.67 is split between the still-hungry M2 and M3.
+- **Round 1:** the mean is the average of the models' remaining demand,
+  ≈ (3 + 4 + 4) / 3 ≈ 3.67. M1 is capped at its quota of 2 (below its demand of 3),
+  so part of its fair-share slot goes unused; M2 and M3 pull toward the mean under
+  their own quotas.
+- **Round 2:** with M1 satisfied at 2, the remaining cluster budget (8 − 2 = 6) is
+  split between the still-hungry M2 and M3.
 
-Final allocation: **M1 = 2, M2 ≈ 3, M3 ≈ 3** (total 8). The outcome respects
-every quota and exhausts the cluster budget; the multi-round path is why a
+Final allocation: **M1 = 2, M2 ≈ 3, M3 ≈ 3** (total 8). The outcome respects every
+quota and exhausts the cluster budget; the multi-round path is why a
 quota-constrained model's slack flows to later rounds rather than to its
-round-mates.
+round-mates. (The exact per-round means come from the fair-share metric —
+priority × score × demand — so treat the numbers here as an illustration of the
+*path*, not an exact trace.)
 
 ## Interaction with `TypeInventory`
 

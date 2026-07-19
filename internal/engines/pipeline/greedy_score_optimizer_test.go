@@ -402,6 +402,47 @@ var _ = Describe("GreedyByScoreOptimizer", func() {
 
 			Expect(dm["v1"].TargetReplicas).To(Equal(1))
 		})
+
+		It("treats a cluster-scope unlimited (sentinel) pool like abundant capacity, not a deny", func() {
+			// Regression for the cluster-unlimited-under-V2 bug: a -1
+			// (config.QuotaUnlimited) cluster quota is emitted as a sentinel pool
+			// (Limit < 0), which mergeConstraints carries through as an unbounded
+			// budget. Before the fix the type was absent from the merged budget,
+			// so fairShareRolePick read a 0 budget and denied every scale-up —
+			// inverting -1 = unlimited into a hard deny.
+			newReq := func() []ModelScalingRequest {
+				r := &interfaces.AnalyzerResult{
+					ModelID:          "model-1",
+					Namespace:        "default",
+					AnalyzedAt:       time.Now(),
+					RequiredCapacity: 40000,
+					VariantCapacities: []interfaces.VariantCapacity{
+						{VariantName: "v1", AcceleratorName: "A100", Cost: 5.0, ReplicaCount: 1, PerReplicaCapacity: 10000},
+					},
+				}
+				return []ModelScalingRequest{
+					withSatEntry(r, ModelScalingRequest{
+						ModelID:   "model-1",
+						Namespace: "default",
+						VariantStates: []interfaces.VariantReplicaState{
+							{VariantName: "v1", CurrentReplicas: 1, GPUsPerReplica: 2},
+						},
+					}),
+				}
+			}
+
+			// -1 is config.QuotaUnlimited; used as a literal here to avoid a config
+			// import in this optimizer-level test.
+			unlimited := decisionMap(optimizer.Optimize(ctx, newReq(),
+				[]*ResourceConstraints{{Pools: map[string]ResourcePool{"A100": {Limit: -1}}}}))
+			abundant := decisionMap(optimizer.Optimize(ctx, newReq(),
+				[]*ResourceConstraints{{Pools: map[string]ResourcePool{"A100": {Limit: 1000}}}}))
+
+			Expect(unlimited["v1"].Action).To(Equal(interfaces.ActionScaleUp), "unlimited cluster quota must not deny scale-up")
+			Expect(unlimited["v1"].TargetReplicas).To(BeNumerically(">", 1))
+			Expect(unlimited["v1"].TargetReplicas).To(Equal(abundant["v1"].TargetReplicas),
+				"unlimited behaves like abundant finite capacity")
+		})
 	})
 
 	Context("Scale-Down", func() {

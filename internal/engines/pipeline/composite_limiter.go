@@ -24,12 +24,20 @@ import (
 //   - On error from any constituent, Limit returns immediately; decisions
 //     made by earlier constituents stay applied. TryAllocate's in-memory usage
 //     state is per-allocator, so usage accounting never leaks across
-//     constituents; the TargetReplicas mutations earlier constituents already
-//     wrote to the shared slice do persist, which is benign because an error
-//     aborts the whole optimize cycle.
+//     constituents. The TargetReplicas mutations earlier constituents already
+//     wrote to the shared slice DO persist and are NOT rolled back: on a limiter
+//     error the V1 caller (saturation engine) logs and proceeds with these
+//     partially-capped decisions rather than aborting the cycle, so a Limit
+//     error means "decisions may be partially limited." In practice quota
+//     constituents never return an error (Refresh is a no-op and the allocation
+//     algorithm swallows TryAllocate errors), so this is a robustness note
+//     rather than a live path.
 //
-// LimitedBy semantics: when more than one constituent caps the same decision,
-// the LAST one to run wins on LimitedBy. The DecisionStep history preserves
+// LimitedBy semantics: attribution is scoped to the constituent that actually
+// reduced a decision (see DefaultLimiter.updateDecisionMetadata) — a constituent
+// that runs but does not cap a decision leaves its LimitedBy and the limited
+// metric untouched. When more than one constituent caps the same decision, the
+// LAST one to reduce it wins on LimitedBy. The DecisionStep history preserves
 // every constituent's contribution, so the per-step trace remains accurate.
 type CompositeLimiter struct {
 	name     string

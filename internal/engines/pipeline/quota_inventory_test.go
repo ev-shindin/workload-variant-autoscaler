@@ -303,6 +303,37 @@ var _ = Describe("QuotaInventory", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(d.DecisionSteps).To(BeEmpty())
 		})
+
+		It("denies with a step when a cluster quota of 0 is a hard deny (distinct from unlimited)", func() {
+			// Locks in that 0 is a real deny cap, not folded into the unlimited
+			// pass-through path — a regression that did so would turn a hard-deny
+			// quota into a pass-through and no other spec would catch it.
+			inv := newClusterQuotaInv(map[string]int{"H100": 0})
+			alloc := inv.CreateAllocator(ctx)
+			d := quotaDecisionFor("team-a", "H100")
+
+			got, err := alloc.TryAllocate(ctx, d, 5)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(got).To(Equal(0), "a cluster cap of 0 denies all allocation")
+			Expect(d.DecisionSteps).To(HaveLen(1))
+			Expect(d.DecisionSteps[0].Reason).To(Equal("limited by quota[scope=cluster, type=H100]"))
+			Expect(d.DecisionSteps[0].WasConstrained).To(BeTrue())
+		})
+
+		It("denies with a step when a namespace quota of 0 is a hard deny", func() {
+			inv := newNamespaceQuotaInv(map[string]map[string]int{
+				"team-a": {"H100": 0},
+			}, nil)
+			alloc := inv.CreateAllocator(ctx)
+			d := quotaDecisionFor("team-a", "H100")
+
+			got, err := alloc.TryAllocate(ctx, d, 5)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(got).To(Equal(0), "a namespace cap of 0 denies all allocation")
+			Expect(d.DecisionSteps).To(HaveLen(1))
+			Expect(d.DecisionSteps[0].Reason).To(Equal("limited by quota[scope=namespace, namespace=team-a, type=H100]"))
+			Expect(d.DecisionSteps[0].WasConstrained).To(BeTrue())
+		})
 	})
 
 	Describe("combined cluster + namespace", func() {
@@ -333,7 +364,7 @@ var _ = Describe("QuotaInventory", func() {
 	})
 
 	Describe("GetResourcePools", func() {
-		It("returns per-type pools for cluster scope, omitting unlimited and keeping zero caps", func() {
+		It("returns per-type pools for cluster scope, emitting unlimited as a sentinel and keeping zero caps", func() {
 			inv := newClusterQuotaInv(map[string]int{
 				"H100": 8,
 				"A100": config.QuotaUnlimited,
@@ -345,7 +376,8 @@ var _ = Describe("QuotaInventory", func() {
 			Expect(pools).To(HaveKey("H100"))
 			Expect(pools["H100"].Limit).To(Equal(8))
 			Expect(pools["H100"].Used).To(Equal(3))
-			Expect(pools).NotTo(HaveKey("A100"), "unlimited imposes no constraint, so it is omitted")
+			Expect(pools).To(HaveKey("A100"), "unlimited is emitted as a sentinel so the V2 optimizer can distinguish it from an unconfigured (deny) type")
+			Expect(pools["A100"].Limit).To(Equal(config.QuotaUnlimited), "unlimited is carried as the QuotaUnlimited sentinel")
 			Expect(pools).To(HaveKey("L40S"))
 			Expect(pools["L40S"].Limit).To(Equal(0), "a quota of 0 is a real deny cap, distinct from unlimited")
 		})

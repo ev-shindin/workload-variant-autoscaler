@@ -192,6 +192,13 @@ func (o *GreedyByScoreOptimizer) fairShareScaleUp(
 
 		totalGPUs := 0
 		for _, v := range available {
+			// An unbounded (math.MaxInt) budget marks an unlimited quota type;
+			// saturate rather than overflow the sum, which is only used for the
+			// "== 0" stop check below.
+			if v == math.MaxInt {
+				totalGPUs = math.MaxInt
+				break
+			}
 			totalGPUs += v
 		}
 		if totalGPUs == 0 {
@@ -297,7 +304,7 @@ func (o *GreedyByScoreOptimizer) allocateForModel(
 		if nsBudget != nil {
 			// Decrement only finite namespace caps; the unlimited sentinel
 			// (negative) imposes no budget to draw down.
-			if cap, capped := nsBudget[accType]; capped && cap >= 0 {
+			if nsCap, capped := nsBudget[accType]; capped && nsCap >= 0 {
 				nsBudget[accType] -= consumed
 			}
 		}

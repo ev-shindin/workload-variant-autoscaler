@@ -76,13 +76,24 @@ func (l *DefaultLimiter) Limit(ctx context.Context, decisions []*interfaces.Vari
 	// Step 3: Create allocator with available resources
 	allocator := l.inventory.CreateAllocator(ctx)
 
+	// Snapshot TargetReplicas so updateDecisionMetadata can tell whether THIS
+	// limiter actually reduced a decision. In a CompositeLimiter each constituent
+	// runs Limit over the same slice; attributing on the sticky WasLimited flag
+	// alone would make every constituent that runs at/after the capping one
+	// re-emit the limited metric under its own name and overwrite LimitedBy.
+	// Comparing before/after scopes attribution to the limiter that did the cap.
+	targetBefore := make([]int, len(decisions))
+	for i, d := range decisions {
+		targetBefore[i] = d.TargetReplicas
+	}
+
 	// Step 4: Run allocation algorithm to distribute resources
 	if err := l.algorithm.Allocate(ctx, decisions, allocator); err != nil {
 		return fmt.Errorf("allocation algorithm failed: %w", err)
 	}
 
 	// Step 5: Update decision metadata
-	l.updateDecisionMetadata(decisions)
+	l.updateDecisionMetadata(decisions, targetBefore)
 
 	return nil
 }
@@ -140,19 +151,26 @@ func (l *DefaultLimiter) calculateUsedGPUsByNamespace(decisions []*interfaces.Va
 	return usedByNS
 }
 
-// updateDecisionMetadata sets LimitedBy and adds DecisionSteps.
-// Note: WasLimited is set by the algorithm during allocation.
-func (l *DefaultLimiter) updateDecisionMetadata(decisions []*interfaces.VariantDecision) {
-	for _, d := range decisions {
-		// If the algorithm marked the decision as limited, set LimitedBy
-		if d.WasLimited {
+// updateDecisionMetadata sets LimitedBy and adds DecisionSteps. targetBefore is
+// the per-decision TargetReplicas snapshot taken before this limiter's algorithm
+// ran, indexed to match decisions.
+//
+// Attribution (LimitedBy + the limited metric) is recorded only when THIS
+// limiter actually reduced the decision this pass (WasLimited is set AND the
+// target dropped). WasLimited is sticky across a CompositeLimiter's constituents,
+// so gating on it alone would double-count the metric and misattribute LimitedBy
+// to a constituent that merely ran after the one that capped.
+func (l *DefaultLimiter) updateDecisionMetadata(decisions []*interfaces.VariantDecision, targetBefore []int) {
+	for i, d := range decisions {
+		cappedHere := d.WasLimited && d.TargetReplicas < targetBefore[i]
+		if cappedHere {
 			d.LimitedBy = l.name
 			l.metricsEmitter.RecordDecisionsLimitedTotalMetric(d.VariantName, d.Namespace, d.LimitedBy)
 		}
 
 		// Add decision step for observability
 		reason := l.buildStepReason(d)
-		d.AddDecisionStep(l.name, reason, d.WasLimited)
+		d.AddDecisionStep(l.name, reason, cappedHere)
 	}
 }
 
