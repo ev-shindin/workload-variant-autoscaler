@@ -277,6 +277,79 @@ var _ = Describe("resolveSaturationConfig", func() {
 		Expect(cfg.QueueLengthThreshold).To(Equal(5.0))
 		Expect(cfg.KvSpareTrigger).To(Equal(0.10))
 		Expect(cfg.QueueSpareTrigger).To(Equal(3.0))
+		// A V1-style entry stays V1 (selection is decided globally, not here), but the
+		// RESOLVED config is calibrated post-merge so that if the global default routes
+		// this model to the V2 path it runs with valid thresholds rather than zeros
+		// (which would disable the scale-up/scale-down post-step).
+		Expect(cfg.IsV2()).To(BeFalse())
+		Expect(cfg.ScaleUpThreshold).To(Equal(config.DefaultScaleUpThreshold))
+		Expect(cfg.ScaleDownBoundary).To(Equal(config.DefaultScaleDownBoundary))
+	})
+
+	It("should not let a V1-style override clobber a tuned global V2 threshold (production parse order)", func() {
+		// Regression guard: entries are ApplyDefaults()'d individually at parse time
+		// before storage (see parseSaturationConfig). Build the map that way, then
+		// resolve. A V1-style override that omits scaleUpThreshold must INHERIT the
+		// operator-tuned global 0.95, not silently revert to the 0.85 default.
+		def := config.SaturationScalingConfig{
+			Analyzers:        []config.AnalyzerScoreConfig{{Name: "saturation"}},
+			ScaleUpThreshold: 0.95, // operator tuned away from the 0.85 default
+			KvCacheThreshold: 0.80,
+		}
+		def.ApplyDefaults()
+		override := config.SaturationScalingConfig{KvCacheThreshold: 0.90} // V1-style, no V2 thresholds
+		override.ApplyDefaults()
+		configMap := map[string]config.SaturationScalingConfig{
+			"default":                   def,
+			"meta/llama-70b#production": override,
+		}
+		cfg := resolveSaturationConfig(configMap, "meta/llama-70b", "production")
+		Expect(cfg.KvCacheThreshold).To(Equal(0.90))
+		Expect(cfg.ScaleUpThreshold).To(Equal(0.95), "tuned global scaleUpThreshold must survive a V1-style override")
+		Expect(cfg.ScaleDownBoundary).To(Equal(config.DefaultScaleDownBoundary))
+	})
+
+	It("should default the sibling V2 threshold post-merge for a fully V1-style namespace map", func() {
+		// Namespace-local map that is V1-style end-to-end (no analyzers anywhere), as
+		// when a tenant ships their own saturation ConfigMap. Global selection routes
+		// these models to V2. The override sets ONLY scaleUpThreshold; the merged
+		// config's IsV2() stays false, so ApplyV2ThresholdDefaults() is the ONLY thing
+		// that fills the missing scaleDownBoundary — this test fails if that post-merge
+		// call is removed (the explicit ApplyDefaults V2-branch never runs here).
+		def := config.SaturationScalingConfig{KvCacheThreshold: 0.80} // V1-style, no analyzers
+		def.ApplyDefaults()
+		override := config.SaturationScalingConfig{ScaleUpThreshold: 0.90} // only scaleUp set
+		override.ApplyDefaults()
+		configMap := map[string]config.SaturationScalingConfig{
+			"default":      def,
+			"model-1#ns-1": override,
+		}
+		cfg := resolveSaturationConfig(configMap, "model-1", "ns-1")
+		Expect(cfg.IsV2()).To(BeFalse())
+		Expect(cfg.ScaleUpThreshold).To(Equal(0.90), "explicit override must win")
+		Expect(cfg.ScaleDownBoundary).To(Equal(config.DefaultScaleDownBoundary), "missing sibling must be defaulted post-merge")
+	})
+
+	It("should reset an inverted V2 threshold pair produced by a cross-entry merge", func() {
+		// Base scaleUpThreshold 0.85; a V1-style override raises scaleDownBoundary above
+		// it. Each entry is valid on its own (so load-time validation passes), but the
+		// merged pair is inverted — resolveSaturationConfig must fall back to defaults
+		// rather than feed the optimizer scaleUp <= scaleDown.
+		def := config.SaturationScalingConfig{
+			Analyzers:        []config.AnalyzerScoreConfig{{Name: "saturation"}},
+			KvCacheThreshold: 0.80,
+		}
+		def.ApplyDefaults() // scaleUp=0.85, scaleDown=0.70
+		override := config.SaturationScalingConfig{ScaleDownBoundary: 0.95}
+		override.ApplyDefaults()
+		configMap := map[string]config.SaturationScalingConfig{
+			"default":      def,
+			"model-1#ns-1": override,
+		}
+		cfg := resolveSaturationConfig(configMap, "model-1", "ns-1")
+		Expect(cfg.ScaleUpThreshold).To(Equal(config.DefaultScaleUpThreshold))
+		Expect(cfg.ScaleDownBoundary).To(Equal(config.DefaultScaleDownBoundary))
+		Expect(cfg.ScaleUpThreshold).To(BeNumerically(">", cfg.ScaleDownBoundary))
 	})
 })
 

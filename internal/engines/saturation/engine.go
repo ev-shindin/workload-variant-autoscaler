@@ -96,7 +96,9 @@ type safetyNetEmitter func(
 // Starts from the "default" entry (or zero-value), then merges the model-specific
 // override "{modelID}#{namespace}" on top (if present). This allows per-model
 // overrides to specify only the fields they want to change.
-// ApplyDefaults is called last to fill any remaining zero-valued fields.
+// After merging, ApplyDefaults fills remaining zero-valued fields, then
+// ApplyV2ThresholdDefaults calibrates the V2 thresholds on the final config and an
+// inconsistent (inverted) threshold pair is reset to the defaults.
 func resolveSaturationConfig(
 	configMap map[string]config.SaturationScalingConfig,
 	modelID, namespace string,
@@ -111,6 +113,19 @@ func resolveSaturationConfig(
 		base.Merge(override)
 	}
 	base.ApplyDefaults()
+	// Calibrate V2 thresholds on the final merged config. Analyzer selection is
+	// global, so this entry may run on the V2 path even when written V1-style;
+	// applied here (post-merge) rather than in ApplyDefaults so a V1-style override
+	// cannot clobber a tuned global threshold during Merge.
+	base.ApplyV2ThresholdDefaults()
+	// Per-entry V2 thresholds are range-validated at load, but a merge can still
+	// produce an inconsistent pair across entries (e.g. an override raises
+	// scaleDownBoundary above the base scaleUpThreshold). Rather than feed the
+	// optimizer an inverted pair, fall back to the defaults for both.
+	if base.ScaleUpThreshold <= base.ScaleDownBoundary {
+		base.ScaleUpThreshold = config.DefaultScaleUpThreshold
+		base.ScaleDownBoundary = config.DefaultScaleDownBoundary
+	}
 	return base
 }
 
