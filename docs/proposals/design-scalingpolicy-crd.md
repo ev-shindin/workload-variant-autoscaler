@@ -18,31 +18,46 @@ It does **not** change how WVA *actuates* (it still emits `wva_desired_replicas`
 
 ## Optional and backward-compatible
 
-The structured configuration is **optional and additive**. A workload with only the managed labels keeps scaling under WVA's defaults exactly as today — the schema adds *scoped overrides*, it does not become required. Upgrading an existing cluster needs **no migration**: phase 1 *is* the ConfigMap WVA already reads, with more structure in it. Fields that exist today (`priority`, `scaleToZero`, analyzer settings, limiter selection) keep their current meaning at the cluster tier; per-namespace and per-pool scoping is the new capability.
+The structured configuration is **optional and additive** — a workload with only the managed labels keeps scaling under WVA's defaults exactly as today. Two things to be accurate about, because the value here is **unification**, not "adding tiers":
 
-**Before / after — the cluster tier is today's ConfigMap, restructured.** Today's flat cluster config gains a scope label and the typed shape; the values carry over:
+- **WVA already tiers per-model/namespace.** The `saturation-scaling-config` ConfigMap already carries a `default` entry **plus per-model/namespace override entries** (each carrying `priority` and per-analyzer `score` and thresholds), and `scaleToZero` and the queueing-model analyzer are already namespace-aware in the controller config. So per-namespace scoping is **not new**.
+- **What *is* new:** one **unified schema** across those currently-separate surfaces; the **per-pool** tier (finer than per-model/namespace); the admin/tenant **ownership boundary** (§2); and the typed **`behavior`** field (§4). `priority` (per-model), `scaleToZero`, thresholds and `enableLimiter` keep their current meaning.
+
+Upgrading needs **no value migration**, but be honest that it *is* a **consolidation** — three config surfaces fold into one — not a pure restructuring of a single ConfigMap.
+
+**Before / after.** Today's real `saturation-scaling-config` (abbreviated):
 
 ```yaml
-# today (illustrative): one global ConfigMap
-data: { priority: "1.0", scaleToZero: "false", analyzer: "saturation", scaleUpThreshold: "0.9" }
-# phase 1: same values, structured, labelled as the cluster-default tier (§2)
-metadata: { labels: { scaling.llm-d.ai/config: "true", scaling.llm-d.ai/tier: cluster } }
+metadata:
+  name: saturation-scaling-config
+  labels: { app.kubernetes.io/name: workload-variant-autoscaler }   # controller cache filters on this
 data:
-  config: |
-    priority: 1.0
-    scaleToZero: { enabled: false }
-    analyzers: [ { type: saturation, parameters: { scaleUpThreshold: 0.9 } } ]
-    limiters:  [ { type: gpu-inventory } ]      # admin-only, cluster tier
+  default: |                         # global defaults
+    scaleUpThreshold: 0.85
+    priority: 1.0                    # per-model multiplier
+    analyzers: [ { name: saturation, score: 1.0 } ]   # per-analyzer weight
+    enableLimiter: false
+  premium-override: |                # a per-(model, namespace) override entry
+    model_id: granite-premium
+    namespace: production
+    priority: 2.0
 ```
 
-**Minimal usage.** A pool with no `ScalingPolicy`/ConfigMap of its own scales under the cluster default (unchanged behavior). To raise one pool's priority, a tenant adds *just* the per-pool object with only the delta:
+Phase 1 keeps the same values in the unified schema, resolved by tier/placement (§2) instead of in-data `model_id`/`namespace` keys:
 
 ```yaml
-metadata: { namespace: production, labels: { scaling.llm-d.ai/config: "true", scaling.llm-d.ai/tier: pool, scaling.llm-d.ai/pool: granite-premium-pool } }
-data: { config: "inferencePoolRef: { name: granite-premium-pool }\npriority: 2.0" }
+# cluster-default tier == the 'default' entry above
+priority: 1.0
+scaleToZero: { enabled: false }
+analyzers: [ { type: saturation, name: saturation, score: 1.0, parameters: { scaleUpThreshold: 0.85 } } ]
+limiters:  [ { type: gpu-inventory } ]              # admin-only, cluster tier (§2)
+
+# per-pool tier for granite-premium (== the override above), only the delta:
+#   inferencePoolRef: { name: granite-premium-pool }
+#   priority: 2.0
 ```
 
-Everything else (`scaleToZero`, `behavior`, `analyzers`) inherits from the tiers above (§2).
+**Minimal usage.** A pool with no config of its own scales under the cluster default (unchanged). To raise one pool's priority, a tenant adds *just* the per-pool object carrying the delta (`inferencePoolRef` + `priority: 2.0`); everything else (`scaleToZero`, `behavior`, `analyzers`) inherits from the tiers above (§2).
 
 ## 1. The configuration object and how it is matched
 
@@ -136,6 +151,7 @@ Consequences:
 
 - **`maxReplicas` stays** as the tenant's hard per-workload ceiling on the `ScaledObject`. WVA's desired count is clamped by it exactly as today; the config sets the *policy* WVA decides within, not the safety cap.
 - **Scale-to-zero** — `scaleToZero.enabled` lets WVA emit a desired of `0`; the `ScaledObject` (with KEDA's idle-replica support) actuates it.
+- **`behavior` means WVA owns stabilization — the `ScaledObject` must not double it.** `spec.behavior` (§4) makes WVA apply the HPA-style damping (windows, rate policies) to its *own* recommendation before emitting it. But the `ScaledObject`/HPA can *also* stabilize the metric it reads, and two stabilizers in series **compound lag** (a spike is damped by WVA, then damped again downstream). The contract when `behavior` is set: **WVA owns stabilization; the `ScaledObject`/HPA `behavior` is configured near-passthrough** (`stabilizationWindowSeconds: 0`). Where the two are reconciled (operator convention vs. WVA generating the `ScaledObject` behavior) is the stabilization proposal's, not this schema's — this proposal only fixes that `behavior` is a per-model field and that it is the *single* stabilizer of record.
 - **Managed-set identification is unchanged.** WVA discovers the workloads it manages from the `llm-d.ai/managed` label on the `ScaledObject` (and reads `llm-d.ai/model-id`, `inference.optimization/acceleratorName`) — the current mechanism. This proposal does not change it (§7).
 
 ## 4. The generic schema shape (review question 2)
