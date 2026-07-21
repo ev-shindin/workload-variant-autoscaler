@@ -1,144 +1,220 @@
-# Proposal: ScalingPolicy CRD — minimal core
+# Proposal: WVA scaling configuration — schema and resolution (ConfigMap first, CRD later)
 
-## Scope
+## Problem — what this addresses
 
-This is the **bare-minimum** core of the WVA configuration CRD, split out from the broader analysis in **#1194** (kept open for reference). Per review, it answers the two questions that gate the design — and settles only the minimum they force (the resolution tiers and the status surface):
+Today WVA is configured by **one cluster-wide ConfigMap** plus **per-workload labels/annotations** on the KEDA `ScaledObject` (`llm-d.ai/managed`, `llm-d.ai/model-id`, `inference.optimization/acceleratorName`). That is enough for a single global configuration, but it cannot express:
 
-1. **What is the relationship between the Config CRD and the HPA object?** (§2)
-2. **What is the generic shape (schema) of the CRD?** (§3)
+- **per-namespace or per-pool policy** — every workload shares one global `priority`, `scaleToZero`, and analyzer configuration;
+- **an ownership boundary** — cluster-admin-owned enforcement (GPU limiters / quota) and tenant-owned tuning (thresholds, priority) live in the same undifferentiated blob, with no way to give them different RBAC;
+- **validation** — a typo in the ConfigMap is silently ignored;
+- **a resolved-configuration surface** — an operator cannot see *what policy WVA actually applied* to a given pool.
 
-Everything else from #1194 — migration tooling, deprecation phases, the full status-condition catalog, per-role detail, alternatives, comparison matrices — is **deliberately deferred** (§6); the dependency on the VA-deprecation proposal (discovery, cost source) and one remaining open question are in §5. The goal here is to agree the CRD's *boundary* and *shape* first; the rest layers on top without changing either.
+This proposal fixes the configuration **schema** and **resolution** (the fields, the scope tiers, the pluggable-plugin envelope, and the merge order). It is **transport-neutral** and lands in two phases:
 
-## 1. The object
+- **Phase 1 — extend the existing ConfigMap** with this schema. No CRD, no migration, no new install step. Validation via `ValidatingAdmissionPolicy` (CEL) + the controller; the ownership boundary via RBAC. This is the minimal core.
+- **Phase 2 — promote the schema to a `ScalingPolicy` CRD** when field-level typed validation, `kubectl explain`, and a native `.status` are worth the operational cost of a CRD (§6). Same schema, same resolution — a delivery upgrade, not a redesign.
 
-One namespaced CRD, `ScalingPolicy` (`scaling.llm-d.ai/v1alpha1`), carries WVA's scaling configuration. It is matched to a workload through that workload's **`InferencePool`** (defined by the Gateway API Inference Extension; the workload→pool link is the pool's pod selector) — not through the workload, and not through its HPA:
+It does **not** change how WVA *actuates* (it still emits `wva_desired_replicas` for a `ScaledObject`, §3) or how it *identifies* the workloads it manages (§7).
+
+## Optional and backward-compatible
+
+The structured configuration is **optional and additive**. A workload with only the managed labels keeps scaling under WVA's defaults exactly as today — the schema adds *scoped overrides*, it does not become required. Upgrading an existing cluster needs **no migration**: phase 1 *is* the ConfigMap WVA already reads, with more structure in it. Fields that exist today (`priority`, `scaleToZero`, analyzer settings, limiter selection) keep their current meaning at the cluster tier; per-namespace and per-pool scoping is the new capability.
+
+**Before / after — the cluster tier is today's ConfigMap, restructured.** Today's flat cluster config gains a scope label and the typed shape; the values carry over:
 
 ```yaml
+# today (illustrative): one global ConfigMap
+data: { priority: "1.0", scaleToZero: "false", analyzer: "saturation", scaleUpThreshold: "0.9" }
+# phase 1: same values, structured, labelled as the cluster-default tier (§2)
+metadata: { labels: { scaling.llm-d.ai/config: "true", scaling.llm-d.ai/tier: cluster } }
+data:
+  config: |
+    priority: 1.0
+    scaleToZero: { enabled: false }
+    analyzers: [ { type: saturation, parameters: { scaleUpThreshold: 0.9 } } ]
+    limiters:  [ { type: gpu-inventory } ]      # admin-only, cluster tier
+```
+
+**Minimal usage.** A pool with no `ScalingPolicy`/ConfigMap of its own scales under the cluster default (unchanged behavior). To raise one pool's priority, a tenant adds *just* the per-pool object with only the delta:
+
+```yaml
+metadata: { namespace: production, labels: { scaling.llm-d.ai/config: "true", scaling.llm-d.ai/tier: pool, scaling.llm-d.ai/pool: granite-premium-pool } }
+data: { config: "inferencePoolRef: { name: granite-premium-pool }\npriority: 2.0" }
+```
+
+Everything else (`scaleToZero`, `behavior`, `analyzers`) inherits from the tiers above (§2).
+
+## 1. The configuration object and how it is matched
+
+The configuration is **one schema** carried by one object per scope:
+
+- **Phase 1:** a ConfigMap whose `data` holds the schema as a YAML document (one per tier, §2).
+- **Phase 2:** a namespaced `ScalingPolicy` custom resource (`scaling.llm-d.ai/v1alpha1`).
+
+It is matched to a workload through that workload's **`InferencePool`** (the Gateway API Inference Extension object; the workload→pool link is the pool's pod selector) via `inferencePoolRef` — **not** through the workload and **not** through its `ScaledObject`. The config points at the pool; the pool's workloads carry no reference back.
+
+```yaml
+# Phase 2 (CRD) form — the phase-1 ConfigMap carries the same document under data:
 apiVersion: scaling.llm-d.ai/v1alpha1
 kind: ScalingPolicy
-metadata:
-  name: granite-premium-priority
-  namespace: production
+metadata: { name: granite-premium-priority, namespace: production }
 spec:
-  inferencePoolRef:
-    name: granite-premium-pool      # the pool this policy configures
-  priority: 2.0
-  scaleToZero: { enabled: false }
+  inferencePoolRef: { name: granite-premium-pool }   # the pool this config governs (per-pool tier)
+  priority: 2.0                                       # per-model; see §2
+  scaleToZero: { enabled: false }                     # per-model
+  behavior:                                           # per-model; autoscaling/v2 HPA behavior (§4)
+    scaleDown: { stabilizationWindowSeconds: 300 }
   analyzers:
     - type: saturation
-      parameters: { scaleUpThreshold: 0.95 }
+      parameters: { scaleUpThreshold: 0.95 }          # plugin-owned; see §4
 ```
 
-The policy **points at the pool**; the pool's workloads carry no reference back to the policy. Why that direction matters is §2.
+The tunable field families and their meaning, defined here so nothing below is referenced before it is defined:
 
-## 2. Relationship to the HPA / ScaledObject (review question 1)
+- **`priority`** *(per-model)* — the model's weight when models contend for a shared GPU budget. It is only meaningful **relative to other models drawing on the same budget**: within a namespace quota if one exists, otherwise the shared cluster budget (so priority *does* compose across un-quota'd namespaces on the same accelerator type — how it does is engine/rescale territory, not this schema). It is not comparable across *independent* budgets. Default `1.0`.
+- **`scaleToZero`** *(per-model)* — whether WVA may emit a desired count of `0` for an idle model (§3).
+- **`behavior`** *(per-model, tenant-tunable)* — the HPA-style stabilization behavior WVA applies to its own recommendation (trailing windows, per-period rate policies, tolerance) before emitting it. This is a **typed** field reusing `k8s.io/api/autoscaling/v2` `HorizontalPodAutoscalerBehavior` verbatim (§4); its *shape* is fixed here, its *algorithm* is the stabilization proposal's.
+- **`analyzers`** *(per-model, tenant-tunable)* — the saturation/queueing analysis plugins and their thresholds (§4). Per-**role** (prefill/decode) tuning lives *inside* an analyzer's `parameters`, not as top-level fields (§5).
 
-**They own different things:** WVA owns the scaling decision, the HPA owns actuation. `ScalingPolicy` configures the decision; the HPA actuates it by reading WVA's `wva_desired_replicas` metric. Neither the policy nor the HPA references the other's *config*. WVA reads the HPA/`ScaledObject` to identify the workloads it manages, but the *mechanism* (the #1130 label) is the **VA-deprecation proposal's** — and this CRD's shape does not depend on it.**
+`limiters`/`quota` are **not** in that list — they are admin-only and cluster-scoped (§2).
 
-| | Owns | Reads | Writes |
+## 2. Scope tiers — one schema, up to three placements
+
+The surface is **one schema**, resolved at up to **three placements of it** — not three schemas, not three kinds — by a deterministic lookup in fixed order. In phase 1 each placement is a ConfigMap; in phase 2 each is a `ScalingPolicy` object.
+
+1. **Cluster-default** — in the system namespace, no `inferencePoolRef`. **Admin-owned.**
+2. **Namespace-default** — in the workload's namespace, no `inferencePoolRef`. **Tenant-owned.**
+3. **Per-pool** — in the workload's namespace, `inferencePoolRef` set. **Tenant-owned.** A workload-specific policy is *just this placement* — it needs only the fields it overrides.
+
+**How the controller finds a tier (phase 1).** A CRD has identity from its kind, namespace, and `spec.inferencePoolRef`; a ConfigMap does not, so phase 1 classifies ConfigMaps by a fixed label set the controller watches (`scaling.llm-d.ai/config: "true"`):
+
+| tier | namespace | labels |
+|---|---|---|
+| cluster-default | system (`workload-variant-autoscaler-system`) | `scaling.llm-d.ai/tier: cluster` |
+| namespace-default | workload's | `scaling.llm-d.ai/tier: namespace` |
+| per-pool | workload's | `scaling.llm-d.ai/tier: pool`, `scaling.llm-d.ai/pool: <inferencePool>` |
+
+The controller resolves a workload's policy from the labelled ConfigMaps in (system-ns, workload-ns); the `inferencePoolRef` inside the document must agree with the `pool` label (admission-checked). In phase 2 this labelling goes away — the CR's kind + namespace + `spec.inferencePoolRef` are the identity.
+
+**Resolution is inheritance, not replacement.** Fields merge **cluster → namespace → per-pool**, higher tier winning **per field** — a per-pool object that sets only `priority` inherits `scaleToZero`, `behavior`, and `analyzers` from the tiers above it. `analyzers` merge **by `name`** (§4): a lower tier can add or replace an analyzer entry without redeclaring the others. Note the granularity: because a plugin's `parameters` is **opaque** to the envelope (§4), it cannot be structurally deep-merged — a same-`name` entry **replaces the whole `parameters` block**, it does not patch one key. So a tenant writes the minimum set of *entries*, but retuning one threshold means restating that analyzer's `parameters`. This is the "narrower than intended" point from review: real per-field/per-entry inheritance across tiers, with parameters as the replace-granular leaf.
+
+**One kind, two purposes — deliberately.** The same schema serves two owners because it is placed differently and gated by different RBAC: at the **cluster-default** tier it is the admin's **enforcement** carrier (limiters/quota); at the **namespace/per-pool** tiers it is the tenant's **tuning** surface (priority, scaleToZero, analyzers). This dual purpose is intentional — one schema and one merge, partitioned by placement and RBAC, rather than two objects to keep in sync.
+
+**Which fields live at which tier:**
+
+| field family | tiers allowed | owner | rationale |
 |---|---|---|---|
-| **HPA / KEDA `ScaledObject`** (tenant-owned) | replica **actuation** | the `wva_desired_replicas` metric | the workload's `spec.replicas` |
-| **WVA controller** | the scaling **decision** | `ScalingPolicy`, cluster/pool state, and the HPA/`ScaledObject` that marks its managed workloads (per the VA-deprecation proposal) | the `wva_desired_replicas` metric (+ `ScalingPolicy.status`) |
-| **`ScalingPolicy` CRD** | the scaling **policy** (priority, thresholds, scale-to-zero, quota) | — | — |
+| `analyzers`, `priority`, `scaleToZero` | any tier | tenant (ns/pool), admin sets cluster defaults | per-model tuning; safe to delegate |
+| **`limiters` / `quota`** | **cluster-default only** | **admin** | instance-wide **enforcement**, not a tenant knob |
 
-The data flow is one-directional:
+**`limiters`/`quota` are cluster-default-only, and this is a security boundary, not a style choice.** They are excluded from the merge entirely — a lower tier can neither override nor remove them. That is why **`inferencePoolRef` and `limiters` never co-occur**: `limiters` exist only on the cluster-default, which by definition has no `inferencePoolRef`. If a tenant could set `limiters` on a policy they own, they could drop the `quota` limiter (or set `limiters: []`) and **escape their own cap**.
+
+The isolation **guarantee** is RBAC plus the controller; admission is only UX:
+
+1. **RBAC (the guarantee)** — tenants have no permission to write the cluster-default (it lives in the system namespace). Identical in both phases; this is what actually prevents cap-escape.
+2. **Controller (defense in depth)** — WVA only honors `limiters`/`quota` from the cluster-default tier; a `limiters` block on a tenant-tier object is *ignored*, so even a mis-scoped config cannot weaken enforcement.
+3. **Admission (feedback, not a control)** — a **`ValidatingAdmissionPolicy` (CEL)** rejects a namespace/per-pool config carrying `limiters` so the tenant gets an immediate error instead of a silent ignore. In phase 1 this is a string-level check on the ConfigMap document (a regex, not a security boundary); phase 2's CRD `x-kubernetes-validations` makes it field-precise (§6). It is convenience over (1)+(2), never a substitute for them.
+
+**`analyzers` and `limiters` type selection vs. the controller's global mode.** The analyzer *type* a policy names (`saturation`, `queueing`) selects a plugin; whether the engine runs the V1 or V2 analysis pipeline, and whether the GPU limiter is active at all, are **controller-global modes** (today: the `enableLimiter` / analyzer-version switches), not per-policy fields. A policy *configures* the analyzers/limiters the controller is running; it does not turn the pipeline on or off. Keeping that boundary explicit answers "is the analyzer type global?" — the *pipeline* is; the *plugin selection and parameters* are policy.
+
+**Two objects matching the same scope** (two per-pool policies for one pool, or two namespace-defaults in one namespace) are a configuration error. This is a *set* invariant — admission (VAP or CRD CEL) validates one object in isolation and cannot see siblings — so it is **detected by the controller**, which refuses to resolve an ambiguous scope and raises a `Conflict` (a duplicate on a status-bearing object; a controller log/event in the status-less phase-1 ConfigMap case) rather than picking one non-deterministically.
+
+## 3. Relationship to the `ScaledObject` (review question 1)
+
+WVA and the scaler own **different things, on different objects**:
+
+- **WVA** computes the scaling **decision** and publishes it as the `wva_desired_replicas` **metric**. It configures *its own* decision via this schema. It does **not** create, own, or write the `ScaledObject`, and never sets `spec.replicas`.
+- The **KEDA `ScaledObject`** (the scaler WVA integrates with) is a **standalone autoscaler** owned by the tenant. It actuates `spec.replicas` from whatever metrics it is configured with — WVA simply supplies one of them (`wva_desired_replicas`). It can scale without WVA; WVA feeds it a signal.
+
+So there is **no configuration cross-reference in either direction**: the config points at the `InferencePool`, not the `ScaledObject`; the `ScaledObject` references the metric, not any WVA config object. Configuring WVA never means editing a tenant's `ScaledObject`.
 
 ```
-ScalingPolicy ──configures──▶ WVA ──emits──▶ wva_desired_replicas ──read by──▶ HPA / ScaledObject ──sets──▶ spec.replicas
+ScalingConfig ─configures→ WVA ─emits→ wva_desired_replicas ─read by→ ScaledObject ─sets→ spec.replicas
 ```
 
-The consequences answer the question directly:
+Consequences:
 
-- **No config cross-reference.** The HPA / `ScaledObject` carries no reference to a WVA *config* object, and `ScalingPolicy` points at the `InferencePool`, **not** the HPA — so configuring WVA never means editing a tenant's HPA. The HPA's tie to WVA is that it reads the `wva_desired_replicas` metric to actuate. (An `HPA → ScalingPolicy` config reference would put a WVA-specific field on every workload — that's what this avoids.)
-- **WVA never *writes* tenant-owned objects.** It does not set `spec.replicas` or modify the HPA / `ScaledObject`; it publishes the `wva_desired_replicas` metric, which the HPA consumes. WVA *does* **read** the HPA/`ScaledObject` to identify its managed set — the mechanism (the `llm-d.ai/managed` label on those objects, #1130) belongs to the VA-deprecation proposal, not this one.
-- **HPA `maxReplicas` stays, as a complementary hard ceiling.** `ScalingPolicy` does not replace it: WVA's desired count is clamped by the HPA exactly as today. `ScalingPolicy` sets the *policy* WVA decides within; `maxReplicas` is the tenant's final per-workload safety cap.
-- **Scale-to-zero is a policy toggle, actuated by the HPA layer.** `spec.scaleToZero.enabled` lets WVA emit a desired of 0; KEDA/HPA actuate it. WVA decides 0; it does not force it.
+- **`maxReplicas` stays** as the tenant's hard per-workload ceiling on the `ScaledObject`. WVA's desired count is clamped by it exactly as today; the config sets the *policy* WVA decides within, not the safety cap.
+- **Scale-to-zero** — `scaleToZero.enabled` lets WVA emit a desired of `0`; the `ScaledObject` (with KEDA's idle-replica support) actuates it.
+- **Managed-set identification is unchanged.** WVA discovers the workloads it manages from the `llm-d.ai/managed` label on the `ScaledObject` (and reads `llm-d.ai/model-id`, `inference.optimization/acceleratorName`) — the current mechanism. This proposal does not change it (§7).
 
-**Net:** a workload is *configured* via its pool (§1's "not through the HPA") and *actuated* via the metric; the CRD sits *upstream* of that metric, so it slots into the existing HPA/KEDA flow without modifying it. How a workload is *identified as WVA-managed* is the VA-deprecation proposal's, not here.
+## 4. The generic schema shape (review question 2)
 
-## 3. The generic schema shape (review question 2)
-
-The CRD is a **thin typed envelope around pluggable, schemaless plugin lists** — so the schema itself is small and fixed, and new analyzers/limiters never change it. Two validation tiers, deliberately:
+The schema is a **thin typed envelope around pluggable, schemaless plugin lists**, so the envelope is small and fixed and new plugins never change it:
 
 ```yaml
-spec:
-  # (a) typed, cross-cutting fields — OpenAPI/CEL-validated, `kubectl explain`-able
-  inferencePoolRef: { name: granite-premium-pool }   # per-pool only; mutually exclusive with limiters (§4)
-  priority: 2.0
-  scaleToZero: { enabled: false }
+# (a) cross-cutting fields — typed, well-known schemas, validated
+inferencePoolRef: { name: granite-premium-pool }   # match key (per-pool tier only)
+priority: 2.0
+scaleToZero: { enabled: false }
+behavior:                      # k8s.io/api/autoscaling/v2 HorizontalPodAutoscalerBehavior, verbatim
+  scaleDown: { stabilizationWindowSeconds: 300, policies: [ { type: Percent, value: 100, periodSeconds: 60 } ] }
 
-  # (b) pluggable lists — {type, name, parameters}; `parameters` is plugin-owned
-  analyzers:                          # one or more; TENANT-tunable, any tier
-    - type: saturation
-      name: sat                       # identity, used for cross-tier merge
-      parameters:                     # x-kubernetes-preserve-unknown-fields
-        scaleUpThreshold: 0.95
-  limiters:                           # zero or more; chain; CLUSTER-DEFAULT ONLY (admin)
-    - type: gpu-inventory
-    - type: quota                     # parameters schema owned by #1162
+# (b) plugin lists — {type, name, parameters}; parameters is plugin-owned
+analyzers:                     # per-model, tenant-tunable, any tier
+  - type: saturation
+    name: sat                  # identity for cross-tier merge; defaults to `type`
+    parameters:                # opaque to the envelope; each plugin validates its own
+      scaleUpThreshold: 0.95
+limiters:                      # cluster-default only (§2)
+  - type: gpu-inventory
+  - type: quota                # parameters owned by the quota work (#1162)
 ```
 
-*Field catalog, not a single valid object: a real `ScalingPolicy` is one tier, and `inferencePoolRef` and `limiters`/`quota` never co-occur — limiters live only on the cluster-default, which has no `inferencePoolRef` (§4).*
+- **(a) cross-cutting fields** (`priority`, `scaleToZero`, `behavior`, `inferencePoolRef`) are the small stable set. Each has a **fixed, well-known schema** — `behavior` in particular is `autoscaling/v2` `HorizontalPodAutoscalerBehavior` reused verbatim (a k8s building block, not a WVA invention). In **phase 2** they are OpenAPI-typed and `kubectl explain`-able; in **phase 1** the controller validates them on load and a `ValidatingAdmissionPolicy` guards the coarse shape.
+- **(b) plugin lists** are name-keyed `{type, name, parameters}` — the **EPP `EndpointPickerConfig` shape** reused so the plugin-list convention is one WVA already ships as an InferencePool consumer, not a bespoke one. **`parameters` is opaque to the envelope** (phase 2: `x-kubernetes-preserve-unknown-fields`) — each plugin validates its own. `name` keys the cross-tier merge (replace-granular, §2), **defaults to `type`** for a single instance, and must be unique within a tier.
 
-- **(a) Stable typed fields** — the tunable cross-cutting fields (`priority`, `scaleToZero`) and the match key (`inferencePoolRef`) are **typed**: OpenAPI/CEL-validated, discoverable via `kubectl explain`.
-- **(b) Plugin lists** (`analyzers`, `limiters`) are name-keyed `{type, name, parameters}` where **`parameters` is `x-kubernetes-preserve-unknown-fields`** — each plugin validates its own at load. This reuses the **EPP `EndpointPickerConfig` shape** (not its config — both sides merely read the `InferencePool`). `name` keys the cross-tier merge (§4) and **defaults to `type`** for a single instance; it's required only for two instances of one `type`, and must be unique within a tier (admission-enforced).
-- **Tenant-tunable vs admin-only — an isolation boundary, not a style choice.** `analyzers`, `priority`, and `scaleToZero` are tenant-tunable at any tier. **`limiters` (and `quota`) are cluster-default-only**: they are *instance-wide enforcement*, not tenant knobs. A **CEL rule rejects `limiters`/`quota` on any namespace or per-pool `ScalingPolicy`**, and tenants have no RBAC to write the cluster-default object (it lives in the system namespace). This is load-bearing for security: if a tenant could set `limiters` on a policy they own, they could drop the `quota` limiter — or set `limiters: []` — and **escape their own cap**. So `limiters`/`quota` are never authored, merged, or overridable below the cluster-default tier (§4).
+**This is what keeps the surface generic — and why one config object suffices rather than a new CRD per feature.** Adding an analyzer or limiter ships *its own* `parameters` keys; the envelope does not change. A future `optimizer` block slots in the same way with no redesign. This directly answers the "won't we keep needing new CRDs / should the kind be more general" concern: the envelope *is* the generality — the plugin list absorbs new config without a schema change, so a single `ScalingPolicy` (or its phase-1 ConfigMap) does not need to become a broader kind to grow.
 
-The one property that makes the shape "generic": **adding an analyzer or limiter ships its own `parameters` keys and the CRD schema does not change.** The optimizer is a single fixed stage with nothing to configure today; the schema leaves room for a `spec.optimizer` block later with no redesign.
+**Schema vs. engine — the boundary this proposal draws.** This document fixes the **schema and resolution** only: the fields, the tiers, the merge, the plugin envelope, and the `status` *shape*. It does **not** specify engine behavior — how an analyzer resolves a threshold, how per-role parameters are applied, how the optimizer consumes `priority`. Those are engine concerns, tracked separately, and are deliberately left open so the schema can be agreed without pinning the implementation.
 
-(The `quota` limiter's `parameters` schema and its cluster-scope enforcement are owned by **#1162** / issue #1002 — quota lives on this surface, but its shape is settled there, not here.)
+## 5. Per-role (prefill/decode) configuration
 
-## 4. Why more than one tier (the quota constraint)
+Per-role tuning is a real need for disaggregated (P/D) models, and it has a clear home: **inside an analyzer's `parameters`** (e.g. a `roleOverrides` block), **not** as top-level fields. The reason is ownership of the concern — `priority` and `scaleToZero` are **per-model** decisions (the whole model scales to zero, or has a priority), while role-specific thresholds are **per-analyzer** knobs. So the envelope carries no `prefill`/`decode` fields; a P/D model configures both roles through the analyzer plugin that understands them:
 
-The surface is still **one CRD**. It is resolved at up to **three placements** of that same object — not three schemas and not three kinds — by a deterministic lookup in fixed order:
+```yaml
+analyzers:
+  - type: saturation
+    parameters:
+      roleOverrides:
+        prefill: { scaleUpThreshold: 0.90 }
+        decode:  { scaleUpThreshold: 0.95 }
+```
 
-1. **Cluster-default** — `ScalingPolicy` in the system namespace, no `inferencePoolRef`.
-2. **Namespace-default** — `ScalingPolicy` in the workload's namespace, no `inferencePoolRef`.
-3. **Per-pool** — `ScalingPolicy` in the workload's namespace, `inferencePoolRef` set.
+*Applying* per-role thresholds is an **engine** change (resolving and enforcing role-scoped parameters), out of scope here and tracked separately — this proposal only fixes that per-role config is a `parameters` concern, so it needs no envelope change.
 
-Fields merge cluster → namespace → per-pool (higher tier wins; `analyzers` merge by `name`). **`limiters` and `quota` are excluded from the merge entirely — they exist *only* on the cluster-default tier** (CEL-rejected on the others, §3), so a lower tier can neither override them nor remove them. A tenant cannot weaken or delete their own cap by editing a policy they own; the only objects they can write (namespace / per-pool) cannot carry a limiter at all.
+## 6. Surfacing the resolved configuration (status) — and the CRD's phase-2 value
 
-Two `ScalingPolicy` objects matching the **same** scope (two per-pool policies for one pool, or two namespace-defaults in one namespace) are a configuration error, **rejected at admission** — so resolution is always deterministic, never order- or name-dependent.
-
-**Two tiers are forced by ownership, not preference.** Quota is **cluster-admin-owned and cluster-scoped** (a tenant must not raise their own cap, and a cluster aggregate needs a cluster-wide view — per-namespace instances would each see full node inventory and collectively overcommit); thresholds/`priority`/`scaleToZero` are **tenant-owned and namespace-scoped**. Different owners, different RBAC — they can't share one object without letting tenants edit quota or admins own every tenant's thresholds. So **cluster-default + namespace are structural, not convenience.**
-
-The **third (per-pool) tier costs no extra schema** — it is the *same* CRD with `inferencePoolRef` set, in the tenant's namespace, adding override *granularity*, not a new surface. So "multiple levels" is three placements of one object resolved by a small deterministic merge — not three configuration systems.
-
-### Status — surfacing the resolution
-
-The per-pool object's status publishes both *what was resolved* and *what it governs* — so `kubectl get scalingpolicy <name> -o yaml` shows exactly what WVA decided, no unseen algorithm (for pools with a per-pool object; §5 covers default-only pools):
+An operator must be able to see *what WVA actually decided* for a pool — the merged policy and the workloads it governs — without reverse-engineering the merge. The **shape** of that surface:
 
 ```yaml
 status:
-  managedVariants:                     # variants WVA manages in this pool (managed set; identified per VA-deprecation proposal)
+  effectivePolicy: { … }          # merged result (cluster → ns → per-pool)
+  sources: [ … ]                  # which tier each field came from, in precedence order
+  managedVariants:                # workloads WVA manages in this pool (managed set, §7)
     - workloadRef: { kind: Deployment, name: granite-premium-prefill }
-      role: prefill                    # when known
-      cost: 40.0                       # per-replica $/hr (see source below)
-    - workloadRef: { kind: Deployment, name: granite-premium-decode }
-      role: decode
-      cost: 24.0
-  effectivePolicy: { … }               # merged result (cluster → ns → per-pool)
-  sources: [ … ]                       # contributing tiers, in precedence order
+      role: prefill               # when known
+      cost: 40.0                  # per-replica $/hr — the stable cost input, surfaced here
+  conditions: [ { type: PolicyMatched, … } ]   # False when no managed workload matched
 ```
 
-- **`effectivePolicy`** (+ **`sources`**) — the merged result and which tier each field came from.
-- **`managedVariants`** — the workloads this policy manages, each with `workloadRef`, `role`, and per-replica `cost`. *Which* workloads and *how* they're identified is the VA-deprecation proposal's (§5); this fixes only the **shape**. It is **distinct from pool membership** (an unmanaged pool member wouldn't appear); `cost` is a stable input surfaced so the cost basis of each decision is visible in one place; an **empty list** (no managed workloads) raises `PolicyMatched: False`. Live replica counts stay in the metric — status holds the stable mapping.
+- **`effectivePolicy` + `sources`** make the merge auditable in one place.
+- **`managedVariants`** is the policy→workload mapping (distinct from pool membership — an unmanaged pool member does not appear); `cost` is surfaced so the basis of each scaling decision is visible. *Which* workloads and *how* they are identified, and where `cost` is sourced, are the VA-deprecation proposal's (§7) — this fixes only the shape.
 
-## 5. Dependencies and open questions
+**Be explicit: phase 1 is config-only — this visibility does not exist yet.** A ConfigMap has no `.status`, so in phase 1 there is **no `kubectl get` view of the merged policy**; the resolved configuration is surfaced (if at all) by a `wva-config explain <pool>` command or a WVA-maintained status-only object, otherwise deferred. Do not expect the effective-policy surface in phase 1. **This is the concrete reason the CRD earns phase 2:** promoting to the CRD gives a **native, per-object `.status`**, plus **field-level typed validation** (`x-kubernetes-validations` walking the actual fields, vs. phase-1 string checks on the ConfigMap blob) and **`kubectl explain`**. Security is *not* on that list — RBAC + controller enforcement (§2) already secure phase 1 — so the CRD is a validation/UX/observability upgrade, taken when its cost is justified, not a prerequisite.
 
-**Depends on the VA-deprecation proposal — not decided here.** That proposal owns how WVA identifies the workloads it manages and where per-variant `cost` is sourced. This proposal fixes only the **shape** of `managedVariants` (`workloadRef`, `role`, `cost`) and is independent of the mechanism. *(For context: that proposal marks managed objects with the `llm-d.ai/managed` label on the HPA/`ScaledObject` (#1130), which WVA reads — so per-variant `cost` would co-locate there; `cost` comes from the `VariantAutoscaling` CR until then.)*
+**Open question — where the effective config is shown for a pool with no per-pool object.** Per-pool objects are optional, so a pool governed by the namespace/cluster default alone has no per-object status in phase 2 either. Candidate homes: the `InferencePool` status, a WVA status-only object per managed pool, or the `wva-config explain` view. Unresolved; the same answer serves both phases.
 
-**Open — where is the effective policy published for a pool with no per-pool object?** `effectivePolicy` / `managedVariants` are shown on the per-pool `ScalingPolicy` status — but per-pool objects are **optional** (a pool governed by the namespace/cluster default alone has none), so today the resolved policy is invisible in exactly the common case. Candidate homes: the `InferencePool` status, a WVA-maintained status-only object per managed pool, or a `wva-config explain <pool>` view. Unresolved.
+## 7. Dependencies and out of scope
 
-## 6. Deliberately out of scope (deferred to #1194)
+**Managed-set identification and per-variant cost are not decided here.** How WVA identifies the workloads it manages, and where per-replica `cost` comes from, are owned by the **VA-deprecation proposal**. For context: managed workloads are marked with the `llm-d.ai/managed` label on their `ScaledObject`, which WVA reads; per-variant `cost` comes from the `VariantAutoscaling` CR until that proposal relocates it. This proposal fixes only the **shape** of `managedVariants` and is independent of the mechanism.
 
-To hold this to the bare minimum, the following are **not** decided here and remain in #1194 for reference:
+Deferred (a later revision or companion proposal):
 
-- Migration path and the `wva-config` CLI / migration tool.
-- Deprecation phases and the ConfigMap-removal timeline.
-- The full `status` schema beyond what's defined above — the fields `effectivePolicy`, `sources`, `managedVariants` and the `PolicyMatched` condition are in scope; additional conditions, timestamps, and observed generations are deferred.
-- Per-role (prefill/decode) configuration — an analyzer-`parameters` concern, not a CRD-shape concern.
-- Alternatives considered and the autoscaler comparison matrices.
-- The `quota` `parameters` schema and enforcement — owned by #1162.
+- **Migration/tooling** — a `wva-config` CLI, ConfigMap→CRD promotion, deprecation timeline.
+- **The full `status` catalog** beyond `effectivePolicy`/`sources`/`managedVariants`/`PolicyMatched` — extra conditions, timestamps, observed generations.
+- **Per-role application** — the engine change to resolve and enforce analyzer `roleOverrides` (§5).
+- **The `quota` `parameters` schema and enforcement** — owned by the quota work (#1162 / issue #1002).
+- **Alternatives and autoscaler comparison matrices.**
 
-Once the CRD boundary (§2) and shape (§3) are agreed, these layer on top without changing either.
+Once the schema (§4), the tier resolution (§2), and the `ScaledObject` boundary (§3) are agreed, these layer on top without changing any of them — in either the ConfigMap or the CRD phase.
