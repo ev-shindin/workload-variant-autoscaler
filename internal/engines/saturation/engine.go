@@ -831,6 +831,29 @@ func (e *Engine) selectV2Optimizer(
 	return optimizer, constraints
 }
 
+// resolveRescaleFlags builds the scope-coupled rescale enablement for this cycle:
+// the cluster flag from the global saturation `default` config, plus a per-namespace
+// flag from each active namespace's OWN `default` config (never the global fallback,
+// so the cluster flag cannot enable rescale on a namespace quota).
+func (e *Engine) resolveRescaleFlags(requests []pipeline.ModelScalingRequest) pipeline.RescaleFlags {
+	flags := pipeline.RescaleFlags{Cluster: e.Config.RescaleEnabledCluster()}
+	seen := make(map[string]bool)
+	for _, req := range requests {
+		ns := req.Namespace
+		if ns == "" || seen[ns] {
+			continue
+		}
+		seen[ns] = true
+		if enabled, hasLocal := e.Config.RescaleEnabledForNamespaceLocal(ns); hasLocal && enabled {
+			if flags.ByNamespace == nil {
+				flags.ByNamespace = make(map[string]bool)
+			}
+			flags.ByNamespace[ns] = true
+		}
+	}
+	return flags
+}
+
 // optimizeV2 runs the V2 token-based optimizer path (saturation-token-based).
 // Collects AnalyzerResults for all models, calls the optimizer once, then applies enforcer per-model.
 func (e *Engine) optimizeV2(
@@ -902,6 +925,11 @@ func (e *Engine) optimizeV2(
 
 	// Stage 2: Compute GPU constraints and call optimizer
 	optimizer, constraints := e.selectV2Optimizer(ctx, requests)
+	// Scope-coupled rescale enablement (cluster + per-namespace) is resolved from
+	// config and handed to the GPU-aware optimizer for this cycle.
+	if g, ok := optimizer.(*pipeline.GreedyByScoreOptimizer); ok {
+		g.Rescale = e.resolveRescaleFlags(requests)
+	}
 	allDecisions := optimizer.Optimize(ctx, requests, constraints)
 	logScalingDecisions(ctx, requests, allDecisions)
 
