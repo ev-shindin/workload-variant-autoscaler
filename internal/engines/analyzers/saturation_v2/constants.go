@@ -31,6 +31,16 @@ const (
 	// bound on token count) since modern tokenizers achieve 5-6 chars/token.
 	BytesPerToken = 4
 
+	// DefaultEPPQueueDemandMultiplier scales the token demand estimated from
+	// the EPP scheduler queue (requests queued upstream in llm-d flow control)
+	// before it is folded into model-level demand. A value of 1.0 leaves the
+	// estimate unchanged; values > 1.0 inflate queue demand to bias the
+	// autoscaler toward earlier scale-up under upstream queue pressure.
+	//
+	// This is currently an internal, compile-time knob. A follow-up will
+	// promote it to SaturationScalingConfig so it can be tuned per model.
+	DefaultEPPQueueDemandMultiplier = 1.0
+
 	// ShortOutputThreshold is the upper bound (exclusive) for the "short"
 	// output-length bucket used for k2 history keying.
 	ShortOutputThreshold = 100

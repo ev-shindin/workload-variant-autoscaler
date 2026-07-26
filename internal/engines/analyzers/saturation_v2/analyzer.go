@@ -105,7 +105,9 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input domain.AnalyzerI
 	}
 
 	// Add scheduler queue demand (requests queued upstream in llm-d flow control).
-	queueDemand := estimateSchedulerQueueDemand(input.SchedulerQueue, input.ReplicaMetrics, activeRoles)
+	// The EPP queue demand multiplier is an internal knob for now; a follow-up
+	// will source it from satConfig.
+	queueDemand := estimateSchedulerQueueDemand(input.SchedulerQueue, input.ReplicaMetrics, activeRoles, DefaultEPPQueueDemandMultiplier)
 	totalDemand += queueDemand.total
 
 	var utilization float64
@@ -604,6 +606,7 @@ func estimateSchedulerQueueDemand(
 	sq *domain.SchedulerQueueMetrics,
 	replicaMetrics []domain.ReplicaMetrics,
 	activeRoles map[string]bool,
+	demandMultiplier float64,
 ) schedulerQueueDemand {
 	if sq == nil || (sq.QueueSize == 0 && sq.QueueBytes == 0) {
 		return schedulerQueueDemand{}
@@ -625,6 +628,13 @@ func estimateSchedulerQueueDemand(
 
 	// Estimate output tokens (no cache reduction — output must be generated)
 	outputTokens := float64(sq.QueueSize) * avgOutput
+
+	// Apply the EPP queue demand multiplier to both token components so the
+	// model-level total and per-role attribution scale consistently. The
+	// multiplier is currently an internal knob (DefaultEPPQueueDemandMultiplier);
+	// a value of 1.0 is a no-op.
+	inputTokens *= demandMultiplier
+	outputTokens *= demandMultiplier
 
 	total := inputTokens + outputTokens
 

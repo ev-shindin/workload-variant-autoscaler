@@ -661,7 +661,7 @@ var _ = Describe("SaturationAnalyzer", func() {
 				QueueBytes: 0, // use count-based estimation only
 			}
 
-			result := estimateSchedulerQueueDemand(sq, metrics, activeRoles)
+			result := estimateSchedulerQueueDemand(sq, metrics, activeRoles, DefaultEPPQueueDemandMultiplier)
 
 			// Input: max(0/4=0, 10*100=1000) = 1000 (no cache hit)
 			// Output: 10 * 50 = 500
@@ -685,10 +685,32 @@ var _ = Describe("SaturationAnalyzer", func() {
 				QueueBytes: 0,
 			}
 
-			result := estimateSchedulerQueueDemand(sq, metrics, activeRoles)
+			result := estimateSchedulerQueueDemand(sq, metrics, activeRoles, DefaultEPPQueueDemandMultiplier)
 
 			Expect(result.total).To(Equal(1500.0))
 			Expect(result.byRole["both"]).To(Equal(1500.0))
+		})
+
+		It("should scale total and per-role demand by the EPP queue multiplier", func() {
+			metrics := []domain.ReplicaMetrics{
+				makeReplicaMetrics("pod-1", "variant-a", "H100", 10.0,
+					5000, 16000, 0, 100, 50),
+			}
+			activeRoles := map[string]bool{"prefill": true, "decode": true}
+			sq := &domain.SchedulerQueueMetrics{
+				QueueSize:  10,
+				QueueBytes: 0, // count-based estimation only
+			}
+
+			// Baseline (multiplier 1.0): input=1000, output=500, total=1500.
+			// With a 2.0 multiplier every component doubles.
+			result := estimateSchedulerQueueDemand(sq, metrics, activeRoles, 2.0)
+
+			Expect(result.total).To(Equal(3000.0))
+			// Prefill gets scaled inputTokens only (1000 * 2)
+			Expect(result.byRole["prefill"]).To(Equal(2000.0))
+			// Decode gets scaled inputTokens + outputTokens ((1000 + 500) * 2)
+			Expect(result.byRole["decode"]).To(Equal(3000.0))
 		})
 
 		It("should return empty byRole when nil activeRoles", func() {
@@ -701,7 +723,7 @@ var _ = Describe("SaturationAnalyzer", func() {
 				QueueBytes: 0,
 			}
 
-			result := estimateSchedulerQueueDemand(sq, metrics, nil)
+			result := estimateSchedulerQueueDemand(sq, metrics, nil, DefaultEPPQueueDemandMultiplier)
 
 			Expect(result.total).To(Equal(1500.0))
 			Expect(result.byRole).To(BeEmpty())
@@ -714,7 +736,7 @@ var _ = Describe("SaturationAnalyzer", func() {
 			}
 			activeRoles := map[string]bool{"prefill": true, "decode": true}
 
-			result := estimateSchedulerQueueDemand(nil, metrics, activeRoles)
+			result := estimateSchedulerQueueDemand(nil, metrics, activeRoles, DefaultEPPQueueDemandMultiplier)
 
 			Expect(result.total).To(Equal(0.0))
 			Expect(result.byRole).To(BeNil())
@@ -737,7 +759,7 @@ var _ = Describe("SaturationAnalyzer", func() {
 				QueueBytes: 0,
 			}
 
-			result := estimateSchedulerQueueDemand(sq, metrics, activeRoles)
+			result := estimateSchedulerQueueDemand(sq, metrics, activeRoles, DefaultEPPQueueDemandMultiplier)
 
 			// Input: 10*100=1000, after cache: 1000*(1-0.5)=500
 			// Output: 10*50=500
