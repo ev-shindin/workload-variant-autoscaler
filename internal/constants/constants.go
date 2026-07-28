@@ -115,6 +115,7 @@ const (
 	K8SEventScaledToZero              = "ScaledToZero"
 	K8SEventOptimizationFailed        = "OptimizationFailed"
 	K8SEventUnattributedReadyPods     = "UnattributedReadyPods"
+	K8SEventRescaleStalled            = "RescaleStalled"
 	EnforcerPolicyTypeScaleToZero     = "scale_to_zero"
 	EnforcerPolicyTypeMinimumReplicas = "minimum_replicas"
 

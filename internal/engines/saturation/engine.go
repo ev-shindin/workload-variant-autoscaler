@@ -516,8 +516,9 @@ func modeLabelForAnalyzer(analyzerName string) string {
 }
 
 // recordEvent ensures only one event is recorded per VA in an optimization cycle.
-// Exception: K8SEventResourceConstrained events bypass deduplication and can be
-// recorded alongside other event types (e.g., ScaledUp + ResourceConstrained).
+// Exception: K8SEventResourceConstrained and K8SEventRescaleStalled bypass
+// deduplication and can be recorded alongside another event type (e.g., a scaling
+// event) — both are Warnings that describe a constraint on top of the scaling action.
 func (e *Engine) recordEvent(
 	va *llmdVariantAutoscalingV1alpha1.VariantAutoscaling,
 	eventType, reason, message string,
@@ -526,8 +527,9 @@ func (e *Engine) recordEvent(
 		return
 	}
 
-	if reason == constants.K8SEventResourceConstrained {
-		// This is the only exception where a variant can have 2 K8S events in an optimize cycle: K8SEventScaledUp & K8SEventResourceConstrained
+	if reason == constants.K8SEventResourceConstrained || reason == constants.K8SEventRescaleStalled {
+		// The only exceptions where a variant can have 2 K8S events in an optimize
+		// cycle: a scaling event plus ResourceConstrained or RescaleStalled.
 		e.Recorder.Event(va, eventType, reason, message)
 		return
 	}
@@ -1627,6 +1629,15 @@ func (e *Engine) applySaturationDecisions(
 				"Optimization loop ran (no scaling change needed)")
 		}
 
+		// Surface the priority-weighted rescale outcome (Beta observability): the
+		// Rescaled condition records the model's priority, its water-fill share vs
+		// current allocation, the budget scope, and the direction taken. A reclaim
+		// that could not shed a whole replica (stall) is additionally emitted as a
+		// Warning event so operators see redistribution is blocked without reading logs.
+		if hasDecision && decision.Rescale != nil {
+			e.setRescaledCondition(ctx, &updateVa, decision.Rescale)
+		}
+
 		// Emit metrics for external autoscalers (Important: Actuator emits these)
 		// We should emit metrics even if no decision changed, to keep HPA alive
 		act := actuator.NewActuator(e.client)
@@ -1711,6 +1722,39 @@ func (e *Engine) applySaturationDecisions(
 				"target", targetReplicas,
 				"reason", reason)
 		}
+	}
+}
+
+// setRescaledCondition records the priority-weighted rescale outcome on a variant:
+// the Rescaled status condition (reason = Reclaim/Fill/Hold, or Stalled when a
+// reclaim could not shed a whole replica) with a message carrying the model's
+// priority, water-fill share, current allocation, and budget scope. A stall also
+// emits a Warning event and a log line so blocked redistribution is visible.
+func (e *Engine) setRescaledCondition(
+	ctx context.Context,
+	va *llmdVariantAutoscalingV1alpha1.VariantAutoscaling,
+	info *domain.RescaleDecisionInfo,
+) {
+	reason := llmdVariantAutoscalingV1alpha1.ReasonRescaleHold
+	switch {
+	case info.Stalled:
+		reason = llmdVariantAutoscalingV1alpha1.ReasonRescaleStalled
+	case info.Action == domain.RescaleActionReclaim:
+		reason = llmdVariantAutoscalingV1alpha1.ReasonRescaleReclaim
+	case info.Action == domain.RescaleActionFill:
+		reason = llmdVariantAutoscalingV1alpha1.ReasonRescaleFill
+	}
+	msg := fmt.Sprintf("priority-weighted rescale (%s): priority=%g share=%dGPU current=%dGPU scope=%s",
+		info.Action, info.Priority, info.TargetGPUs, info.CurrentGPUs, info.Scope)
+	llmdVariantAutoscalingV1alpha1.SetCondition(va,
+		llmdVariantAutoscalingV1alpha1.TypeRescaled, metav1.ConditionTrue, reason, msg)
+
+	if info.Stalled {
+		e.recordEvent(va, corev1.EventTypeWarning, constants.K8SEventRescaleStalled,
+			"rescale could not shed a whole replica to reach the priority-weighted share: "+msg)
+		ctrl.LoggerFrom(ctx).Info("rescale reclaim stalled (role could not shed a whole replica)",
+			"variant", va.Name, "namespace", va.Namespace,
+			"share", info.TargetGPUs, "current", info.CurrentGPUs, "scope", info.Scope)
 	}
 }
 

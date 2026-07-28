@@ -218,6 +218,36 @@ type DecisionStep struct {
 	Timestamp metav1.Time
 }
 
+// RescaleDecisionInfo is the observability payload attached to a decision produced
+// by the priority-weighted rescale pass. It records the model-level view that drove
+// the per-variant decision — priority, the water-fill share (TargetGPUs) vs current
+// allocation, the budget scope, the direction taken, and whether a reclaim stalled
+// (a role could not shed a whole replica, so the model stays above its share). It is
+// nil on every non-rescale decision.
+type RescaleDecisionInfo struct {
+	// Priority is the model's priority multiplier used in the weight.
+	Priority float64
+	// TargetGPUs is the model's priority-weighted water-fill share, in whole GPUs.
+	TargetGPUs int
+	// CurrentGPUs is the model's current allocation on the group's accelerator type.
+	CurrentGPUs int
+	// Scope is the budget scope the model competes in: "cluster" or a namespace name.
+	Scope string
+	// Action is the rescale direction for this model this cycle: "reclaim", "fill",
+	// or "hold" (within its share, or suppressed by hysteresis).
+	Action string
+	// Stalled is true when a reclaim could not shed a whole replica it owed (blocked
+	// by minReplicas or the cheapest-at-1 protection), so the model remains over-share.
+	Stalled bool
+}
+
+// Rescale direction constants for RescaleDecisionInfo.Action.
+const (
+	RescaleActionReclaim = "reclaim"
+	RescaleActionFill    = "fill"
+	RescaleActionHold    = "hold"
+)
+
 // VariantDecision represents the scaling decision for a single variant.
 //
 // This type serves as shared state that flows through the decision pipeline.
@@ -286,6 +316,11 @@ type VariantDecision struct {
 	// DecisionSteps records each pipeline stage's contribution to the final decision.
 	// This replaces the single Reason field with structured multi-step tracking.
 	DecisionSteps []DecisionStep
+
+	// Rescale carries the priority-weighted rescale observability payload when this
+	// decision was produced by the rescale pass; nil otherwise. The engine surfaces
+	// it as the Rescaled status condition and a stall event.
+	Rescale *RescaleDecisionInfo
 
 	// decisionReason is the categorized reason used for Prometheus metric labels.
 	// Set via SetDecisionReason along with the detailed reason string.

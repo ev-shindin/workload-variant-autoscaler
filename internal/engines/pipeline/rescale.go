@@ -302,9 +302,14 @@ func (o *GreedyByScoreOptimizer) applyRescale(
 			}
 		}
 
+		scope := "cluster"
+		if k.scope != "" {
+			scope = k.scope
+		}
+
 		freeThisCycle := fillable
 		for _, req := range reqs {
-			d := o.rescaleModelDecisions(ctx, req, k.accType, targets[modelKey(req)], &freeThisCycle)
+			d := o.rescaleModelDecisions(ctx, req, k.accType, scope, targets[modelKey(req)], &freeThisCycle)
 			decisions = append(decisions, d...)
 			handled[modelKey(req)] = true
 		}
@@ -332,10 +337,14 @@ func (o *GreedyByScoreOptimizer) applyRescale(
 // rescaleModelDecisions drives one model to targetGPUs on accType: reclaim (shed
 // most-expensive-first, respecting minReplicas) or fill (add most-cost-efficient
 // first, gated on *freeThisCycle). Reclaim decisions are tagged DecisionReasonRescale.
+// scope is the model's budget scope ("cluster" or a namespace) for observability.
+// Every decision it returns carries a *domain.RescaleDecisionInfo summarising the
+// model's priority, share (targetGPUs) vs current, direction, and reclaim-stall state.
 func (o *GreedyByScoreOptimizer) rescaleModelDecisions(
 	ctx context.Context,
 	req ModelScalingRequest,
 	accType string,
+	scope string,
 	targetGPUs int,
 	freeThisCycle *int,
 ) []domain.VariantDecision {
@@ -351,18 +360,27 @@ func (o *GreedyByScoreOptimizer) rescaleModelDecisions(
 	curByRole := make(map[string]int, len(roles))
 	demByRole := make(map[string]int, len(roles))
 	floorByRole := make(map[string]int, len(roles))
+	modelCurrent := 0
 	for _, role := range roles {
 		curByRole[role] = roleCurrentGPUs(req, accType, role)
 		demByRole[role] = roleDemandGPUs(satEntry, stateMap, accType, role)
 		floorByRole[role] = roleFloorGPUs(req, accType, role)
+		modelCurrent += curByRole[role]
 	}
 	tgtByRole := distributeGPUsByWeight(targetGPUs, roles, demByRole, curByRole, floorByRole)
 
+	stalled := false
 	for _, role := range roles {
 		rt, rc := tgtByRole[role], curByRole[role]
 		switch {
 		case rt < rc:
-			reclaimRole(ctx, req.AnalyzerResults, satEntry.VariantCapacities, role, stateMap, targets, rc-rt)
+			unshed := reclaimRole(ctx, req.AnalyzerResults, satEntry.VariantCapacities, role, stateMap, targets, rc-rt)
+			// A whole-replica-sized shortfall means a role that owed a reclaim could
+			// not shed even one replica (blocked by minReplicas / cheapest-at-1); a
+			// smaller leftover is just sub-replica quantization, not a stall.
+			if gMin := roleMinGPUsPerReplica(satEntry.VariantCapacities, role, stateMap); gMin > 0 && unshed >= gMin {
+				stalled = true
+			}
 		case rt > rc:
 			want := rt - rc
 			if want > *freeThisCycle {
@@ -372,18 +390,56 @@ func (o *GreedyByScoreOptimizer) rescaleModelDecisions(
 		}
 	}
 
+	info := &domain.RescaleDecisionInfo{
+		Priority:    req.Priority,
+		TargetGPUs:  targetGPUs,
+		CurrentGPUs: modelCurrent,
+		Scope:       scope,
+		Action:      rescaleAction(targetGPUs, modelCurrent),
+		Stalled:     stalled,
+	}
+
 	decisions := buildDecisionsWithOptimizer(req, stateMap, vcMap, targets, "rescale")
 	for i := range decisions {
 		if decisions[i].Action == domain.ActionScaleDown {
 			decisions[i].SetDecisionReason(domain.ActionScaleDown, domain.DecisionReasonRescale,
 				string(domain.DecisionReasonRescale)+" (optimizer: rescale, reclaim)")
 		}
+		// Share the immutable model-level summary across the model's variant decisions.
+		decisions[i].Rescale = info
 	}
 	return decisions
 }
 
+// rescaleAction classifies a model's rescale direction from its share vs current.
+func rescaleAction(targetGPUs, currentGPUs int) string {
+	switch {
+	case targetGPUs < currentGPUs:
+		return domain.RescaleActionReclaim
+	case targetGPUs > currentGPUs:
+		return domain.RescaleActionFill
+	default:
+		return domain.RescaleActionHold
+	}
+}
+
+// roleMinGPUsPerReplica is the smallest positive gpusPerReplica among a role's
+// variants on accType — the size of the smallest replica the role could shed.
+func roleMinGPUsPerReplica(variants []domain.VariantCapacity, role string, stateMap map[string]domain.VariantReplicaState) int {
+	minG := 0
+	for _, vc := range variantsForRole(variants, role) {
+		g := gpusPerReplicaFromState(stateMap, vc.VariantName)
+		if g > 0 && (minG == 0 || g < minG) {
+			minG = g
+		}
+	}
+	return minG
+}
+
 // reclaimRole sheds up to deltaGPUs worth of a role's replicas, most-expensive-first,
 // respecting minReplicas and the cheapest-at-1 protection, via scaleDownVariantSet.
+// It returns the GPUs it could NOT shed (the shortfall, >= 0): a value at least one
+// whole replica in size signals a reclaim stall.
 func reclaimRole(
 	ctx context.Context,
 	s []NamedAnalyzerResult,
@@ -392,7 +448,7 @@ func reclaimRole(
 	stateMap map[string]domain.VariantReplicaState,
 	targets map[string]int,
 	deltaGPUs int,
-) {
+) int {
 	remaining := deltaGPUs
 	sorted := sortVariantsForScaleDown(s, variantsForRole(variants, role))
 	scaleDownVariantSet(ctx, sorted, targets, stateMap,
@@ -407,6 +463,7 @@ func reclaimRole(
 			remaining -= n * gpusPerReplicaFromState(stateMap, vc.VariantName)
 		},
 	)
+	return remaining
 }
 
 // fillRole adds up to wantGPUs worth of a role's replicas, most-cost-efficient-first,

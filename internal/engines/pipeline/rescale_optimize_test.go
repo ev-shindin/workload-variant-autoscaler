@@ -681,3 +681,85 @@ var _ = Describe("GreedyByScoreOptimizer rescale", func() {
 		Expect(dm["B-v"].TargetReplicas).To(BeNumerically(">=", 2), "not reclaimed below current in Conflict")
 	})
 })
+
+var _ = Describe("GreedyByScoreOptimizer rescale observability (Beta)", func() {
+	// Every decision from a rescale group carries a *RescaleDecisionInfo summary:
+	// the reclaimed model reports its priority, share vs current, scope, and direction.
+	It("attaches priority/share info to reclaim and fill decisions", func() {
+		o := NewGreedyByScoreOptimizer()
+		o.Rescale = RescaleFlags{Cluster: true}
+		reqs := []ModelScalingRequest{
+			rescaleReq("A", "default", 1, 8000, 8),
+			rescaleReq("B", "default", 3, 8000, 0),
+		}
+		cons := []*ResourceConstraints{{Pools: map[string]ResourcePool{"A100": {Limit: 8, Used: 8}}}}
+		dm := decisionMap(o.Optimize(context.Background(), reqs, cons))
+
+		ra := dm["A-v"].Rescale
+		Expect(ra).NotTo(BeNil())
+		Expect(ra.Action).To(Equal(domain.RescaleActionReclaim))
+		Expect(ra.Priority).To(Equal(1.0))
+		Expect(ra.TargetGPUs).To(Equal(2), "water-fill share")
+		Expect(ra.CurrentGPUs).To(Equal(8))
+		Expect(ra.Scope).To(Equal("cluster"))
+		Expect(ra.Stalled).To(BeFalse())
+
+		rb := dm["B-v"].Rescale
+		Expect(rb).NotTo(BeNil())
+		Expect(rb.Action).To(Equal(domain.RescaleActionFill), "B is under its share")
+		Expect(rb.TargetGPUs).To(Equal(6))
+		Expect(rb.Scope).To(Equal("cluster"))
+	})
+
+	// A namespace-quota group reports the namespace as its scope.
+	It("reports the namespace as scope for a namespace-quota group", func() {
+		o := NewGreedyByScoreOptimizer()
+		o.Rescale = RescaleFlags{ByNamespace: map[string]bool{"team": true}}
+		reqs := []ModelScalingRequest{
+			nsModelReq("A", "team", "A-v", 1, 8000, 8),
+			nsModelReq("B", "team", "B-v", 3, 8000, 0),
+		}
+		cons := []*ResourceConstraints{{
+			Pools:          map[string]ResourcePool{"A100": {Limit: 8, Used: 8}},
+			NamespacePools: map[string]map[string]ResourcePool{"team": {"A100": {Limit: 8, Used: 8}}},
+		}}
+		dm := decisionMap(o.Optimize(context.Background(), reqs, cons))
+		Expect(dm["A-v"].Rescale).NotTo(BeNil())
+		Expect(dm["A-v"].Rescale.Scope).To(Equal("team"))
+	})
+
+	// Stall: A holds a single, cheapest-at-1-protected replica whose water-fill share
+	// rounds to 0 (zero demand ⇒ zero weight). Reclaim owes one whole replica but the
+	// last replica is protected, so it cannot shed it — the info reports Stalled.
+	It("flags a reclaim that cannot shed a whole replica as stalled", func() {
+		o := NewGreedyByScoreOptimizer()
+		o.Rescale = RescaleFlags{Cluster: true}
+		reqs := []ModelScalingRequest{
+			rescaleReq("A", "default", 1, 0, 1),    // no demand ⇒ weight 0 ⇒ share 0, but holds 1 protected replica
+			rescaleReq("B", "default", 5, 8000, 3), // high priority, hungry
+		}
+		cons := []*ResourceConstraints{{Pools: map[string]ResourcePool{"A100": {Limit: 4, Used: 4}}}}
+		dm := decisionMap(o.Optimize(context.Background(), reqs, cons))
+
+		ra := dm["A-v"].Rescale
+		Expect(ra).NotTo(BeNil())
+		Expect(ra.Action).To(Equal(domain.RescaleActionReclaim), "share 0 < current 1")
+		Expect(ra.TargetGPUs).To(Equal(0))
+		Expect(ra.CurrentGPUs).To(Equal(1))
+		Expect(ra.Stalled).To(BeTrue(), "cheapest-at-1 blocks shedding the last replica")
+		Expect(dm["A-v"].TargetReplicas).To(Equal(1), "A stays at its protected replica")
+	})
+
+	// Rescale off ⇒ no info attached (nil), regardless of contention.
+	It("attaches no info when rescale is off", func() {
+		o := NewGreedyByScoreOptimizer()
+		reqs := []ModelScalingRequest{
+			rescaleReq("A", "default", 1, 8000, 8),
+			rescaleReq("B", "default", 3, 8000, 0),
+		}
+		cons := []*ResourceConstraints{{Pools: map[string]ResourcePool{"A100": {Limit: 8, Used: 8}}}}
+		dm := decisionMap(o.Optimize(context.Background(), reqs, cons))
+		Expect(dm["A-v"].Rescale).To(BeNil())
+		Expect(dm["B-v"].Rescale).To(BeNil())
+	})
+})

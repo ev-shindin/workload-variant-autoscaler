@@ -111,6 +111,24 @@ const (
 	TypeMetricsAvailable = "MetricsAvailable"
 	// TypeOptimizationReady indicates whether the optimization engine can run successfully
 	TypeOptimizationReady = "OptimizationReady"
+	// TypeRescaled indicates the variant participated in a priority-weighted rescale
+	// group this cycle (set only when rescale acted on the model). See the Rescale*
+	// reason constants below.
+	TypeRescaled = "Rescaled"
+)
+
+// Condition Reasons for the Rescaled condition (priority-weighted rescale, #1447).
+const (
+	// ReasonRescaleReclaim indicates rescale reclaimed GPUs from this over-share model.
+	ReasonRescaleReclaim = "Reclaim"
+	// ReasonRescaleFill indicates rescale filled this under-share model with free GPUs.
+	ReasonRescaleFill = "Fill"
+	// ReasonRescaleHold indicates the model is within its share (or hysteresis held it),
+	// so rescale made no change this cycle.
+	ReasonRescaleHold = "Hold"
+	// ReasonRescaleStalled indicates a reclaim could not shed a whole replica (blocked
+	// by minReplicas or the cheapest-at-1 protection), so the model stays over its share.
+	ReasonRescaleStalled = "Stalled"
 )
 
 // Condition Reasons for MetricsAvailable
