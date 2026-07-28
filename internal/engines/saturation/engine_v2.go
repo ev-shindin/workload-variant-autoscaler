@@ -167,7 +167,7 @@ func (e *Engine) runAnalyzersAndScore(
 // fair-share priority ordering across models.
 func scoreForAnalyzer(analyzerName string, cfg config.SaturationScalingConfig) float64 {
 	for _, aw := range cfg.Analyzers {
-		if aw.Name == analyzerName {
+		if aw.EffectiveType() == analyzerName {
 			if aw.Score > 0 {
 				return aw.Score
 			}
@@ -179,7 +179,7 @@ func scoreForAnalyzer(analyzerName string, cfg config.SaturationScalingConfig) f
 
 func resolveThresholds(analyzerName string, cfg config.SaturationScalingConfig) (scaleUp, scaleDown float64) {
 	for _, aw := range cfg.Analyzers {
-		if aw.Name == analyzerName {
+		if aw.EffectiveType() == analyzerName {
 			return aw.EffectiveScaleUpThreshold(cfg.ScaleUpThreshold),
 				aw.EffectiveScaleDownBoundary(cfg.ScaleDownBoundary)
 		}
@@ -192,7 +192,7 @@ func resolveThresholds(analyzerName string, cfg config.SaturationScalingConfig) 
 // pointers default to true (consistent with ApplyDefaults).
 func effectiveEnabled(analyzerName string, cfg config.SaturationScalingConfig) bool {
 	for _, aw := range cfg.Analyzers {
-		if aw.Name == analyzerName {
+		if aw.EffectiveType() == analyzerName {
 			if aw.Enabled != nil {
 				return *aw.Enabled
 			}
