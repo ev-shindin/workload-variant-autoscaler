@@ -26,10 +26,11 @@ allocation by arrival order once the budget is full.
   reclaims.
 
 **Deferred**
+- **Observability** (`Rescaled` status condition, surfacing a reclaim **stall** when a role can't
+  shed a whole replica) + **hysteresis** (min share-gap / cool-down) → **Beta** (delivered; see
+  `docs/plans/engine/rescale-beta.md`).
 - Physical∧quota **namespace partition** of the cluster budget → needs #1003.
 - **Multi-accelerator** models (variants spanning GPU types) → future scope.
-- **Observability** (`Rescaled` status condition, surfacing a reclaim **stall** when a role can't
-  shed a whole replica) + **hysteresis** (min share-gap / cool-down) → Beta.
 
 ## Flag semantics — scope-coupled to the budget
 
