@@ -19,6 +19,36 @@ var _ = Describe("SaturationScalingConfig enableRescale", func() {
 		Entry("explicit false", "enableRescale: false\n", false),
 	)
 
+	// Locks the Beta hysteresis yaml tags and their zero defaults.
+	DescribeTable("hysteresis knob parsing",
+		func(doc string, wantGap, wantCooldown int) {
+			var cfg SaturationScalingConfig
+			Expect(yaml.Unmarshal([]byte(doc), &cfg)).To(Succeed())
+			Expect(cfg.RescaleMinShareGapGPUs).To(Equal(wantGap))
+			Expect(cfg.RescaleCooldownSeconds).To(Equal(wantCooldown))
+		},
+		Entry("absent defaults zero", "kvCacheThreshold: 0.8\n", 0, 0),
+		Entry("explicit values", "rescaleMinShareGapGPUs: 2\nrescaleCooldownSeconds: 90\n", 2, 90),
+	)
+
+	// Negative knob values are rejected by Validate.
+	DescribeTable("hysteresis knob validation",
+		func(gap, cooldown int, wantErr bool) {
+			cfg := SaturationScalingConfig{RescaleMinShareGapGPUs: gap, RescaleCooldownSeconds: cooldown}
+			cfg.ApplyDefaults()
+			err := cfg.Validate()
+			if wantErr {
+				Expect(err).To(HaveOccurred())
+			} else {
+				Expect(err).NotTo(HaveOccurred())
+			}
+		},
+		Entry("both zero ok", 0, 0, false),
+		Entry("positive ok", 1, 60, false),
+		Entry("negative gap rejected", -1, 0, true),
+		Entry("negative cooldown rejected", 0, -1, true),
+	)
+
 	// enableRescale is budget-scoped: it is read only from the global/namespace
 	// `default` entry and must NOT be settable via a per-model override, so Merge()
 	// deliberately ignores it. This locks that exclusion against an accidental
@@ -63,5 +93,34 @@ var _ = Describe("rescale flag accessors", func() {
 		en, has := c.RescaleEnabledForNamespaceLocal("absent")
 		Expect(has).To(BeFalse())
 		Expect(en).To(BeFalse())
+	})
+
+	It("reads cluster hysteresis knobs from the global default", func() {
+		c.UpdateSaturationConfig(map[string]SaturationScalingConfig{
+			"default": {EnableRescale: true, RescaleMinShareGapGPUs: 2, RescaleCooldownSeconds: 90},
+		})
+		t := c.RescaleTuningCluster()
+		Expect(t.Enabled).To(BeTrue())
+		Expect(t.MinShareGapGPUs).To(Equal(2))
+		Expect(t.CooldownSeconds).To(Equal(90))
+	})
+
+	It("reads namespace-local hysteresis knobs without global fallback", func() {
+		c.UpdateSaturationConfig(map[string]SaturationScalingConfig{
+			"default": {EnableRescale: true, RescaleMinShareGapGPUs: 5, RescaleCooldownSeconds: 120},
+		})
+		c.UpdateSaturationConfigForNamespace("team", map[string]SaturationScalingConfig{
+			"default": {EnableRescale: true, RescaleMinShareGapGPUs: 1},
+		})
+		t, has := c.RescaleTuningForNamespaceLocal("team")
+		Expect(has).To(BeTrue())
+		Expect(t.Enabled).To(BeTrue())
+		Expect(t.MinShareGapGPUs).To(Equal(1), "namespace-local value, not the global 5")
+		Expect(t.CooldownSeconds).To(Equal(0), "unset namespace-local knob must not fall back to global")
+	})
+
+	It("reports no tuning for an unconfigured namespace", func() {
+		_, has := c.RescaleTuningForNamespaceLocal("absent")
+		Expect(has).To(BeFalse())
 	})
 })

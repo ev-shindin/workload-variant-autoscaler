@@ -45,3 +45,13 @@ data:
     # that namespace's quota budget. Has no effect without a same-scope GPU budget
     # (requires enableLimiter and a matching cluster/namespace budget).
     enableRescale: false
+    # Rescale hysteresis (Beta) — damps oscillation when demand hovers around the
+    # contention threshold. Both are budget-scope (read only from this `default`
+    # entry, same as enableRescale) and default 0, which preserves the plain
+    # whole-replica behavior. rescaleMinShareGapGPUs is a deadband in whole GPUs:
+    # a model is held at its current allocation when its target-vs-current gap is
+    # smaller than this. rescaleCooldownSeconds suppresses a repeat reclaim from a
+    # model until this many seconds after its last reclaim (fills are never cooled
+    # down). Recommended when enabling rescale in production: gap 1, cooldown ~60.
+    rescaleMinShareGapGPUs: 0
+    rescaleCooldownSeconds: 0

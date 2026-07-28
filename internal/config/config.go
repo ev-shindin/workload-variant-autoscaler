@@ -419,30 +419,65 @@ func (c *Config) SaturationConfigForNamespace(namespace string) map[string]Satur
 	return copySaturationConfig(sourceConfig)
 }
 
-// RescaleEnabledForNamespaceLocal reports the EnableRescale flag from a namespace's
-// OWN saturation config `default` entry, and whether that namespace has its own
+// RescaleTuning is the scope-coupled rescale configuration read from a single
+// saturation config `default` entry: whether rescale is enabled at that budget
+// scope, plus the Beta hysteresis knobs. All fields come from the same "default"
+// entry, so they share the budget-scope semantics documented on EnableRescale.
+type RescaleTuning struct {
+	// Enabled mirrors EnableRescale for this scope.
+	Enabled bool
+	// MinShareGapGPUs is the hysteresis deadband in whole GPUs (0 = off).
+	MinShareGapGPUs int
+	// CooldownSeconds is the per-model reclaim cool-down in seconds (0 = off).
+	CooldownSeconds int
+}
+
+func rescaleTuningFrom(c SaturationScalingConfig) RescaleTuning {
+	return RescaleTuning{
+		Enabled:         c.EnableRescale,
+		MinShareGapGPUs: c.RescaleMinShareGapGPUs,
+		CooldownSeconds: c.RescaleCooldownSeconds,
+	}
+}
+
+// RescaleTuningCluster returns the rescale tuning from the global saturation config
+// `default` entry — the cluster-budget scope.
+func (c *Config) RescaleTuningCluster() RescaleTuning {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return rescaleTuningFrom(c.saturation.global["default"])
+}
+
+// RescaleTuningForNamespaceLocal returns the rescale tuning from a namespace's OWN
+// saturation config `default` entry, and whether that namespace has its own
 // (non-global) config. It intentionally does NOT fall back to the global config: the
-// scope-coupled rescale flag for a namespace quota is governed only by that
-// namespace's own config, so the cluster (global) flag never leaks onto it.
-func (c *Config) RescaleEnabledForNamespaceLocal(namespace string) (enabled bool, hasLocal bool) {
+// scope-coupled rescale flag and knobs for a namespace quota are governed only by
+// that namespace's own config, so the cluster (global) settings never leak onto it.
+func (c *Config) RescaleTuningForNamespaceLocal(namespace string) (RescaleTuning, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if namespace == "" {
-		return false, false
+		return RescaleTuning{}, false
 	}
 	nsCfg, ok := c.saturation.namespaceConfigs[namespace]
 	if !ok || len(nsCfg) == 0 {
-		return false, false
+		return RescaleTuning{}, false
 	}
-	return nsCfg["default"].EnableRescale, true
+	return rescaleTuningFrom(nsCfg["default"]), true
+}
+
+// RescaleEnabledForNamespaceLocal reports the EnableRescale flag from a namespace's
+// OWN saturation config `default` entry, and whether that namespace has its own
+// (non-global) config. Convenience wrapper over RescaleTuningForNamespaceLocal.
+func (c *Config) RescaleEnabledForNamespaceLocal(namespace string) (enabled bool, hasLocal bool) {
+	t, has := c.RescaleTuningForNamespaceLocal(namespace)
+	return t.Enabled, has
 }
 
 // RescaleEnabledCluster reports the EnableRescale flag from the global saturation
 // config `default` entry — the cluster-budget scope.
 func (c *Config) RescaleEnabledCluster() bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.saturation.global["default"].EnableRescale
+	return c.RescaleTuningCluster().Enabled
 }
 
 // copySaturationConfig creates a deep copy of the saturation config map.

@@ -45,6 +45,26 @@ type SaturationScalingConfig struct {
 	// (see docs/plans/engine/rescale-alpha.md).
 	EnableRescale bool `yaml:"enableRescale,omitempty"`
 
+	// RescaleMinShareGapGPUs is the Beta hysteresis deadband, in whole GPUs: rescale
+	// holds a model at its current allocation this cycle when the target-vs-current
+	// GPU gap is smaller than this value, so a model whose water-fill share drifts by
+	// a GPU or two around the contention threshold does not flap up and down. Default
+	// 0 (whole-replica quantization is the only damping — the Alpha behavior).
+	//
+	// Same BUDGET-SCOPE semantics as EnableRescale: read only from the "default"
+	// entry; global governs the cluster budget, a namespace-local "default" governs
+	// that namespace's quota budget. No effect unless rescale is enabled at that scope.
+	RescaleMinShareGapGPUs int `yaml:"rescaleMinShareGapGPUs,omitempty"`
+
+	// RescaleCooldownSeconds is the Beta per-model reclaim cool-down, in seconds:
+	// after rescale reclaims GPUs from a model, it will not reclaim from that model
+	// again until this much time has elapsed (fills are never cooled down — genuinely
+	// free GPUs still flow to higher-priority work). Damps time-based oscillation.
+	// Default 0 (no cool-down — the Alpha behavior).
+	//
+	// Same BUDGET-SCOPE semantics as EnableRescale (see above).
+	RescaleCooldownSeconds int `yaml:"rescaleCooldownSeconds,omitempty"`
+
 	// AnalyzerName selects which saturation analyzer to use.
 	// "saturation" uses the V2 token-based analyzer.
 	// Empty string (default) uses the V1 percentage-based analyzer.
@@ -263,6 +283,12 @@ func (c *SaturationScalingConfig) Validate() error {
 	}
 	if c.Priority < 0 {
 		return fmt.Errorf("priority must be >= 0, got %.2f", c.Priority)
+	}
+	if c.RescaleMinShareGapGPUs < 0 {
+		return fmt.Errorf("rescaleMinShareGapGPUs must be >= 0, got %d", c.RescaleMinShareGapGPUs)
+	}
+	if c.RescaleCooldownSeconds < 0 {
+		return fmt.Errorf("rescaleCooldownSeconds must be >= 0, got %d", c.RescaleCooldownSeconds)
 	}
 
 	// KV cache threshold should be greater than spare trigger (otherwise contradictory)
