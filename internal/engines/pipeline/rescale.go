@@ -6,6 +6,7 @@ import (
 	"maps"
 	"math"
 	"slices"
+	"time"
 
 	ctrl "sigs.k8s.io/controller-runtime"
 
@@ -22,15 +23,30 @@ func modelKey(req ModelScalingRequest) string {
 	return utils.GetNamespacedKey(req.Namespace, req.ModelID)
 }
 
-// RescaleFlags carries the resolved, scope-coupled rescale enablement for one
-// optimize cycle. Cluster governs the cluster budget group; ByNamespace[ns]
-// governs namespace ns's quota budget group. The zero value disables rescale.
-type RescaleFlags struct {
-	Cluster     bool
-	ByNamespace map[string]bool
+// RescaleTuning carries the Beta hysteresis knobs for one budget scope. The zero
+// value disables both mechanisms (Alpha behavior).
+type RescaleTuning struct {
+	// MinShareGapGPUs is the deadband: a model is held at its current allocation
+	// when |target-current| is smaller than this (0 = off).
+	MinShareGapGPUs int
+	// CooldownSeconds suppresses a repeat reclaim from a model until this many
+	// seconds after its last reclaim (0 = off).
+	CooldownSeconds int
 }
 
-func (f RescaleFlags) any() bool { return f.Cluster || len(f.ByNamespace) > 0 }
+// RescaleFlags carries the resolved, scope-coupled rescale enablement and hysteresis
+// tuning for one optimize cycle. Cluster governs the cluster budget group;
+// ByNamespace[ns] governs namespace ns's quota budget group, with matching per-scope
+// tuning in ClusterTuning / ByNamespaceTuning. The zero value disables rescale.
+type RescaleFlags struct {
+	Cluster           bool
+	ByNamespace       map[string]bool
+	ClusterTuning     RescaleTuning
+	ByNamespaceTuning map[string]RescaleTuning
+}
+
+// Any reports whether rescale is enabled at any scope this cycle.
+func (f RescaleFlags) Any() bool { return f.Cluster || len(f.ByNamespace) > 0 }
 
 // enabledForScope reports whether rescale is on at a group's budget scope:
 // the namespace flag for a namespace-quota group, else the cluster flag.
@@ -39,6 +55,14 @@ func (f RescaleFlags) enabledForScope(namespace string, namespaceScoped bool) bo
 		return f.ByNamespace[namespace]
 	}
 	return f.Cluster
+}
+
+// tuningForScope returns the hysteresis knobs for a group's budget scope.
+func (f RescaleFlags) tuningForScope(namespace string, namespaceScoped bool) RescaleTuning {
+	if namespaceScoped {
+		return f.ByNamespaceTuning[namespace]
+	}
+	return f.ClusterTuning
 }
 
 // rescaleInput is one model's contribution to the priority-weighted water-filling.
@@ -306,10 +330,11 @@ func (o *GreedyByScoreOptimizer) applyRescale(
 		if k.scope != "" {
 			scope = k.scope
 		}
+		tuning := o.Rescale.tuningForScope(k.scope, k.scope != "")
 
 		freeThisCycle := fillable
 		for _, req := range reqs {
-			d := o.rescaleModelDecisions(ctx, req, k.accType, scope, targets[modelKey(req)], &freeThisCycle)
+			d := o.rescaleModelDecisions(ctx, req, k.accType, scope, tuning, targets[modelKey(req)], &freeThisCycle)
 			decisions = append(decisions, d...)
 			handled[modelKey(req)] = true
 		}
@@ -338,13 +363,16 @@ func (o *GreedyByScoreOptimizer) applyRescale(
 // most-expensive-first, respecting minReplicas) or fill (add most-cost-efficient
 // first, gated on *freeThisCycle). Reclaim decisions are tagged DecisionReasonRescale.
 // scope is the model's budget scope ("cluster" or a namespace) for observability.
-// Every decision it returns carries a *domain.RescaleDecisionInfo summarising the
-// model's priority, share (targetGPUs) vs current, direction, and reclaim-stall state.
+// tuning applies the Beta hysteresis (deadband + reclaim cool-down): when it holds
+// the model, no reclaim/fill runs this cycle. Every decision it returns carries a
+// *domain.RescaleDecisionInfo summarising the model's priority, share (targetGPUs)
+// vs current, direction, and reclaim-stall state.
 func (o *GreedyByScoreOptimizer) rescaleModelDecisions(
 	ctx context.Context,
 	req ModelScalingRequest,
 	accType string,
 	scope string,
+	tuning RescaleTuning,
 	targetGPUs int,
 	freeThisCycle *int,
 ) []domain.VariantDecision {
@@ -369,33 +397,53 @@ func (o *GreedyByScoreOptimizer) rescaleModelDecisions(
 	}
 	tgtByRole := distributeGPUsByWeight(targetGPUs, roles, demByRole, curByRole, floorByRole)
 
+	// Hysteresis (Beta): hold the model at its current allocation when the
+	// target-vs-current gap is inside the deadband, or when a reclaim is still within
+	// its cool-down. Held models produce no reclaim/fill (targets stay = current) and
+	// report a "hold" action. Both checks are inert when their knob is 0 (Alpha).
+	held := heldByHysteresis(o, modelKey(req), targetGPUs, modelCurrent, tuning)
+
 	stalled := false
-	for _, role := range roles {
-		rt, rc := tgtByRole[role], curByRole[role]
-		switch {
-		case rt < rc:
-			unshed := reclaimRole(ctx, req.AnalyzerResults, satEntry.VariantCapacities, role, stateMap, targets, rc-rt)
-			// A whole-replica-sized shortfall means a role that owed a reclaim could
-			// not shed even one replica (blocked by minReplicas / cheapest-at-1); a
-			// smaller leftover is just sub-replica quantization, not a stall.
-			if gMin := roleMinGPUsPerReplica(satEntry.VariantCapacities, role, stateMap); gMin > 0 && unshed >= gMin {
-				stalled = true
+	if !held {
+		totalShed := 0
+		for _, role := range roles {
+			rt, rc := tgtByRole[role], curByRole[role]
+			switch {
+			case rt < rc:
+				unshed := reclaimRole(ctx, req.AnalyzerResults, satEntry.VariantCapacities, role, stateMap, targets, rc-rt)
+				totalShed += (rc - rt) - unshed
+				// A whole-replica-sized shortfall means a role that owed a reclaim could
+				// not shed even one replica (blocked by minReplicas / cheapest-at-1); a
+				// smaller leftover is just sub-replica quantization, not a stall.
+				if gMin := roleMinGPUsPerReplica(satEntry.VariantCapacities, role, stateMap); gMin > 0 && unshed >= gMin {
+					stalled = true
+				}
+			case rt > rc:
+				want := rt - rc
+				if want > *freeThisCycle {
+					want = *freeThisCycle
+				}
+				*freeThisCycle -= fillRole(satEntry.VariantCapacities, role, stateMap, targets, want)
 			}
-		case rt > rc:
-			want := rt - rc
-			if want > *freeThisCycle {
-				want = *freeThisCycle
-			}
-			*freeThisCycle -= fillRole(satEntry.VariantCapacities, role, stateMap, targets, want)
+		}
+		// Stamp the cool-down only when a reclaim actually shed GPUs, so a stalled
+		// reclaim (shed nothing) does not start a cool-down that would then block the
+		// retry that could finally succeed.
+		if totalShed > 0 && o.RescaleLastReclaim != nil {
+			o.RescaleLastReclaim[modelKey(req)] = o.RescaleNow
 		}
 	}
 
+	action := rescaleAction(targetGPUs, modelCurrent)
+	if held {
+		action = domain.RescaleActionHold
+	}
 	info := &domain.RescaleDecisionInfo{
 		Priority:    req.Priority,
 		TargetGPUs:  targetGPUs,
 		CurrentGPUs: modelCurrent,
 		Scope:       scope,
-		Action:      rescaleAction(targetGPUs, modelCurrent),
+		Action:      action,
 		Stalled:     stalled,
 	}
 
@@ -409,6 +457,42 @@ func (o *GreedyByScoreOptimizer) rescaleModelDecisions(
 		decisions[i].Rescale = info
 	}
 	return decisions
+}
+
+// heldByHysteresis reports whether the Beta hysteresis holds a model at its current
+// allocation this cycle: the deadband (|target-current| below MinShareGapGPUs) holds
+// both directions; the reclaim cool-down holds only a would-be reclaim (target below
+// current) whose model was reclaimed too recently. Both are inert when their knob is 0.
+func heldByHysteresis(o *GreedyByScoreOptimizer, key string, targetGPUs, currentGPUs int, tuning RescaleTuning) bool {
+	gap := targetGPUs - currentGPUs
+	if gap == 0 {
+		return false // already at its share; the model is a natural no-op, not "held"
+	}
+	absGap := gap
+	if absGap < 0 {
+		absGap = -absGap
+	}
+	if tuning.MinShareGapGPUs > 0 && absGap < tuning.MinShareGapGPUs {
+		return true // deadband
+	}
+	if gap < 0 && o.inReclaimCooldown(key, tuning) {
+		return true // reclaim cool-down
+	}
+	return false
+}
+
+// inReclaimCooldown reports whether model `key` was reclaimed less than
+// CooldownSeconds ago. It is false (cool-down off) when the knob is 0, no cool-down
+// clock/state was wired for this cycle, or the model has no recorded reclaim.
+func (o *GreedyByScoreOptimizer) inReclaimCooldown(key string, tuning RescaleTuning) bool {
+	if tuning.CooldownSeconds <= 0 || o.RescaleLastReclaim == nil || o.RescaleNow.IsZero() {
+		return false
+	}
+	last, ok := o.RescaleLastReclaim[key]
+	if !ok {
+		return false
+	}
+	return o.RescaleNow.Sub(last) < time.Duration(tuning.CooldownSeconds)*time.Second
 }
 
 // rescaleAction classifies a model's rescale direction from its share vs current.

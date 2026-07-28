@@ -5,6 +5,7 @@ import (
 	"maps"
 	"math"
 	"sort"
+	"time"
 
 	ctrl "sigs.k8s.io/controller-runtime"
 
@@ -23,10 +24,18 @@ import (
 //   - Disaggregated models use paired (n_P, n_D) allocation via the paired helpers
 //   - Scale-down uses scaleDownRoleIterated (role-iterated unified path)
 type GreedyByScoreOptimizer struct {
-	// Rescale carries the resolved, scope-coupled rescale enablement for the
-	// current cycle (set by the engine before Optimize). Zero value = off, which
-	// keeps the additive fair-share behaviour unchanged.
+	// Rescale carries the resolved, scope-coupled rescale enablement and hysteresis
+	// tuning for the current cycle (set by the engine before Optimize). Zero value =
+	// off, which keeps the additive fair-share behaviour unchanged.
 	Rescale RescaleFlags
+
+	// RescaleNow is this cycle's timestamp, used for the reclaim cool-down. The zero
+	// value (unset) disables cool-down, so pure-pipeline callers need not set it.
+	RescaleNow time.Time
+	// RescaleLastReclaim is the engine-owned per-model (namespace, ModelID) last-reclaim
+	// store the rescale pass reads and updates for the cool-down. A nil map disables
+	// cool-down (and makes the pass never write), so it is safe to leave unset.
+	RescaleLastReclaim map[string]time.Time
 }
 
 // NewGreedyByScoreOptimizer creates a new GreedyByScoreOptimizer.
@@ -111,7 +120,7 @@ func (o *GreedyByScoreOptimizer) Optimize(
 	// unchanged.
 	var rescaleDecisions []domain.VariantDecision
 	var handled map[string]bool
-	if o.Rescale.any() {
+	if o.Rescale.Any() {
 		rescaleDecisions, handled = o.applyRescale(ctx, requests, available, availableByNS)
 	}
 

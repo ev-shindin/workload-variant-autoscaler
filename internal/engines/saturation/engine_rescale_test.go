@@ -49,4 +49,28 @@ var _ = Describe("Engine.resolveRescaleFlags", func() {
 		Expect(flags.ByNamespace).ToNot(HaveKey("absent"))
 		Expect(flags.ByNamespace).ToNot(HaveKey(""))
 	})
+
+	It("propagates the cluster hysteresis knobs into the resolved tuning", func() {
+		c := config.NewTestConfig()
+		c.UpdateSaturationConfig(map[string]config.SaturationScalingConfig{
+			"default": {EnableRescale: true, RescaleMinShareGapGPUs: 2, RescaleCooldownSeconds: 90},
+		})
+		flags := (&Engine{Config: c}).resolveRescaleFlags([]pipeline.ModelScalingRequest{req("any")})
+		Expect(flags.ClusterTuning.MinShareGapGPUs).To(Equal(2))
+		Expect(flags.ClusterTuning.CooldownSeconds).To(Equal(90))
+	})
+
+	It("propagates namespace-local hysteresis knobs without leaking the cluster ones", func() {
+		c := config.NewTestConfig()
+		c.UpdateSaturationConfig(map[string]config.SaturationScalingConfig{
+			"default": {EnableRescale: true, RescaleMinShareGapGPUs: 5, RescaleCooldownSeconds: 120},
+		})
+		c.UpdateSaturationConfigForNamespace("team", map[string]config.SaturationScalingConfig{
+			"default": {EnableRescale: true, RescaleMinShareGapGPUs: 1},
+		})
+		flags := (&Engine{Config: c}).resolveRescaleFlags([]pipeline.ModelScalingRequest{req("team")})
+		Expect(flags.ByNamespaceTuning).To(HaveKey("team"))
+		Expect(flags.ByNamespaceTuning["team"].MinShareGapGPUs).To(Equal(1), "namespace-local value")
+		Expect(flags.ByNamespaceTuning["team"].CooldownSeconds).To(Equal(0), "no global fallback for the namespace knob")
+	})
 })

@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"math"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -761,5 +762,98 @@ var _ = Describe("GreedyByScoreOptimizer rescale observability (Beta)", func() {
 		dm := decisionMap(o.Optimize(context.Background(), reqs, cons))
 		Expect(dm["A-v"].Rescale).To(BeNil())
 		Expect(dm["B-v"].Rescale).To(BeNil())
+	})
+})
+
+var _ = Describe("GreedyByScoreOptimizer rescale hysteresis (Beta)", func() {
+	// Deadband: equal-priority A(5)/B(3) on a full budget of 8 water-fill to 4/4, so A
+	// owes a 1-GPU reclaim. A deadband of 2 GPUs holds A at 5 (gap 1 < 2); without it,
+	// A would reclaim to 4.
+	It("holds a sub-deadband reclaim", func() {
+		reqs := func() []ModelScalingRequest {
+			return []ModelScalingRequest{
+				rescaleReq("A", "default", 1, 8000, 5),
+				rescaleReq("B", "default", 1, 8000, 3),
+			}
+		}
+		cons := []*ResourceConstraints{{Pools: map[string]ResourcePool{"A100": {Limit: 8, Used: 8}}}}
+
+		// Without a deadband: A reclaims 5 -> 4.
+		plain := NewGreedyByScoreOptimizer()
+		plain.Rescale = RescaleFlags{Cluster: true}
+		Expect(decisionMap(plain.Optimize(context.Background(), reqs(), cons))["A-v"].TargetReplicas).To(Equal(4))
+
+		// With a 2-GPU deadband: the 1-GPU gap is held, A stays at 5.
+		o := NewGreedyByScoreOptimizer()
+		o.Rescale = RescaleFlags{Cluster: true, ClusterTuning: RescaleTuning{MinShareGapGPUs: 2}}
+		dm := decisionMap(o.Optimize(context.Background(), reqs(), cons))
+		Expect(dm["A-v"].TargetReplicas).To(Equal(5), "held by deadband")
+		Expect(dm["A-v"].Rescale.Action).To(Equal(domain.RescaleActionHold))
+	})
+
+	// Cool-down: A is reclaimed in cycle 1 (stamping the cool-down), held in cycle 2
+	// (30s < 60s window), and reclaimed again in cycle 3 (90s > 60s). The model's
+	// current stays at 8 across cycles (paced convergence: the reclaim has not actuated).
+	It("suppresses a repeat reclaim within the cool-down, then allows it after", func() {
+		reqs := func() []ModelScalingRequest {
+			return []ModelScalingRequest{
+				rescaleReq("A", "default", 1, 8000, 8),
+				rescaleReq("B", "default", 3, 8000, 0),
+			}
+		}
+		cons := []*ResourceConstraints{{Pools: map[string]ResourcePool{"A100": {Limit: 8, Used: 8}}}}
+
+		o := NewGreedyByScoreOptimizer()
+		o.Rescale = RescaleFlags{Cluster: true, ClusterTuning: RescaleTuning{CooldownSeconds: 60}}
+		o.RescaleLastReclaim = map[string]time.Time{}
+		t0 := time.Unix(1_000_000, 0)
+
+		o.RescaleNow = t0
+		dm1 := decisionMap(o.Optimize(context.Background(), reqs(), cons))
+		Expect(dm1["A-v"].TargetReplicas).To(Equal(2), "cycle 1: A reclaims 8 -> 2")
+		Expect(dm1["A-v"].Rescale.Action).To(Equal(domain.RescaleActionReclaim))
+
+		o.RescaleNow = t0.Add(30 * time.Second)
+		dm2 := decisionMap(o.Optimize(context.Background(), reqs(), cons))
+		Expect(dm2["A-v"].TargetReplicas).To(Equal(8), "cycle 2: within cool-down, A held at 8")
+		Expect(dm2["A-v"].Rescale.Action).To(Equal(domain.RescaleActionHold))
+
+		o.RescaleNow = t0.Add(90 * time.Second)
+		dm3 := decisionMap(o.Optimize(context.Background(), reqs(), cons))
+		Expect(dm3["A-v"].TargetReplicas).To(Equal(2), "cycle 3: past cool-down, A reclaims again")
+	})
+
+	// A stalled reclaim sheds nothing, so it must NOT stamp the cool-down (otherwise the
+	// retry that could finally succeed would be blocked). Here A holds one protected
+	// replica it can never shed; the store stays empty.
+	It("does not start a cool-down for a reclaim that shed nothing", func() {
+		o := NewGreedyByScoreOptimizer()
+		o.Rescale = RescaleFlags{Cluster: true, ClusterTuning: RescaleTuning{CooldownSeconds: 60}}
+		o.RescaleLastReclaim = map[string]time.Time{}
+		o.RescaleNow = time.Unix(1_000_000, 0)
+		reqs := []ModelScalingRequest{
+			rescaleReq("A", "default", 1, 0, 1),    // share 0, holds 1 protected replica -> stall
+			rescaleReq("B", "default", 5, 8000, 3), // hungry, high priority
+		}
+		cons := []*ResourceConstraints{{Pools: map[string]ResourcePool{"A100": {Limit: 4, Used: 4}}}}
+		dm := decisionMap(o.Optimize(context.Background(), reqs, cons))
+		Expect(dm["A-v"].Rescale.Stalled).To(BeTrue())
+		Expect(o.RescaleLastReclaim).To(BeEmpty(), "a stalled reclaim must not stamp the cool-down")
+	})
+
+	// Knobs at 0 with the cool-down clock/state wired must behave exactly like Alpha:
+	// A reclaims to its share, unaffected by the presence of the store.
+	It("is byte-identical to Alpha when knobs are 0 even with the clock wired", func() {
+		o := NewGreedyByScoreOptimizer()
+		o.Rescale = RescaleFlags{Cluster: true} // zero tuning
+		o.RescaleLastReclaim = map[string]time.Time{}
+		o.RescaleNow = time.Unix(1_000_000, 0)
+		reqs := []ModelScalingRequest{
+			rescaleReq("A", "default", 1, 8000, 8),
+			rescaleReq("B", "default", 3, 8000, 0),
+		}
+		cons := []*ResourceConstraints{{Pools: map[string]ResourcePool{"A100": {Limit: 8, Used: 8}}}}
+		dm := decisionMap(o.Optimize(context.Background(), reqs, cons))
+		Expect(dm["A-v"].TargetReplicas).To(Equal(2), "Alpha reclaim unaffected by zero knobs")
 	})
 })

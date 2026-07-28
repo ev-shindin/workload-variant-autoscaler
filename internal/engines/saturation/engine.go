@@ -141,6 +141,13 @@ type Engine struct {
 	// Key is namespace/name from utils.GetNamespacedKey.
 	vaEventTracker map[string]bool
 
+	// rescaleLastReclaim records, per model (namespace/ModelID key), when rescale last
+	// reclaimed GPUs from it — the state behind the rescale reclaim cool-down. It is
+	// read and written only from the single optimize goroutine (after StartOptimizeLoop),
+	// so it needs no lock; it is lazily created and pruned to the live model set each
+	// cycle. Empty/absent means no cool-down is in effect.
+	rescaleLastReclaim map[string]time.Time
+
 	Config *config.Config // Unified configuration (injected from main.go)
 
 	// ReplicaMetricsCollector is the collector for replica metrics using the source infrastructure
@@ -848,12 +855,17 @@ func (e *Engine) selectV2Optimizer(
 	return optimizer, constraints
 }
 
-// resolveRescaleFlags builds the scope-coupled rescale enablement for this cycle:
-// the cluster flag from the global saturation `default` config, plus a per-namespace
-// flag from each active namespace's OWN `default` config (never the global fallback,
-// so the cluster flag cannot enable rescale on a namespace quota).
+// resolveRescaleFlags builds the scope-coupled rescale enablement and hysteresis
+// tuning for this cycle: the cluster flag/knobs from the global saturation `default`
+// config, plus per-namespace flag/knobs from each active namespace's OWN `default`
+// config (never the global fallback, so the cluster settings cannot enable or tune
+// rescale on a namespace quota).
 func (e *Engine) resolveRescaleFlags(requests []pipeline.ModelScalingRequest) pipeline.RescaleFlags {
-	flags := pipeline.RescaleFlags{Cluster: e.Config.RescaleEnabledCluster()}
+	ct := e.Config.RescaleTuningCluster()
+	flags := pipeline.RescaleFlags{
+		Cluster:       ct.Enabled,
+		ClusterTuning: toPipelineTuning(ct),
+	}
 	seen := make(map[string]bool)
 	for _, req := range requests {
 		ns := req.Namespace
@@ -861,14 +873,41 @@ func (e *Engine) resolveRescaleFlags(requests []pipeline.ModelScalingRequest) pi
 			continue
 		}
 		seen[ns] = true
-		if enabled, hasLocal := e.Config.RescaleEnabledForNamespaceLocal(ns); hasLocal && enabled {
+		if t, hasLocal := e.Config.RescaleTuningForNamespaceLocal(ns); hasLocal && t.Enabled {
 			if flags.ByNamespace == nil {
 				flags.ByNamespace = make(map[string]bool)
+				flags.ByNamespaceTuning = make(map[string]pipeline.RescaleTuning)
 			}
 			flags.ByNamespace[ns] = true
+			flags.ByNamespaceTuning[ns] = toPipelineTuning(t)
 		}
 	}
 	return flags
+}
+
+// toPipelineTuning maps the config hysteresis knobs to the pipeline tuning type.
+func toPipelineTuning(t config.RescaleTuning) pipeline.RescaleTuning {
+	return pipeline.RescaleTuning{
+		MinShareGapGPUs: t.MinShareGapGPUs,
+		CooldownSeconds: t.CooldownSeconds,
+	}
+}
+
+// pruneRescaleCooldownStore drops cool-down stamps for models no longer present, so
+// the store stays bounded to the live model set. Called before each rescale cycle.
+func (e *Engine) pruneRescaleCooldownStore(requests []pipeline.ModelScalingRequest) {
+	if len(e.rescaleLastReclaim) == 0 {
+		return
+	}
+	live := make(map[string]struct{}, len(requests))
+	for _, req := range requests {
+		live[utils.GetNamespacedKey(req.Namespace, req.ModelID)] = struct{}{}
+	}
+	for k := range e.rescaleLastReclaim {
+		if _, ok := live[k]; !ok {
+			delete(e.rescaleLastReclaim, k)
+		}
+	}
 }
 
 // optimizeV2 runs the V2 token-based optimizer path (saturation-token-based).
@@ -942,10 +981,21 @@ func (e *Engine) optimizeV2(
 
 	// Stage 2: Compute GPU constraints and call optimizer
 	optimizer, constraints := e.selectV2Optimizer(ctx, requests)
-	// Scope-coupled rescale enablement (cluster + per-namespace) is resolved from
-	// config and handed to the GPU-aware optimizer for this cycle.
+	// Scope-coupled rescale enablement + hysteresis tuning (cluster + per-namespace)
+	// is resolved from config and handed to the GPU-aware optimizer for this cycle.
+	// When rescale is on, also wire the cool-down clock and the engine-owned per-model
+	// last-reclaim store (pruned to the live model set first) so the reclaim cool-down
+	// persists across cycles.
 	if g, ok := optimizer.(*pipeline.GreedyByScoreOptimizer); ok {
 		g.Rescale = e.resolveRescaleFlags(requests)
+		if g.Rescale.Any() {
+			if e.rescaleLastReclaim == nil {
+				e.rescaleLastReclaim = make(map[string]time.Time)
+			}
+			e.pruneRescaleCooldownStore(requests)
+			g.RescaleNow = time.Now()
+			g.RescaleLastReclaim = e.rescaleLastReclaim
+		}
 	}
 	allDecisions := optimizer.Optimize(ctx, requests, constraints)
 	logScalingDecisions(ctx, requests, allDecisions)
