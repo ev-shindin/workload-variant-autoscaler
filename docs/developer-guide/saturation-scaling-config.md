@@ -163,6 +163,51 @@ This proactive approach ensures adequate headroom and prevents request drops by 
 
 **For detailed implementation, see:** [Saturation Analyzer Documentation](user-guide/saturation-analyzer.md)
 
+## Priority-Weighted Rescale
+
+Under GPU contention (Σ demand > budget within a competition group), the V2
+GPU-constrained optimizer can **redistribute the whole group budget** by
+`priority × demand` — reclaiming GPUs from lower-priority (over-share) models so
+higher-priority work can run — instead of only handing out free GPUs. It is
+**opt-in and off by default**; when disabled or uncontended, behavior is unchanged.
+A competition group is keyed by `(accelerator type, budget scope)` where scope is the
+cluster budget or a namespace quota.
+
+Design and staged rollout: [`docs/plans/engine/rescale-alpha.md`](../plans/engine/rescale-alpha.md)
+(Alpha — redistribution) and [`docs/plans/engine/rescale-beta.md`](../plans/engine/rescale-beta.md)
+(Beta — observability + hysteresis).
+
+### Parameters
+
+These are **budget-scope** settings, read only from the `default` entry (never a
+per-model override): the value in the **global** config governs the cluster budget, and
+a **namespace-local** config's `default` governs that namespace's quota budget (never
+the global fallback). They have no effect without a same-scope GPU budget (`enableLimiter`
+plus a matching cluster/namespace budget).
+
+| Parameter | Type | Description | Default |
+|-----------|------|-------------|---------|
+| `enableRescale` | bool | Enable the priority-weighted rescale pass for this budget scope. | `false` |
+| `rescaleMinShareGapGPUs` | int | Hysteresis **deadband**, in whole GPUs. Holds a model at its current allocation when `0 < \|share − current\| ≤ gap` (inclusive, both directions), so small share drift around the contention threshold does not flap. `0` disables it. | `0` (recommended `1`) |
+| `rescaleCooldownSeconds` | int | Per-model **reclaim cool-down**, in seconds. Suppresses a repeat reclaim from a model until this long after its last reclaim. Fills are never cooled down; a stalled reclaim (shed nothing) never starts a cool-down. `0` disables it. | `0` (recommended `~60`) |
+
+### Observability
+
+Each `VariantAutoscaling` the rescale pass acts on gets a **`Rescaled`** status
+condition, attributed per variant by role:
+
+| Reason | Meaning |
+|--------|---------|
+| `Reclaim` | This variant is being scaled down to release GPUs to higher-priority work. |
+| `Fill` | This variant is being scaled up into freed budget. |
+| `Hold` | Within its share, or suppressed by the deadband / cool-down. |
+| `Stalled` | Its role owed a reclaim but could not shed a whole replica (blocked by `minReplicas` or the cheapest-at-1 protection). |
+
+The condition message carries `priority`, the water-fill `share`, `current` GPUs, and the
+budget `scope`. A stall additionally emits a `RescaleStalled` **Warning** event on that
+variant. When a variant stops being rescaled (its group became uncontended, or rescale was
+disabled), a previously-`True` `Rescaled` condition is set to `False`.
+
 ## Multi-Analyzer Registration
 
 The V2 engine carries an analyzer registry so external analyzers (e.g.
