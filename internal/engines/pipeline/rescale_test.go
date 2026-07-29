@@ -131,7 +131,7 @@ var _ = Describe("distributeGPUsByWeight", func() {
 	})
 })
 
-var _ = Describe("roleDemandGPUs", func() {
+var _ = Describe("roleDemandGPUsForResult", func() {
 	It("rounds token demand up to whole replicas (ceil)", func() {
 		// 8500 tokens / 1000 per-replica capacity = 8.5 -> ceil = 9 replicas (9 GPUs).
 		// Guards against a regression to floor (which would under-count demand at 8).
@@ -145,6 +145,66 @@ var _ = Describe("roleDemandGPUs", func() {
 		stateMap := map[string]domain.VariantReplicaState{
 			"A-v": {VariantName: "A-v", GPUsPerReplica: 1},
 		}
-		Expect(roleDemandGPUs(sat, stateMap, "A100", domain.RoleBoth)).To(Equal(9))
+		Expect(roleDemandGPUsForResult(sat, stateMap, "A100", domain.RoleBoth)).To(Equal(9))
+	})
+})
+
+var _ = Describe("combinedDemandWeight (multi-analyzer)", func() {
+	res := func(demand float64) *domain.AnalyzerResult {
+		return &domain.AnalyzerResult{ModelID: "A", TotalDemand: demand}
+	}
+
+	It("treats an unset/zero Score as 1.0 (matches scoreForAnalyzer)", func() {
+		// withSatEntry-style fixtures leave Score 0; it must weight as 1.0, not zero out.
+		Expect(combinedDemandWeight([]NamedAnalyzerResult{{Result: res(4000)}})).To(Equal(4000.0))
+	})
+
+	It("is the Score-weighted sum of each analyzer's TotalDemand", func() {
+		w := combinedDemandWeight([]NamedAnalyzerResult{
+			{Result: res(4000), Score: 2},
+			{Result: res(8000), Score: 3},
+		})
+		Expect(w).To(Equal(2*4000.0 + 3*8000.0))
+	})
+
+	It("skips nil results", func() {
+		w := combinedDemandWeight([]NamedAnalyzerResult{
+			{Result: res(4000), Score: 1},
+			{Result: nil, Score: 5},
+		})
+		Expect(w).To(Equal(4000.0))
+	})
+})
+
+var _ = Describe("roleDemandGPUs (multi-analyzer)", func() {
+	stateMap := map[string]domain.VariantReplicaState{
+		"A-v": {VariantName: "A-v", GPUsPerReplica: 1},
+	}
+	res := func(demand, prc float64) *domain.AnalyzerResult {
+		return &domain.AnalyzerResult{
+			ModelID:     "A",
+			TotalDemand: demand,
+			VariantCapacities: []domain.VariantCapacity{
+				{VariantName: "A-v", AcceleratorName: "A100", PerReplicaCapacity: prc},
+			},
+		}
+	}
+
+	It("takes the cross-analyzer MAX (bottleneck) demand-in-GPUs", func() {
+		// sat: 4000/1000 = 4 GPUs; second analyzer: 8000/1000 = 8 GPUs -> max 8.
+		got := roleDemandGPUs([]NamedAnalyzerResult{
+			{Result: res(4000, 1000), Score: 1},
+			{Result: res(8000, 1000), Score: 3},
+		}, stateMap, "A100", domain.RoleBoth)
+		Expect(got).To(Equal(8))
+	})
+
+	It("ignores an analyzer whose variant has no per-replica capacity", func() {
+		// The zero-PRC entry contributes 0; only the saturation entry's 4 GPUs count.
+		got := roleDemandGPUs([]NamedAnalyzerResult{
+			{Result: res(4000, 1000), Score: 1},
+			{Result: res(9_000_000, 0), Score: 1}, // PRC 0 -> skipped
+		}, stateMap, "A100", domain.RoleBoth)
+		Expect(got).To(Equal(4))
 	})
 })

@@ -975,3 +975,83 @@ var _ = Describe("GreedyByScoreOptimizer rescale hysteresis (Beta)", func() {
 		Expect(dm["A-v"].TargetReplicas).To(Equal(2), "Alpha reclaim unaffected by zero knobs")
 	})
 })
+
+var _ = Describe("GreedyByScoreOptimizer rescale multi-analyzer", func() {
+	// Builds a request whose demand comes from the saturation entry (1 GPU/replica)
+	// plus an optional second analyzer, so the tests can compare saturation-only vs a
+	// Score-weighted second signal.
+	mkReq := func(id string, prio, satDemand float64, current int, extra *NamedAnalyzerResult) ModelScalingRequest {
+		v := id + "-v"
+		sat := &domain.AnalyzerResult{
+			ModelID: id, Namespace: "default", TotalDemand: satDemand,
+			VariantCapacities: []domain.VariantCapacity{
+				{VariantName: v, AcceleratorName: "A100", Cost: 5, PerReplicaCapacity: 1000, ReplicaCount: current},
+			},
+		}
+		results := []NamedAnalyzerResult{{Name: domain.SaturationAnalyzerName, Result: sat}}
+		if extra != nil {
+			results = append(results, *extra)
+		}
+		return ModelScalingRequest{
+			ModelID: id, Namespace: "default", Priority: prio,
+			AnalyzerResults: results,
+			VariantStates: []domain.VariantReplicaState{
+				{VariantName: v, CurrentReplicas: current, GPUsPerReplica: 1},
+			},
+		}
+	}
+	// A second analyzer for variant {id}-v on A100 with the given demand and Score.
+	extraFor := func(id string, demand, score float64) *NamedAnalyzerResult {
+		return &NamedAnalyzerResult{
+			Name: "throughput", Score: score,
+			Result: &domain.AnalyzerResult{
+				ModelID: id, Namespace: "default", TotalDemand: demand,
+				VariantCapacities: []domain.VariantCapacity{
+					{VariantName: id + "-v", AcceleratorName: "A100", PerReplicaCapacity: 1000},
+				},
+			},
+		}
+	}
+
+	// The Score-weighted second analyzer raises A's water-fill share. Equal-priority
+	// A(8)/B(0), budget 8, both saturation demand 8000 (8 GPUs) -> contended. Saturation
+	// only: equal weight -> split 4/4, A reclaims to 4. Adding analyzer(demand 16000,
+	// Score 3) to A gives weight 8000 + 3*16000 = 56000 vs B's 8000 (7:1) -> A keeps 7.
+	It("weights the water-fill by the combined Score-weighted demand", func() {
+		cons := []*ResourceConstraints{{Pools: map[string]ResourcePool{"A100": {Limit: 8, Used: 8}}}}
+
+		base := NewGreedyByScoreOptimizer()
+		base.Rescale = RescaleFlags{Cluster: true}
+		dmBase := decisionMap(base.Optimize(context.Background(),
+			[]ModelScalingRequest{mkReq("A", 1, 8000, 8, nil), mkReq("B", 1, 8000, 0, nil)}, cons))
+		Expect(dmBase["A-v"].TargetReplicas).To(Equal(4), "saturation-only: equal weight -> A=4")
+
+		o := NewGreedyByScoreOptimizer()
+		o.Rescale = RescaleFlags{Cluster: true}
+		dm := decisionMap(o.Optimize(context.Background(),
+			[]ModelScalingRequest{mkReq("A", 1, 8000, 8, extraFor("A", 16000, 3)), mkReq("B", 1, 8000, 0, nil)}, cons))
+		Expect(dm["A-v"].TargetReplicas).To(Equal(7), "second analyzer raises A's share 7:1")
+		Expect(dm["A-v"].Rescale.TargetGPUs).To(Equal(7))
+	})
+
+	// The sizing MAX (bottleneck) can flip a group into contention. Low-priority A(4)
+	// and high-priority B(0), saturation demand 4000 (4 GPUs) each, budget 8. Saturation
+	// only: 4+4 = 8 does not exceed 8 -> uncontended, no rescale. A high-demand second
+	// analyzer on B (20 GPUs) makes Sum demand 4+20 exceed 8 -> rescale reclaims A.
+	It("triggers contention via the cross-analyzer bottleneck demand", func() {
+		cons := []*ResourceConstraints{{Pools: map[string]ResourcePool{"A100": {Limit: 8, Used: 4}}}}
+
+		base := NewGreedyByScoreOptimizer()
+		base.Rescale = RescaleFlags{Cluster: true}
+		dmBase := decisionMap(base.Optimize(context.Background(),
+			[]ModelScalingRequest{mkReq("A", 1, 4000, 4, nil), mkReq("B", 5, 4000, 0, nil)}, cons))
+		Expect(hasRescaleReason(dmBase)).To(BeFalse(), "saturation-only demand (4+4=8) does not exceed budget 8")
+
+		o := NewGreedyByScoreOptimizer()
+		o.Rescale = RescaleFlags{Cluster: true}
+		dm := decisionMap(o.Optimize(context.Background(),
+			[]ModelScalingRequest{mkReq("A", 1, 4000, 4, nil), mkReq("B", 5, 4000, 0, extraFor("B", 20000, 1))}, cons))
+		Expect(hasRescaleReason(dm)).To(BeTrue(), "B's 20-GPU bottleneck demand makes the group contended")
+		Expect(dm["A-v"].TargetReplicas).To(BeNumerically("<", 4), "low-priority A is reclaimed under contention")
+	})
+})

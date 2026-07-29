@@ -392,7 +392,7 @@ func (o *GreedyByScoreOptimizer) rescaleModelDecisions(
 	modelCurrent := 0
 	for _, role := range roles {
 		curByRole[role] = roleCurrentGPUs(req, accType, role)
-		demByRole[role] = roleDemandGPUs(satEntry, stateMap, accType, role)
+		demByRole[role] = roleDemandGPUs(req.AnalyzerResults, stateMap, accType, role)
 		floorByRole[role] = roleFloorGPUs(req, accType, role)
 		modelCurrent += curByRole[role]
 	}
@@ -681,7 +681,7 @@ func rescaleInputsForGroup(reqs []ModelScalingRequest, accType string, budget in
 			}
 		}
 
-		demandGPUs := modelDemandGPUs(satEntry, stateMap, accType)
+		demandGPUs := modelDemandGPUs(req.AnalyzerResults, stateMap, accType)
 		capGPUs := demandGPUs
 		if maxBounded {
 			capGPUs = min(capGPUs, maxGPUs)
@@ -693,7 +693,7 @@ func rescaleInputsForGroup(reqs []ModelScalingRequest, accType string, budget in
 		inputs = append(inputs, rescaleInput{
 			ID:        modelKey(req),
 			Priority:  req.Priority,
-			Demand:    satEntry.TotalDemand,
+			Demand:    combinedDemandWeight(req.AnalyzerResults),
 			FloorGPUs: floorGPUs,
 			CapGPUs:   capGPUs,
 		})
@@ -703,28 +703,52 @@ func rescaleInputsForGroup(reqs []ModelScalingRequest, accType string, budget in
 }
 
 // modelDemandGPUs is the model's demand-in-GPUs summed across its roles on accType
-// (a P/D model needs GPUs for both prefill and decode).
-func modelDemandGPUs(satEntry *domain.AnalyzerResult, stateMap map[string]domain.VariantReplicaState, accType string) int {
+// (a P/D model needs GPUs for both prefill and decode). Demand is combined across all
+// enabled analyzers (see roleDemandGPUs); the role topology is saturation-sourced.
+func modelDemandGPUs(results []NamedAnalyzerResult, stateMap map[string]domain.VariantReplicaState, accType string) int {
+	satEntry := saturationEntry(results)
+	if satEntry == nil {
+		return 0
+	}
 	total := 0
 	for _, role := range modelRolesOnType(satEntry.VariantCapacities, accType) {
-		total += roleDemandGPUs(satEntry, stateMap, accType, role)
+		total += roleDemandGPUs(results, stateMap, accType, role)
 	}
 	return total
 }
 
-// roleDemandGPUs converts a role's token demand to a GPU count via the role's most
-// cost-efficient variant's per-replica capacity. The synthetic "both" role uses the
-// model-level TotalDemand; a P/D role uses its RoleCapacities demand.
-func roleDemandGPUs(satEntry *domain.AnalyzerResult, stateMap map[string]domain.VariantReplicaState, accType, role string) int {
-	demand := satEntry.TotalDemand
+// roleDemandGPUs is a role's demand-in-GPUs, combined across all enabled analyzers as
+// the cross-analyzer MAX (bottleneck) — matching roleBottleneckReplicas: the most
+// demanding analyzer sizes the role. Each analyzer's demand is converted to GPUs in its
+// own replica-space (its TotalDemand / its per-replica capacity), so the values are
+// commensurable. With a single analyzer this reduces to roleDemandGPUsForResult(sat).
+func roleDemandGPUs(results []NamedAnalyzerResult, stateMap map[string]domain.VariantReplicaState, accType, role string) int {
+	maxGPUs := 0
+	for _, e := range results {
+		if e.Result == nil {
+			continue
+		}
+		if g := roleDemandGPUsForResult(e.Result, stateMap, accType, role); g > maxGPUs {
+			maxGPUs = g
+		}
+	}
+	return maxGPUs
+}
+
+// roleDemandGPUsForResult converts one analyzer's role demand to a GPU count via that
+// role's most cost-efficient variant's per-replica capacity (in the analyzer's own
+// units). The synthetic "both" role uses the model-level TotalDemand; a P/D role uses
+// its RoleCapacities demand. gpusPerReplica is physical (from state), analyzer-agnostic.
+func roleDemandGPUsForResult(result *domain.AnalyzerResult, stateMap map[string]domain.VariantReplicaState, accType, role string) int {
+	demand := result.TotalDemand
 	if role != domain.RoleBoth {
-		if rc, ok := satEntry.RoleCapacities[role]; ok {
+		if rc, ok := result.RoleCapacities[role]; ok {
 			demand = rc.TotalDemand
 		}
 	}
 	best := 0.0
 	bestGPUs := 1
-	for _, vc := range sortByCostEfficiencyAsc(variantsForRole(variantsOnType(satEntry.VariantCapacities, accType), role)) {
+	for _, vc := range sortByCostEfficiencyAsc(variantsForRole(variantsOnType(result.VariantCapacities, accType), role)) {
 		if vc.PerReplicaCapacity <= 0 {
 			continue
 		}
@@ -740,6 +764,27 @@ func roleDemandGPUs(satEntry *domain.AnalyzerResult, stateMap map[string]domain.
 		replicas = 0
 	}
 	return replicas * bestGPUs
+}
+
+// combinedDemandWeight is the model's demand for the water-fill weight, combined across
+// all enabled analyzers as the Score-weighted sum of their raw TotalDemand — mirroring
+// fairShareValue's priority combine. It enters computeRescaleTargets only inside the
+// priority x demand ratio, so mixing analyzer-specific units is tolerated (as in
+// fairShareValue). A single analyzer (Score normalized to 1) reduces to its TotalDemand,
+// preserving Alpha. Score <= 0 is normalized to 1.0, matching scoreForAnalyzer.
+func combinedDemandWeight(results []NamedAnalyzerResult) float64 {
+	weight := 0.0
+	for _, e := range results {
+		if e.Result == nil {
+			continue
+		}
+		score := e.Score
+		if score <= 0 {
+			score = 1.0
+		}
+		weight += score * e.Result.TotalDemand
+	}
+	return weight
 }
 
 // variantsOnType filters variants to those on accType.

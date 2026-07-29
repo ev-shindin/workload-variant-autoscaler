@@ -106,6 +106,25 @@ cool-down window can never trigger — so Alpha behaviour is preserved byte-for-
   group became uncontended, or rescale was disabled), a previously-`True` `Rescaled`
   condition is flipped to `False` so it does not linger as a stale "still reclaiming".
 
+## Analyzer scope (multi-analyzer)
+
+Rescale consumes the same multi-analyzer signal as the rest of the V2 optimizer (the
+per-analyzer `req.AnalyzerResults` slice from #1246), so enabling a second analyzer
+(throughput / queueing) affects rescale, not just the additive fair-share path:
+
+- **Water-fill weight** (`priority × demand`): `demand` is `combinedDemandWeight` =
+  `Σₐ Scoreₐ × Resultₐ.TotalDemand` — the Score-weighted sum of each analyzer's raw total
+  demand, mirroring `fairShareValue`. Raw demand (a ratio) keeps a single analyzer
+  identical to Alpha; `Scoreₐ ≤ 0` normalizes to `1.0` (matching `scoreForAnalyzer`).
+- **Sizing demand-in-GPUs** (contention check, per-model `CapGPUs`, P/D role split):
+  `roleDemandGPUs` is the cross-analyzer **MAX** (bottleneck) of each analyzer's
+  total-demand-in-GPUs (converted in that analyzer's own replica-space), matching
+  `roleBottleneckReplicas`. A single analyzer reduces to the saturation value.
+- **Reclaim ordering** already used the combine (`sortVariantsForScaleDown` is
+  Score-weighted). **Fill ordering** stays cost-based (`sortByCostEfficiencyAsc`), and
+  **variant topology** (which variants, roles, `gpusPerReplica`, floors/caps) stays
+  saturation-sourced — both consistent with the pipeline's allocate path.
+
 ## Files
 
 | File | Change |

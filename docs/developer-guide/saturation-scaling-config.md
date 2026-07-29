@@ -177,6 +177,11 @@ Design and staged rollout: [`docs/plans/engine/rescale-alpha.md`](../plans/engin
 (Alpha — redistribution) and [`docs/plans/engine/rescale-beta.md`](../plans/engine/rescale-beta.md)
 (Beta — observability + hysteresis).
 
+Rescale is multi-analyzer: the water-fill weight is the `Score`-weighted sum of each
+enabled analyzer's demand and the sizing uses the cross-analyzer bottleneck, so the
+[Multi-Analyzer](#multi-analyzer-registration) `score` weights apply to rescale too. With
+the default single (`saturation`) analyzer this is identical to the saturation-only signal.
+
 ### Parameters
 
 These are **budget-scope** settings, read only from the `default` entry (never a
