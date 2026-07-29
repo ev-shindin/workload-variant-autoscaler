@@ -71,6 +71,16 @@ const (
 	// ceiling from a single slow interval.
 	MinServiceRateSamples = 2
 
+	// MinResidenceSeconds and MaxResidenceSeconds bound the residence estimate used
+	// as the arrival-smoothing time constant, so a garbage latency reading cannot
+	// turn the average into either a passthrough or a frozen value.
+	MinResidenceSeconds = 1.0
+	MaxResidenceSeconds = 300.0
+
+	// ArrivalSmoothingResetFactor is how many time constants may pass before the
+	// previous arrival average is discarded rather than blended.
+	ArrivalSmoothingResetFactor = 3.0
+
 	// MinRateAnchoredFraction floors the estimate at a fraction of k1. A replica
 	// that has stalled completely (mu near zero while requests are queued) would
 	// otherwise drive capacity to ~0 and demand an unbounded scale-up.
@@ -171,6 +181,98 @@ func decayRate(rate float64, age time.Duration) float64 {
 	return rate * math.Pow(ServiceRateDecayPerWindow, windows)
 }
 
+// arrivalSmoother holds a per-replica exponentially-weighted arrival rate.
+//
+// A completion happens one residence time after the arrival that caused it, so a
+// completion-derived mu and an instantaneous lambda are measured on different time
+// bases: during a ramp, completions still reflect the lighter load of W seconds
+// ago and mu/lambda reads as saturation on a replica that is coping. Occupancy has
+// the same property — it is a stock that already integrates arrivals over W.
+// Averaging lambda over roughly W puts all three on the same footing.
+type arrivalSmoother struct {
+	mu      sync.Mutex
+	entries map[string]*arrivalEntry
+}
+
+type arrivalEntry struct {
+	rate     float64
+	observed time.Time
+}
+
+func newArrivalSmoother() *arrivalSmoother {
+	return &arrivalSmoother{entries: make(map[string]*arrivalEntry)}
+}
+
+// Smooth folds a new arrival-rate sample into the replica's EWMA and returns the
+// smoothed value. tau is the averaging time constant — the residence estimate.
+// The weight is derived from the actual gap between samples, so an irregular
+// optimize interval or a missed cycle does not distort the average.
+func (s *arrivalSmoother) Smooth(key string, rate, tau float64, now time.Time) float64 {
+	if rate <= 0 {
+		return rate
+	}
+	if tau <= 0 {
+		return rate
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	e, ok := s.entries[key]
+	if !ok {
+		s.entries[key] = &arrivalEntry{rate: rate, observed: now}
+		return rate
+	}
+	dt := now.Sub(e.observed).Seconds()
+	if dt <= 0 {
+		return e.rate
+	}
+	// Older than a few time constants: the previous value carries no information.
+	if dt > tau*ArrivalSmoothingResetFactor {
+		e.rate, e.observed = rate, now
+		return rate
+	}
+	alpha := 1 - math.Exp(-dt/tau)
+	e.rate += alpha * (rate - e.rate)
+	e.observed = now
+	return e.rate
+}
+
+// EvictStale drops replicas not seen within timeout, returning the number removed.
+func (s *arrivalSmoother) EvictStale(timeout time.Duration, now time.Time) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	removed := 0
+	for k, e := range s.entries {
+		if now.Sub(e.observed) > timeout {
+			delete(s.entries, k)
+			removed++
+		}
+	}
+	return removed
+}
+
+// residenceSeconds estimates how long a request occupies the replica: time to the
+// first token plus one inter-token latency per output token. Both inputs are
+// already collected per replica. Returns 0 when they are unavailable, which leaves
+// the arrival rate unsmoothed rather than smoothing it by a made-up constant.
+func residenceSeconds(rm domain.ReplicaMetrics) float64 {
+	if rm.AvgITL <= 0 || rm.AvgOutputTokens <= 0 {
+		return 0
+	}
+	w := rm.AvgTTFT + rm.AvgOutputTokens*rm.AvgITL
+	if w <= 0 || math.IsNaN(w) || math.IsInf(w, 0) {
+		return 0
+	}
+	if w < MinResidenceSeconds {
+		return MinResidenceSeconds
+	}
+	if w > MaxResidenceSeconds {
+		return MaxResidenceSeconds
+	}
+	return w
+}
+
 // serviceRateKey identifies a workload bucket for service-rate purposes.
 //
 // The input bucket is part of the key, unlike the k2 history key: mu is a property
@@ -215,6 +317,14 @@ func (a *SaturationAnalyzer) rateAnchoredK2(
 		a.serviceRates.Observe(key, rm.RequestRate, now)
 	}
 
+	// Put lambda on the same time base as the completion-derived mu and the
+	// occupancy stock, both of which integrate over a residence time.
+	smoothingKey := rm.PodName
+	if smoothingKey == "" {
+		smoothingKey = key
+	}
+	lambda := a.arrivals.Smooth(smoothingKey, rm.ArrivalRate, residenceSeconds(rm), now)
+
 	// KvUsageInstant is the un-peaked reading; the 1-minute max used for demand
 	// would over-state the operating point and inflate the estimate.
 	occupancy := rm.KvUsageInstant * float64(rm.TotalKvCapacityTokens)
@@ -222,7 +332,7 @@ func (a *SaturationAnalyzer) rateAnchoredK2(
 		return 0, 0, false, false
 	}
 
-	ratio, src, ok := a.saturationRatio(rm, key, backlogged, now)
+	ratio, src, ok := a.saturationRatio(rm, key, lambda, backlogged, now)
 	if !ok {
 		return 0, 0, false, false
 	}
@@ -248,8 +358,10 @@ func (a *SaturationAnalyzer) rateAnchoredK2(
 // saturationRatio returns mu/lambda — how much service headroom the replica has —
 // from the best signal available, in descending order of directness:
 //
-//  1. EPP arrival rate. The intended path: lambda is measured independently of the
-//     engine, so the ratio holds whether or not the replica is keeping up.
+//  1. EPP arrival rate, smoothed over a residence time. The intended path: lambda
+//     is measured independently of the engine, so the ratio holds whether or not
+//     the replica is keeping up. Smoothing matters because completions lag their
+//     arrivals — see arrivalSmoother.
 //  2. Backlog. A replica queueing at least QueueLengthThreshold deep is saturated
 //     by observation: arrivals exceed service, so the ratio is at most 1 and
 //     capacity is the current occupancy. This needs neither lambda nor a calibrated
@@ -265,13 +377,14 @@ func (a *SaturationAnalyzer) rateAnchoredK2(
 func (a *SaturationAnalyzer) saturationRatio(
 	rm domain.ReplicaMetrics,
 	key string,
+	lambda float64,
 	backlogged bool,
 	now time.Time,
 ) (float64, k2Source, bool) {
 	muRate, haveMu := a.serviceRates.Rate(key, now)
 
-	if rm.ArrivalRate > 0 && haveMu {
-		return muRate / rm.ArrivalRate, k2SrcRateAnchored, true
+	if lambda > 0 && haveMu {
+		return muRate / lambda, k2SrcRateAnchored, true
 	}
 	if backlogged {
 		return 1.0, k2SrcRateBacklog, true

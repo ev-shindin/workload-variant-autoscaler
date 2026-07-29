@@ -335,3 +335,84 @@ var _ = Describe("Rate-anchored k2 and transient queues", func() {
 		Expect(src).To(Equal(k2SrcRateBacklog))
 	})
 })
+
+var _ = Describe("Arrival smoothing over the residence time", func() {
+	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+
+	It("returns the first sample unchanged", func() {
+		s := newArrivalSmoother()
+		Expect(s.Smooth("pod", 10.0, 60, now)).To(Equal(10.0))
+	})
+
+	It("lags a step change instead of following it", func() {
+		s := newArrivalSmoother()
+		_ = s.Smooth("pod", 4.0, 60, now)
+
+		// One quarter of a time constant later the rate quadruples. A replica
+		// serving what arrived a residence ago has not felt this yet.
+		got := s.Smooth("pod", 16.0, 60, now.Add(15*time.Second))
+		Expect(got).To(BeNumerically(">", 4.0))
+		Expect(got).To(BeNumerically("<", 16.0))
+	})
+
+	It("converges on the new rate once a few time constants have passed", func() {
+		s := newArrivalSmoother()
+		_ = s.Smooth("pod", 4.0, 10, now)
+		got := 0.0
+		for i := 1; i <= 10; i++ {
+			got = s.Smooth("pod", 16.0, 10, now.Add(time.Duration(i)*10*time.Second))
+		}
+		Expect(got).To(BeNumerically("~", 16.0, 0.5))
+	})
+
+	It("discards a stale average rather than blending it", func() {
+		s := newArrivalSmoother()
+		_ = s.Smooth("pod", 4.0, 10, now)
+		// Well beyond the reset factor: the old value carries no information.
+		Expect(s.Smooth("pod", 16.0, 10, now.Add(time.Hour))).To(Equal(16.0))
+	})
+
+	It("passes the rate through when the residence estimate is unavailable", func() {
+		s := newArrivalSmoother()
+		_ = s.Smooth("pod", 4.0, 0, now)
+		Expect(s.Smooth("pod", 16.0, 0, now.Add(time.Second))).To(Equal(16.0))
+	})
+
+	It("keeps replicas separate", func() {
+		s := newArrivalSmoother()
+		_ = s.Smooth("a", 4.0, 60, now)
+		Expect(s.Smooth("b", 20.0, 60, now)).To(Equal(20.0))
+	})
+
+	It("evicts replicas not seen within the timeout", func() {
+		s := newArrivalSmoother()
+		_ = s.Smooth("fresh", 4.0, 60, now)
+		_ = s.Smooth("gone", 4.0, 60, now.Add(-2*time.Hour))
+		Expect(s.EvictStale(time.Hour, now)).To(Equal(1))
+	})
+})
+
+var _ = Describe("Residence estimate", func() {
+	It("is time to first token plus one ITL per output token", func() {
+		w := residenceSeconds(domain.ReplicaMetrics{
+			AvgTTFT:         2.0,
+			AvgITL:          0.02,
+			AvgOutputTokens: 250,
+		})
+		Expect(w).To(BeNumerically("~", 2.0+250*0.02, 0.001))
+	})
+
+	It("declines without latency data, leaving the arrival rate unsmoothed", func() {
+		Expect(residenceSeconds(domain.ReplicaMetrics{AvgOutputTokens: 250})).To(BeZero())
+		Expect(residenceSeconds(domain.ReplicaMetrics{AvgITL: 0.02})).To(BeZero())
+	})
+
+	It("bounds an implausible reading", func() {
+		Expect(residenceSeconds(domain.ReplicaMetrics{
+			AvgTTFT: 0, AvgITL: 0.0000001, AvgOutputTokens: 1,
+		})).To(Equal(MinResidenceSeconds))
+		Expect(residenceSeconds(domain.ReplicaMetrics{
+			AvgTTFT: 1e6, AvgITL: 1, AvgOutputTokens: 1,
+		})).To(Equal(MaxResidenceSeconds))
+	})
+})

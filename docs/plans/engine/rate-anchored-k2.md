@@ -122,6 +122,25 @@ are already defined and move with them.
 5. **Tests** — store behaviour (backlog gating, max, decay, eviction), estimator
    arithmetic and clamps, flag-off equivalence with the current path.
 
+## Arrival/completion delay
+
+A completion happens one residence time `W` after the arrival that caused it, so a
+completion-derived μ and an instantaneous λ sit on different time bases. During a
+ramp, completions still reflect the lighter load of `W` ago, and μ/λ reads as
+saturation on a replica that is coping. Occupancy has the same property — it is a
+stock that already integrates arrivals over `W`.
+
+λ is therefore smoothed per replica with an EWMA whose time constant is
+`W = AvgTTFT + AvgOutputTokens × AvgITL`, both already collected. The weight comes
+from the actual gap between samples, so an irregular optimize interval or a missed
+cycle does not distort the average; an average older than
+`ArrivalSmoothingResetFactor × W` is discarded rather than blended. Without latency
+data the rate passes through unsmoothed rather than being averaged by a made-up
+constant.
+
+The backlog path needs none of this: it compares no rates, so it is unaffected by
+the delay. That is a second reason to keep it ahead of the completions fallback.
+
 ## Lambda fallback chain
 
 `saturationRatio` takes the most direct signal available:

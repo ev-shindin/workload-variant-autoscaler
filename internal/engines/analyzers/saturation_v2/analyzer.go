@@ -31,6 +31,10 @@ type SaturationAnalyzer struct {
 	// estimator. Nil unless that estimator is enabled, which is what keeps the
 	// occupancy-based path byte-identical when the flag is off.
 	serviceRates *serviceRateStore
+	// arrivals smooths per-replica arrival rates over a residence time so they are
+	// comparable with the completion-derived service rate. Allocated with
+	// serviceRates.
+	arrivals *arrivalSmoother
 }
 
 // Option configures a SaturationAnalyzer at construction.
@@ -44,6 +48,7 @@ func withRateAnchoredK2(enabled bool) Option { //nolint:unparam // tests pass tr
 	return func(a *SaturationAnalyzer) {
 		if enabled {
 			a.serviceRates = newServiceRateStore()
+			a.arrivals = newArrivalSmoother()
 		}
 	}
 }
@@ -57,6 +62,7 @@ func NewSaturationAnalyzer(store *CapacityKnowledgeStore, opts ...Option) *Satur
 	}
 	if EnableRateAnchoredK2 {
 		a.serviceRates = newServiceRateStore()
+		a.arrivals = newArrivalSmoother()
 	}
 	for _, opt := range opts {
 		opt(a)
