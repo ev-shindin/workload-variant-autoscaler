@@ -1684,8 +1684,19 @@ func (e *Engine) applySaturationDecisions(
 		// current allocation, the budget scope, and the direction taken. A reclaim
 		// that could not shed a whole replica (stall) is additionally emitted as a
 		// Warning event so operators see redistribution is blocked without reading logs.
-		if hasDecision && decision.Rescale != nil {
+		// When the model is no longer rescaled this cycle (uncontended, or rescale
+		// disabled), flip a previously-True condition to False so it does not linger as
+		// a stale "still reclaiming" — matching the condition's this-cycle semantics.
+		switch {
+		case hasDecision && decision.Rescale != nil:
 			e.setRescaledCondition(ctx, &updateVa, decision.Rescale)
+		default:
+			if c := llmdVariantAutoscalingV1alpha1.GetCondition(&updateVa, llmdVariantAutoscalingV1alpha1.TypeRescaled); c != nil && c.Status == metav1.ConditionTrue {
+				llmdVariantAutoscalingV1alpha1.SetCondition(&updateVa,
+					llmdVariantAutoscalingV1alpha1.TypeRescaled, metav1.ConditionFalse,
+					llmdVariantAutoscalingV1alpha1.ReasonRescaleHold,
+					"not part of a rescale group this cycle")
+			}
 		}
 
 		// Emit metrics for external autoscalers (Important: Actuator emits these)

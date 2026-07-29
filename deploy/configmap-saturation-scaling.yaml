@@ -55,7 +55,7 @@ data:
     # entry, same as enableRescale) and default 0, which preserves the plain
     # whole-replica behavior. rescaleMinShareGapGPUs is a deadband in whole GPUs:
     # a model is held at its current allocation when its target-vs-current gap is
-    # smaller than this. rescaleCooldownSeconds suppresses a repeat reclaim from a
+    # at or below this (inclusive). rescaleCooldownSeconds suppresses a repeat reclaim from a
     # model until this many seconds after its last reclaim (fills are never cooled
     # down). Recommended when enabling rescale in production: gap 1, cooldown ~60.
     rescaleMinShareGapGPUs: 0

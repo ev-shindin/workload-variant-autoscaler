@@ -46,10 +46,11 @@ type SaturationScalingConfig struct {
 	EnableRescale bool `yaml:"enableRescale,omitempty"`
 
 	// RescaleMinShareGapGPUs is the Beta hysteresis deadband, in whole GPUs: rescale
-	// holds a model at its current allocation this cycle when the target-vs-current
-	// GPU gap is smaller than this value, so a model whose water-fill share drifts by
-	// a GPU or two around the contention threshold does not flap up and down. Default
-	// 0 (whole-replica quantization is the only damping — the Alpha behavior).
+	// holds a model at its current allocation this cycle when the target-vs-current GPU
+	// gap is at or below this value (inclusive), so a model whose water-fill share
+	// drifts by up to this many GPUs around the contention threshold does not flap up
+	// and down. The recommended starting value is 1 (damp single-GPU flaps). Default 0
+	// (whole-replica quantization is the only damping — the Alpha behavior).
 	//
 	// Same BUDGET-SCOPE semantics as EnableRescale: read only from the "default"
 	// entry; global governs the cluster budget, a namespace-local "default" governs

@@ -404,12 +404,13 @@ func (o *GreedyByScoreOptimizer) rescaleModelDecisions(
 	held := heldByHysteresis(o, modelKey(req), targetGPUs, modelCurrent, tuning)
 
 	stalled := false
+	totalShed, totalFilled, reclaimAttempted := 0, 0, false
 	if !held {
-		totalShed := 0
 		for _, role := range roles {
 			rt, rc := tgtByRole[role], curByRole[role]
 			switch {
 			case rt < rc:
+				reclaimAttempted = true
 				unshed := reclaimRole(ctx, req.AnalyzerResults, satEntry.VariantCapacities, role, stateMap, targets, rc-rt)
 				totalShed += (rc - rt) - unshed
 				// A whole-replica-sized shortfall means a role that owed a reclaim could
@@ -423,7 +424,9 @@ func (o *GreedyByScoreOptimizer) rescaleModelDecisions(
 				if want > *freeThisCycle {
 					want = *freeThisCycle
 				}
-				*freeThisCycle -= fillRole(satEntry.VariantCapacities, role, stateMap, targets, want)
+				spent := fillRole(satEntry.VariantCapacities, role, stateMap, targets, want)
+				*freeThisCycle -= spent
+				totalFilled += spent
 			}
 		}
 		// Stamp the cool-down only when a reclaim actually shed GPUs, so a stalled
@@ -434,16 +437,12 @@ func (o *GreedyByScoreOptimizer) rescaleModelDecisions(
 		}
 	}
 
-	action := rescaleAction(targetGPUs, modelCurrent)
-	if held {
-		action = domain.RescaleActionHold
-	}
 	info := &domain.RescaleDecisionInfo{
 		Priority:    req.Priority,
 		TargetGPUs:  targetGPUs,
 		CurrentGPUs: modelCurrent,
 		Scope:       scope,
-		Action:      action,
+		Action:      modelRescaleAction(held, reclaimAttempted, totalShed, totalFilled, targetGPUs, modelCurrent),
 		Stalled:     stalled,
 	}
 
@@ -460,9 +459,11 @@ func (o *GreedyByScoreOptimizer) rescaleModelDecisions(
 }
 
 // heldByHysteresis reports whether the Beta hysteresis holds a model at its current
-// allocation this cycle: the deadband (|target-current| below MinShareGapGPUs) holds
-// both directions; the reclaim cool-down holds only a would-be reclaim (target below
-// current) whose model was reclaimed too recently. Both are inert when their knob is 0.
+// allocation this cycle: the deadband (|target-current| at or below MinShareGapGPUs)
+// holds both directions; the reclaim cool-down holds only a would-be reclaim (target
+// below current) whose model was reclaimed too recently. Both are inert when their
+// knob is 0 (gap==0 returns early, and MinShareGapGPUs==0 can never satisfy the
+// inclusive test since absGap >= 1 here), preserving Alpha behaviour exactly.
 func heldByHysteresis(o *GreedyByScoreOptimizer, key string, targetGPUs, currentGPUs int, tuning RescaleTuning) bool {
 	gap := targetGPUs - currentGPUs
 	if gap == 0 {
@@ -472,7 +473,10 @@ func heldByHysteresis(o *GreedyByScoreOptimizer, key string, targetGPUs, current
 	if absGap < 0 {
 		absGap = -absGap
 	}
-	if tuning.MinShareGapGPUs > 0 && absGap < tuning.MinShareGapGPUs {
+	// Inclusive: a deadband of N holds a drift of up to N whole GPUs. Strict "<" would
+	// make the smallest useful value 2 (with 1 holding nothing, since absGap >= 1 here),
+	// so the documented recommendation of 1 would be inert.
+	if tuning.MinShareGapGPUs > 0 && absGap <= tuning.MinShareGapGPUs {
 		return true // deadband
 	}
 	if gap < 0 && o.inReclaimCooldown(key, tuning) {
@@ -493,6 +497,30 @@ func (o *GreedyByScoreOptimizer) inReclaimCooldown(key string, tuning RescaleTun
 		return false
 	}
 	return o.RescaleNow.Sub(last) < time.Duration(tuning.CooldownSeconds)*time.Second
+}
+
+// modelRescaleAction labels the rescale direction a model actually took this cycle,
+// from the work performed rather than the model-level GPU totals. This matters for a
+// disaggregated (P/D) model whose roles rebalance to a near-zero net delta: the totals
+// would read "hold" even though a role was reclaimed and/or filled — and, worse, a
+// stalled reclaim on such a model would produce a self-contradictory "hold" label under
+// a Stalled condition. Precedence: a hold wins; then any shed (a reclaim, possibly with
+// a paired fill — a rebalance); then a pure fill; then an attempted-but-unshed reclaim
+// (a stall); otherwise fall back to the intent (fill if under-share and merely fill-
+// gated this cycle, else hold).
+func modelRescaleAction(held, reclaimAttempted bool, totalShed, totalFilled, targetGPUs, currentGPUs int) string {
+	switch {
+	case held:
+		return domain.RescaleActionHold
+	case totalShed > 0:
+		return domain.RescaleActionReclaim
+	case totalFilled > 0:
+		return domain.RescaleActionFill
+	case reclaimAttempted:
+		return domain.RescaleActionReclaim
+	default:
+		return rescaleAction(targetGPUs, currentGPUs)
+	}
 }
 
 // rescaleAction classifies a model's rescale direction from its share vs current.

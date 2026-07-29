@@ -44,7 +44,7 @@ for a namespace). Both default `0` (off).
 
 | Knob | Effect |
 |---|---|
-| `rescaleMinShareGapGPUs` | Deadband in whole GPUs. Hold the model when `|share − current| < gap`. |
+| `rescaleMinShareGapGPUs` | Deadband in whole GPUs. Hold the model when `0 < |share − current| ≤ gap` (inclusive, so `gap: 1` damps a single-GPU flap). |
 | `rescaleCooldownSeconds` | Per-model reclaim cool-down in seconds. Suppress a repeat reclaim within the window. |
 
 Recommended when enabling rescale in production: `gap: 1`, `cooldown: ~60`.
@@ -70,14 +70,24 @@ delta (before the per-role split):
 State: the cool-down clock (`time.Now()` for the cycle) and an engine-owned
 `map[modelKey]time.Time` last-reclaim store are handed to the optimizer each cycle. The
 store is touched only by the single optimize goroutine (lock-free) and is pruned to the
-live model set every cycle. Both knobs are inert at 0 — the deadband condition and the
+live model set every cycle. Both knobs are inert at 0 — the deadband is inclusive
+(`0 < |gap| ≤ knob`) but `absGap ≥ 1` while `knob == 0` never satisfies it, and the
 cool-down window can never trigger — so Alpha behaviour is preserved byte-for-byte.
+
+**Known limitation (deferred):** the deadband is evaluated on the *model-level* gap and,
+when it holds, skips the whole per-role loop. For a disaggregated (P/D) model whose total
+sits inside the band while its role split swings, a budget-neutral prefill↔decode
+rebalance is frozen for that cycle. This only bites at `gap ≥ 2` with a specific
+imbalanced-P/D shape (the recommended `gap: 1` never triggers it), so it is left as a
+future refinement (a per-role deadband) rather than fixed here.
 
 ## Observability
 
 - `domain.RescaleDecisionInfo` (attached to every rescale decision; nil otherwise)
   carries `Priority`, `TargetGPUs` (share), `CurrentGPUs`, `Scope`, `Action`
-  (`reclaim`/`fill`/`hold`), and `Stalled`.
+  (`reclaim`/`fill`/`hold`), and `Stalled`. `Action` is derived from the work actually
+  performed (`modelRescaleAction`), not the model-level GPU totals, so a P/D model that
+  rebalances to a near-zero net delta — or stalls on one role — is not mislabeled `hold`.
 - `reclaimRole` returns the GPUs it could not shed; a whole-replica-sized shortfall
   marks the model stalled.
 - The engine's `applySaturationDecisions` calls `setRescaledCondition`, which sets the
@@ -85,7 +95,9 @@ cool-down window can never trigger — so Alpha behaviour is preserved byte-for-
   `Reclaim`/`Fill`/`Hold`/`Stalled` and a message
   `priority=… share=…GPU current=…GPU scope=…`. A stall additionally emits the
   `RescaleStalled` Warning event (added to `recordEvent`'s dedup-bypass list so it
-  coexists with a scaling event) and a log line.
+  coexists with a scaling event) and a log line. When a VA is no longer rescaled (its
+  group became uncontended, or rescale was disabled), a previously-`True` `Rescaled`
+  condition is flipped to `False` so it does not linger as a stale "still reclaiming".
 
 ## Files
 
