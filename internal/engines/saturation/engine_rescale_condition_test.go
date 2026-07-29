@@ -71,6 +71,30 @@ func TestSetRescaledCondition_Fill(t *testing.T) {
 	}
 }
 
+// TestSetRescaledCondition_Hold uses the Hold reason for a model held (deadband/cool-down)
+// or already at its share, and emits no event.
+func TestSetRescaledCondition_Hold(t *testing.T) {
+	e, rec := newRescaleTestEngine()
+	va := newRescaleTestVA()
+
+	e.setRescaledCondition(context.Background(), va, &domain.RescaleDecisionInfo{
+		Priority: 1, TargetGPUs: 4, CurrentGPUs: 4, Scope: "cluster",
+		Action: domain.RescaleActionHold,
+	})
+
+	cond := llmdVariantAutoscalingV1alpha1.GetCondition(va, llmdVariantAutoscalingV1alpha1.TypeRescaled)
+	if assert.NotNil(t, cond) {
+		assert.Equal(t, llmdVariantAutoscalingV1alpha1.ReasonRescaleHold, cond.Reason)
+		assert.Contains(t, cond.Message, "(hold)")
+	}
+
+	select {
+	case ev := <-rec.Events:
+		t.Errorf("no event expected for a hold, got %q", ev)
+	default:
+	}
+}
+
 // TestSetRescaledCondition_Stalled uses the Stalled reason (overriding the direction)
 // and emits a RescaleStalled Warning event.
 func TestSetRescaledCondition_Stalled(t *testing.T) {

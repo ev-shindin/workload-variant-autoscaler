@@ -751,6 +751,46 @@ var _ = Describe("GreedyByScoreOptimizer rescale observability (Beta)", func() {
 		Expect(dm["A-v"].TargetReplicas).To(Equal(1), "A stays at its protected replica")
 	})
 
+	// Sub-replica leftover is NOT a stall (guards the `unshed >= gMin` threshold, not a
+	// naive `unshed > 0`). A100 at 2 GPUs/replica: A holds 4 replicas (8 GPUs), its
+	// water-fill share is 5 GPUs (an odd, sub-replica-aligned target), so reclaim owes 3
+	// GPUs, sheds one whole replica (2 GPUs) and leaves 1 GPU unshed — 1 < gMin 2, benign
+	// quantization, not a stall. (Priorities 1 and 0.6 make the split land at exactly 5/3.)
+	It("does not flag a sub-replica reclaim leftover as stalled", func() {
+		mk2 := func(id string, prio float64) ModelScalingRequest {
+			r := &domain.AnalyzerResult{
+				ModelID: id, Namespace: "default", TotalDemand: 8000,
+				VariantCapacities: []domain.VariantCapacity{
+					{VariantName: id + "-v", AcceleratorName: "A100", Cost: 5, PerReplicaCapacity: 1000, ReplicaCount: 4},
+				},
+			}
+			return withSatEntry(r, ModelScalingRequest{
+				ModelID: id, Namespace: "default", Priority: prio,
+				VariantStates: []domain.VariantReplicaState{
+					{VariantName: id + "-v", CurrentReplicas: 4, GPUsPerReplica: 2},
+				},
+			})
+		}
+		o := NewGreedyByScoreOptimizer()
+		o.Rescale = RescaleFlags{Cluster: true}
+		// A holds 8 GPUs, B holds 0; budget 8 (full) so B's fill is gated to 0.
+		reqs := []ModelScalingRequest{mk2("A", 1), func() ModelScalingRequest {
+			r := mk2("B", 0.6)
+			r.VariantStates[0].CurrentReplicas = 0
+			saturationEntry(r.AnalyzerResults).VariantCapacities[0].ReplicaCount = 0
+			return r
+		}()}
+		cons := []*ResourceConstraints{{Pools: map[string]ResourcePool{"A100": {Limit: 8, Used: 8}}}}
+		dm := decisionMap(o.Optimize(context.Background(), reqs, cons))
+
+		ra := dm["A-v"].Rescale
+		Expect(ra).NotTo(BeNil())
+		Expect(ra.TargetGPUs).To(Equal(5), "water-fill share is an odd GPU count")
+		Expect(ra.Action).To(Equal(domain.RescaleActionReclaim))
+		Expect(ra.Stalled).To(BeFalse(), "1-GPU sub-replica leftover is quantization, not a stall")
+		Expect(dm["A-v"].TargetReplicas).To(Equal(3), "shed exactly one 2-GPU replica")
+	})
+
 	// Rescale off ⇒ no info attached (nil), regardless of contention.
 	It("attaches no info when rescale is off", func() {
 		o := NewGreedyByScoreOptimizer()
@@ -767,8 +807,8 @@ var _ = Describe("GreedyByScoreOptimizer rescale observability (Beta)", func() {
 
 var _ = Describe("GreedyByScoreOptimizer rescale hysteresis (Beta)", func() {
 	// Deadband: equal-priority A(5)/B(3) on a full budget of 8 water-fill to 4/4, so A
-	// owes a 1-GPU reclaim. A deadband of 2 GPUs holds A at 5 (gap 1 < 2); without it,
-	// A would reclaim to 4.
+	// owes a 1-GPU reclaim. The deadband is inclusive, so the *recommended* value of 1
+	// already holds a 1-GPU drift; without it, A would reclaim to 4.
 	It("holds a sub-deadband reclaim", func() {
 		reqs := func() []ModelScalingRequest {
 			return []ModelScalingRequest{
@@ -783,12 +823,48 @@ var _ = Describe("GreedyByScoreOptimizer rescale hysteresis (Beta)", func() {
 		plain.Rescale = RescaleFlags{Cluster: true}
 		Expect(decisionMap(plain.Optimize(context.Background(), reqs(), cons))["A-v"].TargetReplicas).To(Equal(4))
 
-		// With a 2-GPU deadband: the 1-GPU gap is held, A stays at 5.
+		// With the recommended 1-GPU deadband: the 1-GPU gap is held, A stays at 5.
+		o := NewGreedyByScoreOptimizer()
+		o.Rescale = RescaleFlags{Cluster: true, ClusterTuning: RescaleTuning{MinShareGapGPUs: 1}}
+		dm := decisionMap(o.Optimize(context.Background(), reqs(), cons))
+		Expect(dm["A-v"].TargetReplicas).To(Equal(5), "held by the inclusive 1-GPU deadband")
+		Expect(dm["A-v"].Rescale.Action).To(Equal(domain.RescaleActionHold))
+	})
+
+	// The deadband is a MAXIMUM held drift: a gap strictly larger than it is NOT held.
+	// Same setup but A holds 6 (owes a 2-GPU reclaim to its share of 4); a 1-GPU deadband
+	// does not hold it, so A reclaims.
+	It("does not hold a drift larger than the deadband", func() {
+		o := NewGreedyByScoreOptimizer()
+		o.Rescale = RescaleFlags{Cluster: true, ClusterTuning: RescaleTuning{MinShareGapGPUs: 1}}
+		reqs := []ModelScalingRequest{
+			rescaleReq("A", "default", 1, 8000, 6),
+			rescaleReq("B", "default", 1, 8000, 2),
+		}
+		cons := []*ResourceConstraints{{Pools: map[string]ResourcePool{"A100": {Limit: 8, Used: 8}}}}
+		dm := decisionMap(o.Optimize(context.Background(), reqs, cons))
+		Expect(dm["A-v"].TargetReplicas).To(Equal(4), "2-GPU gap exceeds the 1-GPU deadband -> reclaimed")
+	})
+
+	// The deadband holds the FILL side too (not just reclaims). Equal-priority A(5)/B(4)
+	// under contention water-fill to 6/5, so each owes a 1-GPU fill. With 2 GPUs free
+	// this cycle the fills are fundable, yet a 2-GPU deadband holds both — neither fills
+	// and the free GPUs stay unconsumed. (A cool-down would not do this — it never
+	// suppresses fills.)
+	It("holds a sub-deadband fill", func() {
 		o := NewGreedyByScoreOptimizer()
 		o.Rescale = RescaleFlags{Cluster: true, ClusterTuning: RescaleTuning{MinShareGapGPUs: 2}}
-		dm := decisionMap(o.Optimize(context.Background(), reqs(), cons))
-		Expect(dm["A-v"].TargetReplicas).To(Equal(5), "held by deadband")
+		reqs := []ModelScalingRequest{
+			rescaleReq("A", "default", 1, 8000, 5),
+			rescaleReq("B", "default", 1, 8000, 4),
+		}
+		// currentUsage 9, free 2 -> budget 11; shares 6/5, each a 1-GPU fill within the band.
+		cons := []*ResourceConstraints{{Pools: map[string]ResourcePool{"A100": {Limit: 11, Used: 9}}}}
+		dm := decisionMap(o.Optimize(context.Background(), reqs, cons))
+		Expect(dm["A-v"].TargetReplicas).To(Equal(5), "1-GPU fill held by the 2-GPU deadband")
+		Expect(dm["B-v"].TargetReplicas).To(Equal(4), "1-GPU fill held by the 2-GPU deadband")
 		Expect(dm["A-v"].Rescale.Action).To(Equal(domain.RescaleActionHold))
+		Expect(dm["B-v"].Rescale.Action).To(Equal(domain.RescaleActionHold))
 	})
 
 	// Cool-down: A is reclaimed in cycle 1 (stamping the cool-down), held in cycle 2
