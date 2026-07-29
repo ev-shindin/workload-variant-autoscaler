@@ -219,11 +219,10 @@ type DecisionStep struct {
 }
 
 // RescaleDecisionInfo is the observability payload attached to a decision produced
-// by the priority-weighted rescale pass. It records the model-level view that drove
-// the per-variant decision — priority, the water-fill share (TargetGPUs) vs current
-// allocation, the budget scope, the direction taken, and whether a reclaim stalled
-// (a role could not shed a whole replica, so the model stays above its share). It is
-// nil on every non-rescale decision.
+// by the priority-weighted rescale pass. Priority, TargetGPUs (the water-fill share),
+// CurrentGPUs, and Scope are model-level context; Action and Stalled are per-variant,
+// derived from the variant's own role — so a P/D model's grown role is not blamed with
+// the shed role's reclaim or stall. It is nil on every non-rescale decision.
 type RescaleDecisionInfo struct {
 	// Priority is the model's priority multiplier used in the weight.
 	Priority float64
@@ -233,11 +232,12 @@ type RescaleDecisionInfo struct {
 	CurrentGPUs int
 	// Scope is the budget scope the model competes in: "cluster" or a namespace name.
 	Scope string
-	// Action is the rescale direction for this model this cycle: "reclaim", "fill",
-	// or "hold" (within its share, or suppressed by hysteresis).
+	// Action is this variant's rescale direction this cycle: "reclaim", "fill", or
+	// "hold" (no change, within share, or suppressed by hysteresis).
 	Action string
-	// Stalled is true when a reclaim could not shed a whole replica it owed (blocked
-	// by minReplicas or the cheapest-at-1 protection), so the model remains over-share.
+	// Stalled is true when this variant's role owed a reclaim but could not shed a whole
+	// replica (blocked by minReplicas or the cheapest-at-1 protection). It is never set
+	// on a variant that scaled up.
 	Stalled bool
 }
 

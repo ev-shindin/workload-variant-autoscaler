@@ -364,9 +364,10 @@ func (o *GreedyByScoreOptimizer) applyRescale(
 // first, gated on *freeThisCycle). Reclaim decisions are tagged DecisionReasonRescale.
 // scope is the model's budget scope ("cluster" or a namespace) for observability.
 // tuning applies the Beta hysteresis (deadband + reclaim cool-down): when it holds
-// the model, no reclaim/fill runs this cycle. Every decision it returns carries a
-// *domain.RescaleDecisionInfo summarising the model's priority, share (targetGPUs)
-// vs current, direction, and reclaim-stall state.
+// the model, no reclaim/fill runs this cycle. Every decision carries its own
+// *domain.RescaleDecisionInfo: model-level priority/share (targetGPUs) vs current and
+// scope, but a per-variant Action and Stalled derived from that variant's role, so a
+// P/D model's grown role is never mislabeled with the shed role's reclaim/stall.
 func (o *GreedyByScoreOptimizer) rescaleModelDecisions(
 	ctx context.Context,
 	req ModelScalingRequest,
@@ -403,30 +404,34 @@ func (o *GreedyByScoreOptimizer) rescaleModelDecisions(
 	// report a "hold" action. Both checks are inert when their knob is 0 (Alpha).
 	held := heldByHysteresis(o, modelKey(req), targetGPUs, modelCurrent, tuning)
 
-	stalled := false
-	totalShed, totalFilled, reclaimAttempted := 0, 0, false
+	// Per-role outcome, so the observability payload attaches to each variant by ITS
+	// role rather than sharing one model-level summary — a P/D model whose decode role
+	// stalls while prefill fills must not blame the (grown) prefill variant with a
+	// shed-stall. roleIntent is the role's direction (reclaim/fill/hold); roleStalled
+	// marks a role that owed a reclaim but could not shed a whole replica.
+	roleIntent := make(map[string]string, len(roles))
+	roleStalled := make(map[string]bool, len(roles))
+	totalShed := 0
 	if !held {
 		for _, role := range roles {
 			rt, rc := tgtByRole[role], curByRole[role]
+			roleIntent[role] = rescaleAction(rt, rc)
 			switch {
 			case rt < rc:
-				reclaimAttempted = true
 				unshed := reclaimRole(ctx, req.AnalyzerResults, satEntry.VariantCapacities, role, stateMap, targets, rc-rt)
 				totalShed += (rc - rt) - unshed
 				// A whole-replica-sized shortfall means a role that owed a reclaim could
 				// not shed even one replica (blocked by minReplicas / cheapest-at-1); a
 				// smaller leftover is just sub-replica quantization, not a stall.
 				if gMin := roleMinGPUsPerReplica(satEntry.VariantCapacities, role, stateMap); gMin > 0 && unshed >= gMin {
-					stalled = true
+					roleStalled[role] = true
 				}
 			case rt > rc:
 				want := rt - rc
 				if want > *freeThisCycle {
 					want = *freeThisCycle
 				}
-				spent := fillRole(satEntry.VariantCapacities, role, stateMap, targets, want)
-				*freeThisCycle -= spent
-				totalFilled += spent
+				*freeThisCycle -= fillRole(satEntry.VariantCapacities, role, stateMap, targets, want)
 			}
 		}
 		// Stamp the cool-down only when a reclaim actually shed GPUs, so a stalled
@@ -437,23 +442,47 @@ func (o *GreedyByScoreOptimizer) rescaleModelDecisions(
 		}
 	}
 
-	info := &domain.RescaleDecisionInfo{
-		Priority:    req.Priority,
-		TargetGPUs:  targetGPUs,
-		CurrentGPUs: modelCurrent,
-		Scope:       scope,
-		Action:      modelRescaleAction(held, reclaimAttempted, totalShed, totalFilled, targetGPUs, modelCurrent),
-		Stalled:     stalled,
-	}
-
 	decisions := buildDecisionsWithOptimizer(req, stateMap, vcMap, targets, "rescale")
 	for i := range decisions {
-		if decisions[i].Action == domain.ActionScaleDown {
-			decisions[i].SetDecisionReason(domain.ActionScaleDown, domain.DecisionReasonRescale,
+		d := &decisions[i]
+		role := d.Role
+		if role == "" {
+			role = domain.RoleBoth
+		}
+
+		action := domain.RescaleActionHold
+		stalled := false
+		if !held {
+			// The variant's own action is authoritative when it moved; a no-change
+			// variant reflects its role's intent (a fill gated to 0 this cycle still
+			// reports "fill"; a reclaim blocked at minReplicas still reports "reclaim").
+			switch d.Action {
+			case domain.ActionScaleDown:
+				action = domain.RescaleActionReclaim
+			case domain.ActionScaleUp:
+				action = domain.RescaleActionFill
+			default:
+				if action = roleIntent[role]; action == "" {
+					action = domain.RescaleActionHold
+				}
+			}
+			// A variant being grown is never "stalled on shedding" — only attribute the
+			// role's stall to variants that did not scale up.
+			stalled = roleStalled[role] && d.Action != domain.ActionScaleUp
+		}
+
+		if d.Action == domain.ActionScaleDown {
+			d.SetDecisionReason(domain.ActionScaleDown, domain.DecisionReasonRescale,
 				string(domain.DecisionReasonRescale)+" (optimizer: rescale, reclaim)")
 		}
-		// Share the immutable model-level summary across the model's variant decisions.
-		decisions[i].Rescale = info
+		d.Rescale = &domain.RescaleDecisionInfo{
+			Priority:    req.Priority,
+			TargetGPUs:  targetGPUs,
+			CurrentGPUs: modelCurrent,
+			Scope:       scope,
+			Action:      action,
+			Stalled:     stalled,
+		}
 	}
 	return decisions
 }
@@ -499,31 +528,8 @@ func (o *GreedyByScoreOptimizer) inReclaimCooldown(key string, tuning RescaleTun
 	return o.RescaleNow.Sub(last) < time.Duration(tuning.CooldownSeconds)*time.Second
 }
 
-// modelRescaleAction labels the rescale direction a model actually took this cycle,
-// from the work performed rather than the model-level GPU totals. This matters for a
-// disaggregated (P/D) model whose roles rebalance to a near-zero net delta: the totals
-// would read "hold" even though a role was reclaimed and/or filled — and, worse, a
-// stalled reclaim on such a model would produce a self-contradictory "hold" label under
-// a Stalled condition. Precedence: a hold wins; then any shed (a reclaim, possibly with
-// a paired fill — a rebalance); then a pure fill; then an attempted-but-unshed reclaim
-// (a stall); otherwise fall back to the intent (fill if under-share and merely fill-
-// gated this cycle, else hold).
-func modelRescaleAction(held, reclaimAttempted bool, totalShed, totalFilled, targetGPUs, currentGPUs int) string {
-	switch {
-	case held:
-		return domain.RescaleActionHold
-	case totalShed > 0:
-		return domain.RescaleActionReclaim
-	case totalFilled > 0:
-		return domain.RescaleActionFill
-	case reclaimAttempted:
-		return domain.RescaleActionReclaim
-	default:
-		return rescaleAction(targetGPUs, currentGPUs)
-	}
-}
-
-// rescaleAction classifies a model's rescale direction from its share vs current.
+// rescaleAction classifies a rescale direction from a share (target) vs current, used
+// per role to label each variant's decision.
 func rescaleAction(targetGPUs, currentGPUs int) string {
 	switch {
 	case targetGPUs < currentGPUs:

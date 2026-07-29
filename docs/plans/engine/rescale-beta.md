@@ -74,22 +74,29 @@ live model set every cycle. Both knobs are inert at 0 — the deadband is inclus
 (`0 < |gap| ≤ knob`) but `absGap ≥ 1` while `knob == 0` never satisfies it, and the
 cool-down window can never trigger — so Alpha behaviour is preserved byte-for-byte.
 
-**Known limitation (deferred):** the deadband is evaluated on the *model-level* gap and,
-when it holds, skips the whole per-role loop. For a disaggregated (P/D) model whose total
-sits inside the band while its role split swings, a budget-neutral prefill↔decode
-rebalance is frozen for that cycle. This only bites at `gap ≥ 2` with a specific
-imbalanced-P/D shape (the recommended `gap: 1` never triggers it), so it is left as a
-future refinement (a per-role deadband) rather than fixed here.
+**Known limitations (deferred):**
+- The deadband is evaluated on the *model-level* gap and, when it holds, skips the whole
+  per-role loop. For a disaggregated (P/D) model whose total sits inside the band while its
+  role split swings, a budget-neutral prefill↔decode rebalance is frozen for that cycle.
+  This only bites at `gap ≥ 2` with a specific imbalanced-P/D shape (the recommended
+  `gap: 1` never triggers it), so it is left as a future refinement (a per-role deadband).
+- The condition/event message reports the model-level `share`/`current` GPUs. For a P/D
+  model whose roles rebalance to a near-zero net delta, a genuine role-level stall can
+  therefore surface with `share == current` in the text — accurate at the model level but
+  hiding the role imbalance that caused it. Surfacing role-level numbers is a future polish.
 
 ## Observability
 
 - `domain.RescaleDecisionInfo` (attached to every rescale decision; nil otherwise)
-  carries `Priority`, `TargetGPUs` (share), `CurrentGPUs`, `Scope`, `Action`
-  (`reclaim`/`fill`/`hold`), and `Stalled`. `Action` is derived from the work actually
-  performed (`modelRescaleAction`), not the model-level GPU totals, so a P/D model that
-  rebalances to a near-zero net delta — or stalls on one role — is not mislabeled `hold`.
+  carries model-level `Priority`, `TargetGPUs` (share), `CurrentGPUs`, `Scope`, plus a
+  **per-variant** `Action` (`reclaim`/`fill`/`hold`) and `Stalled`. Action/Stalled are
+  keyed off the variant's own role (`VariantDecision.Role`), not one shared model-level
+  summary, so a P/D model whose decode role stalls while its prefill role fills does not
+  blame the grown prefill variant with the decode reclaim/stall. A no-change variant
+  reflects its role's intent (a fill gated to 0 this cycle still reads `fill`; a reclaim
+  blocked at `minReplicas` still reads `reclaim`); a scaled-up variant is never `Stalled`.
 - `reclaimRole` returns the GPUs it could not shed; a whole-replica-sized shortfall
-  marks the model stalled.
+  marks that **role** stalled, attributed to that role's variants.
 - The engine's `applySaturationDecisions` calls `setRescaledCondition`, which sets the
   `Rescaled` condition (`variant.TypeRescaled`) with reason
   `Reclaim`/`Fill`/`Hold`/`Stalled` and a message

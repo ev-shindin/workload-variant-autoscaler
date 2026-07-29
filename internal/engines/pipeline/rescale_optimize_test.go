@@ -791,6 +791,48 @@ var _ = Describe("GreedyByScoreOptimizer rescale observability (Beta)", func() {
 		Expect(dm["A-v"].TargetReplicas).To(Equal(3), "shed exactly one 2-GPU replica")
 	})
 
+	// Per-variant attribution: a P/D model whose decode role stalls (can't shed its
+	// protected last replica) while its prefill role fills must NOT blame the grown
+	// prefill variant with the decode reclaim/stall. Each variant's info reflects its
+	// own role. A shared model-level payload would mislabel prefill as fill+stalled.
+	It("attributes stall to the shed role, not the filled role, on a P/D model", func() {
+		o := NewGreedyByScoreOptimizer()
+		o.Rescale = RescaleFlags{Cluster: true}
+
+		a := &domain.AnalyzerResult{
+			ModelID: "A", Namespace: "default", TotalDemand: 6000,
+			RoleCapacities: map[string]domain.RoleCapacity{
+				"prefill": {TotalDemand: 6000},
+				"decode":  {TotalDemand: 0},
+			},
+			VariantCapacities: []domain.VariantCapacity{
+				{VariantName: "A-prefill", AcceleratorName: "A100", Cost: 5, PerReplicaCapacity: 1000, Role: "prefill", ReplicaCount: 1},
+				{VariantName: "A-decode", AcceleratorName: "A100", Cost: 5, PerReplicaCapacity: 1000, Role: "decode", ReplicaCount: 1},
+			},
+		}
+		reqA := withSatEntry(a, ModelScalingRequest{
+			ModelID: "A", Namespace: "default", Priority: 1, Disaggregated: true,
+			VariantStates: []domain.VariantReplicaState{
+				{VariantName: "A-prefill", CurrentReplicas: 1, GPUsPerReplica: 1, Role: "prefill"},
+				{VariantName: "A-decode", CurrentReplicas: 1, GPUsPerReplica: 1, Role: "decode"},
+			},
+		})
+		// Budget 3 (free 1 + current 2), contended (demand 6 > 3): A's share is 3, split
+		// prefill 3 / decode 0. Decode owes a reclaim to 0 but is protected at 1 (stall);
+		// prefill fills 1->2 with the 1 free GPU.
+		cons := []*ResourceConstraints{{Pools: map[string]ResourcePool{"A100": {Limit: 3, Used: 2}}}}
+		dm := decisionMap(o.Optimize(context.Background(), []ModelScalingRequest{reqA}, cons))
+
+		pf, dc := dm["A-prefill"], dm["A-decode"]
+		Expect(pf.Action).To(Equal(domain.ActionScaleUp), "prefill grows into the free GPU")
+		Expect(pf.Rescale.Action).To(Equal(domain.RescaleActionFill))
+		Expect(pf.Rescale.Stalled).To(BeFalse(), "a grown variant is never stalled on shedding")
+
+		Expect(dc.TargetReplicas).To(Equal(1), "decode can't shed its protected last replica")
+		Expect(dc.Rescale.Action).To(Equal(domain.RescaleActionReclaim), "decode owed a reclaim")
+		Expect(dc.Rescale.Stalled).To(BeTrue(), "the stall belongs to the decode role")
+	})
+
 	// Rescale off ⇒ no info attached (nil), regardless of contention.
 	It("attaches no info when rescale is off", func() {
 		o := NewGreedyByScoreOptimizer()
