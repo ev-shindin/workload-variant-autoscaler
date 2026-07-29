@@ -38,15 +38,25 @@ against that workload and none of them broke the cycling.
 Add a second, **rate-anchored** estimator for `k2`, selected by an internal flag,
 leaving the existing estimator in place and untouched when the flag is off.
 
-When a replica has a backlog, its completion rate *is* its service rate — this
+When a replica *cannot keep up*, its completion rate is its service rate — this
 holds whichever resource binds (prefill compute, decode bandwidth, memory), which
 is what makes it the right anchor for a workload-agnostic capacity model:
 
 ```
-μ  = max completion rate observed for this workload bucket while QueueLength > 0
+μ  = max completion rate for this bucket, observed only while the queue was
+     at least QueueLengthThreshold deep, over ≥ MinServiceRateSamples samples
 λ  = this replica's arrival rate (EPP dispatch rate)
 k2 = KvUsageInstant × TotalKvCapacityTokens × (μ / λ)
 ```
+
+**μ must be a ceiling, and that has to be established rather than assumed.** With
+no backlog, completions equal arrivals at any load — flow conservation — so an idle
+replica's completion rate carries no information about its limit. If μ were
+recorded from a momentary queue, `μ = λ` would later read as saturation on a
+replica that is merely keeping up comfortably at low occupancy, and the estimator
+would over-provision: the mirror image of the bug it replaces. Hence two gates: a
+queue depth of at least `QueueLengthThreshold` (default 5) to record at all, and
+`MinServiceRateSamples` (2) qualifying observations before a bucket answers.
 
 At `λ = μ` the replica is exactly saturated and `k2` equals its current occupancy,
 so utilization reads 100% **even at 16% KV**. At `λ = μ/2`, `k2` is twice the

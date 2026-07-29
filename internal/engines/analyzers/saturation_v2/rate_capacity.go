@@ -18,7 +18,16 @@ import (
 // low, so the estimate carries no information about the binding constraint.
 //
 // This estimator anchors on the one quantity that is meaningful whichever resource
-// binds: while a replica has a backlog, its completion rate IS its service rate.
+// binds: while a replica cannot keep up, its completion rate IS its service rate.
+//
+// "Cannot keep up" has to be established, not assumed. With no backlog, completions
+// equal arrivals at any load — flow conservation — so an idle replica's completion
+// rate says nothing about its ceiling. mu is therefore recorded only from replicas
+// with a queue at least QueueLengthThreshold deep, and a bucket needs
+// MinServiceRateSamples such observations before it will answer. Without that,
+// one burst of arrival jitter would pin mu at whatever the replica happened to be
+// doing, and every later lambda near that value would read as saturation at low
+// occupancy — over-provisioning, the mirror of the bug this replaces.
 //
 //	mu = highest completion rate seen for this workload bucket while queued
 //	k2 = occupancy × (mu / lambda)
@@ -57,6 +66,11 @@ const (
 	MinRateRatio = 0.05
 	MaxRateRatio = 20.0
 
+	// MinServiceRateSamples is how many qualifying observations a bucket needs
+	// before its service rate is usable. One observation cannot distinguish a real
+	// ceiling from a single slow interval.
+	MinServiceRateSamples = 2
+
 	// MinRateAnchoredFraction floors the estimate at a fraction of k1. A replica
 	// that has stalled completely (mu near zero while requests are queued) would
 	// otherwise drive capacity to ~0 and demand an unbounded scale-up.
@@ -75,6 +89,7 @@ type serviceRateStore struct {
 type serviceRateEntry struct {
 	rate     float64
 	observed time.Time
+	samples  int
 }
 
 func newServiceRateStore() *serviceRateStore {
@@ -92,9 +107,10 @@ func (s *serviceRateStore) Observe(key string, rate float64, now time.Time) {
 
 	e, ok := s.entries[key]
 	if !ok {
-		s.entries[key] = &serviceRateEntry{rate: rate, observed: now}
+		s.entries[key] = &serviceRateEntry{rate: rate, observed: now, samples: 1}
 		return
 	}
+	e.samples++
 	// Compare against the decayed value so a stale peak yields to a fresh, lower
 	// observation rather than persisting until eviction.
 	if decayed := decayRate(e.rate, now.Sub(e.observed)); rate >= decayed {
@@ -113,6 +129,9 @@ func (s *serviceRateStore) Rate(key string, now time.Time) (float64, bool) {
 
 	e, ok := s.entries[key]
 	if !ok {
+		return 0, false
+	}
+	if e.samples < MinServiceRateSamples {
 		return 0, false
 	}
 	if now.Sub(e.observed) > ServiceRateWindow {
@@ -181,6 +200,7 @@ func (a *SaturationAnalyzer) rateAnchoredK2(
 	modelID string,
 	gpuCount int,
 	k1 int64,
+	queueThreshold float64,
 	now time.Time,
 ) (int64, k2Source, bool, bool) {
 	if a.serviceRates == nil {
@@ -189,8 +209,9 @@ func (a *SaturationAnalyzer) rateAnchoredK2(
 
 	key := serviceRateKey(modelID, rm.AcceleratorName, gpuCount, rm.AvgInputTokens, rm.AvgOutputTokens)
 
-	// A replica with a backlog is serving at capacity: record what it achieved.
-	if rm.QueueLength > 0 && rm.RequestRate > 0 {
+	// Only a sustained backlog establishes a ceiling; see the package comment.
+	backlogged := float64(rm.QueueLength) >= queueThreshold
+	if backlogged && rm.RequestRate > 0 {
 		a.serviceRates.Observe(key, rm.RequestRate, now)
 	}
 
@@ -201,7 +222,7 @@ func (a *SaturationAnalyzer) rateAnchoredK2(
 		return 0, 0, false, false
 	}
 
-	ratio, src, ok := a.saturationRatio(rm, key, now)
+	ratio, src, ok := a.saturationRatio(rm, key, backlogged, now)
 	if !ok {
 		return 0, 0, false, false
 	}
@@ -229,11 +250,13 @@ func (a *SaturationAnalyzer) rateAnchoredK2(
 //
 //  1. EPP arrival rate. The intended path: lambda is measured independently of the
 //     engine, so the ratio holds whether or not the replica is keeping up.
-//  2. Backlog. A queueing replica is saturated by observation: arrivals exceed
-//     service, so the ratio is at most 1 and capacity is the current occupancy.
-//     This needs neither lambda nor a calibrated mu, which makes it the safety net
-//     for a fleet with no EPP and no prior calibration — and it is exactly the
-//     prefill-heavy case the occupancy estimator misreads as idle.
+//  2. Backlog. A replica queueing at least QueueLengthThreshold deep is saturated
+//     by observation: arrivals exceed service, so the ratio is at most 1 and
+//     capacity is the current occupancy. This needs neither lambda nor a calibrated
+//     mu, which makes it the safety net for a fleet with no EPP and no prior
+//     calibration — and it is exactly the prefill-heavy case the occupancy
+//     estimator misreads as idle. A shallower queue does not qualify: arrival
+//     jitter produces one every so often at any load.
 //  3. Completion rate as lambda. With no queue, everything that arrives is served
 //     within the scrape window, so completions are arrivals. Valid only in that
 //     case, which is why it sits behind the backlog check rather than in front.
@@ -242,6 +265,7 @@ func (a *SaturationAnalyzer) rateAnchoredK2(
 func (a *SaturationAnalyzer) saturationRatio(
 	rm domain.ReplicaMetrics,
 	key string,
+	backlogged bool,
 	now time.Time,
 ) (float64, k2Source, bool) {
 	muRate, haveMu := a.serviceRates.Rate(key, now)
@@ -249,7 +273,7 @@ func (a *SaturationAnalyzer) saturationRatio(
 	if rm.ArrivalRate > 0 && haveMu {
 		return muRate / rm.ArrivalRate, k2SrcRateAnchored, true
 	}
-	if rm.QueueLength > 0 {
+	if backlogged {
 		return 1.0, k2SrcRateBacklog, true
 	}
 	if haveMu && rm.RequestRate > 0 {
