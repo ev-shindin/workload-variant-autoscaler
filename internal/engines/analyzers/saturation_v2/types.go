@@ -10,17 +10,23 @@ const learnedFromLive = "live"
 type k2Source int
 
 const (
-	k2SrcObserved   k2Source = iota + 1 // queue saturated: tokensInUse
-	k2SrcHistorical                     // rolling average from prior observations
-	k2SrcDerived                        // estimated from deployment args
-	k2SrcFallback                       // fallback to k1 (memory-bound)
+	k2SrcObserved     k2Source = iota + 1 // queue saturated: tokensInUse
+	k2SrcHistorical                       // rolling average from prior observations
+	k2SrcDerived                          // estimated from deployment args
+	k2SrcFallback                         // fallback to k1 (memory-bound)
+	k2SrcRateAnchored                     // rate-anchored: mu/lambda from the EPP arrival rate
+	k2SrcRateBacklog                      // rate-anchored: replica had a backlog, so it is saturated
+	k2SrcRateNoEPP                        // rate-anchored: mu/lambda with completions standing in for lambda
 )
 
 var k2Labels = map[k2Source]string{
-	k2SrcObserved:   "P1-obs",
-	k2SrcHistorical: "P2-hist",
-	k2SrcDerived:    "P3-k2",
-	k2SrcFallback:   "P4-k1",
+	k2SrcObserved:     "P1-obs",
+	k2SrcHistorical:   "P2-hist",
+	k2SrcDerived:      "P3-k2",
+	k2SrcFallback:     "P4-k1",
+	k2SrcRateAnchored: "RATE-λ",
+	k2SrcRateBacklog:  "RATE-q",
+	k2SrcRateNoEPP:    "RATE-c",
 }
 
 const (

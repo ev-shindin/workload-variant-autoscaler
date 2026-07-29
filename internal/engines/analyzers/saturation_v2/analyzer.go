@@ -26,15 +26,42 @@ type SaturationAnalyzer struct {
 	// TODO: check if we need to use other model parameters as key in the future.
 	computeCapacityHistory map[string]*rollingAverage
 	capacityStore          *CapacityKnowledgeStore
+
+	// serviceRates holds observed service rates for the rate-anchored k2
+	// estimator. Nil unless that estimator is enabled, which is what keeps the
+	// occupancy-based path byte-identical when the flag is off.
+	serviceRates *serviceRateStore
+}
+
+// Option configures a SaturationAnalyzer at construction.
+type Option func(*SaturationAnalyzer)
+
+// withRateAnchoredK2 selects the rate-anchored compute-capacity estimator. It is
+// unexported on purpose: the switch is EnableRateAnchoredK2, a build-time constant
+// in rate_capacity.go, not an operator-facing setting. Tests use this to exercise
+// the estimator while the constant is off.
+func withRateAnchoredK2(enabled bool) Option { //nolint:unparam // tests pass true; the parameter documents the switch
+	return func(a *SaturationAnalyzer) {
+		if enabled {
+			a.serviceRates = newServiceRateStore()
+		}
+	}
 }
 
 // NewSaturationAnalyzer creates a new V2 saturation analyzer backed by the
 // given capacity store.
-func NewSaturationAnalyzer(store *CapacityKnowledgeStore) *SaturationAnalyzer {
-	return &SaturationAnalyzer{
+func NewSaturationAnalyzer(store *CapacityKnowledgeStore, opts ...Option) *SaturationAnalyzer {
+	a := &SaturationAnalyzer{
 		computeCapacityHistory: make(map[string]*rollingAverage),
 		capacityStore:          store,
 	}
+	if EnableRateAnchoredK2 {
+		a.serviceRates = newServiceRateStore()
+	}
+	for _, opt := range opts {
+		opt(a)
+	}
+	return a
 }
 
 // Name returns the analyzer identifier for logging and result metadata.
@@ -181,10 +208,29 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 		engineParams,
 		k1,
 	)
+	// Rate-anchored estimate takes precedence when enabled and answerable. It runs
+	// after computeK2 so the occupancy history keeps being maintained, which keeps
+	// the two estimators comparable in the same run.
+	//
+	// storedK2 tracks what the capacity store should learn, which is not always what
+	// this cycle scales on: a below-saturation rate-anchored value is scaled by
+	// headroom rather than being a ceiling, and the store feeds zero-replica
+	// estimation and cross-variant lookups that need a ceiling.
+	storedK2 := k2
+	if rateK2, rateSrc, ceiling, ok := a.rateAnchoredK2(rm, modelID, gpuCount, k1, time.Now()); ok {
+		k2, k2Priority = rateK2, rateSrc
+		if ceiling {
+			storedK2 = rateK2
+		}
+	}
 
 	effectiveCapacity := k1
 	if k2 < k1 {
 		effectiveCapacity = k2
+	}
+	storedCapacity := k1
+	if storedK2 < k1 {
+		storedCapacity = storedK2
 	}
 
 	isSaturated := replicaDemand >= effectiveCapacity
@@ -201,7 +247,7 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 		NumGpuBlocks:          rm.NumGpuBlocks,
 		BlockSize:             rm.BlockSize,
 		TotalKvCapacityTokens: rm.TotalKvCapacityTokens,
-		EffectiveCapacity:     effectiveCapacity,
+		EffectiveCapacity:     storedCapacity,
 		EngineParams:          existingParams,
 		LearnedFrom:           learnedFromLive,
 	})
