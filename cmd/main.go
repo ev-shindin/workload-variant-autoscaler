@@ -95,26 +95,6 @@ func init() {
 	// +kubebuilder:scaffold:scheme
 }
 
-// throughputAnalyzerEnabled reports whether any saturation config entry lists
-// the throughput analyzer with enabled != false. Startup-time gate: when no
-// entry enables throughput anywhere, the analyzer is never registered, so it
-// cannot participate in scaling decisions and cannot veto scale-down.
-//
-// This is independent of the per-cycle effectiveEnabled opt-in check in the
-// saturation engine, which governs participation per namespace/model once the
-// analyzer is registered. Runtime enablement after controller start requires a
-// restart because RegisterAnalyzer is frozen after StartOptimizeLoop.
-func throughputAnalyzerEnabled(cfg *config.Config) bool {
-	for _, sc := range cfg.SaturationConfig() {
-		for _, aw := range sc.Analyzers {
-			if aw.EffectiveType() == throughput.AnalyzerName && (aw.Enabled == nil || *aw.Enabled) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
 // nolint:gocyclo
 func main() {
 	// Command-line flags
@@ -514,7 +494,7 @@ func main() {
 		engine.SetLimiterBuilder(func() (pipeline.Limiter, error) {
 			return pipeline.NewLimiterFromConfig(cfg, mgr.GetClient())
 		})
-		if throughputAnalyzerEnabled(cfg) {
+		if cfg.ThroughputAnalyzerEnabled() {
 			registration.RegisterThroughputAnalyzerQueries(sourceRegistry)
 			if err := engine.RegisterAnalyzer(throughput.AnalyzerName, throughput.NewThroughputAnalyzer()); err != nil {
 				return err

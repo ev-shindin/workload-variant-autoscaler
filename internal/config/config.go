@@ -334,6 +334,35 @@ func (c *Config) LimitedModeEnabled() bool {
 	return c.features.limitedModeEnabled
 }
 
+// throughputAnalyzerName is the analyzer name used by the throughput
+// analyzer's saturation-config entry. Duplicated as a literal (rather than
+// importing internal/engines/analyzers/throughput.AnalyzerName) because
+// internal/config is a lower layer than the analyzers package.
+const throughputAnalyzerName = "throughput"
+
+// ThroughputAnalyzerEnabled reports whether any saturation config entry lists
+// the throughput analyzer with Enabled nil-or-true. Startup-time gate: when
+// no entry enables throughput anywhere, the analyzer is never registered, so
+// it cannot participate in scaling decisions and cannot veto scale-down.
+//
+// This is independent of the per-cycle effectiveEnabled opt-in check in the
+// saturation engine, which governs participation per namespace/model once
+// the analyzer is registered. Runtime enablement after controller start
+// requires a restart because RegisterAnalyzer is frozen after
+// StartOptimizeLoop (cmd/main.go); the ConfigMapReconciler uses this method
+// to detect that kind of live-config divergence from the frozen decision.
+// Thread-safe (SaturationConfig acquires its own lock).
+func (c *Config) ThroughputAnalyzerEnabled() bool {
+	for _, sc := range c.SaturationConfig() {
+		for _, aw := range sc.Analyzers {
+			if aw.EffectiveType() == throughputAnalyzerName && (aw.Enabled == nil || *aw.Enabled) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // ScaleFromZeroMaxConcurrency returns the scale-from-zero max concurrency.
 // Thread-safe.
 func (c *Config) ScaleFromZeroMaxConcurrency() int {
