@@ -29,6 +29,17 @@ operating point, and scales before demand exceeds that supply.
 > `effectiveEnabled` gate (see the [multi-analyzer pipeline guide](multi-analyzer-pipeline.md))
 > governs whether an already-registered analyzer participates in a given cycle, and is
 > independent of this startup-time registration gate.
+>
+> **Editing the ConfigMap without restarting is surfaced, not silent.** When the
+> `ConfigMapReconciler` processes an edit to the **global** `wva-saturation-scaling-config`
+> ConfigMap and the live throughput-analyzer enablement now differs from the registration
+> decision frozen at startup, it emits a Kubernetes Warning event on the ConfigMap (reason
+> `ThroughputAnalyzerRestartRequired`, visible via `kubectl describe configmap
+> wva-saturation-scaling-config -n <system-namespace>`) and logs a message telling the operator
+> to restart `wva-controller-manager` to apply the change. This fires in both directions —
+> enabling or disabling `throughput` at runtime. **Namespace-local saturation ConfigMaps are not
+> covered**: startup registration reads only the global config, so a namespace-local edit can
+> never diverge from it and this check does not run for that path.
 
 ## Table of Contents
 

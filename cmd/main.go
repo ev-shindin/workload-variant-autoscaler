@@ -384,6 +384,13 @@ func main() {
 	}
 	setupLog.Info("Initial ConfigMap bootstrap completed")
 
+	// Frozen registration decision: analyzer registration cannot change without
+	// a controller restart, so this value is captured once (after the bootstrap
+	// above has loaded ConfigMap-backed settings) and shared with the
+	// ConfigMapReconciler so it can detect a later live-config divergence.
+	taRegistered := cfg.ThroughputAnalyzerEnabled()
+	configMapReconciler.ThroughputRegistered = taRegistered
+
 	// Use Prometheus configuration from unified Config (already validated during Load())
 	if cfg.PrometheusBaseURL() == "" {
 		setupLog.Error(nil, "no Prometheus configuration found - this should not happen after validation")
@@ -494,7 +501,7 @@ func main() {
 		engine.SetLimiterBuilder(func() (pipeline.Limiter, error) {
 			return pipeline.NewLimiterFromConfig(cfg, mgr.GetClient())
 		})
-		if cfg.ThroughputAnalyzerEnabled() {
+		if taRegistered {
 			registration.RegisterThroughputAnalyzerQueries(sourceRegistry)
 			if err := engine.RegisterAnalyzer(throughput.AnalyzerName, throughput.NewThroughputAnalyzer()); err != nil {
 				return err
