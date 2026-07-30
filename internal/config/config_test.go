@@ -10,7 +10,21 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/domain"
+	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/engines/analyzers/throughput"
 )
+
+// TestThroughputAnalyzerName_MatchesCanonical guards the throughput analyzer
+// name that config.go duplicates as a literal (throughputAnalyzerName) against
+// the canonical throughput.AnalyzerName. The literal is duplicated to keep
+// internal/config from depending on the analyzers layer; this test restores the
+// coupling at test time so a future rename of throughput.AnalyzerName fails here
+// instead of silently making ThroughputAnalyzerEnabled always return false.
+func TestThroughputAnalyzerName_MatchesCanonical(t *testing.T) {
+	if throughputAnalyzerName != throughput.AnalyzerName {
+		t.Fatalf("throughputAnalyzerName = %q, want %q (canonical throughput.AnalyzerName); the duplicated literal has drifted",
+			throughputAnalyzerName, throughput.AnalyzerName)
+	}
+}
 
 // TestConfig_ThreadSafeUpdates tests that concurrent reads and writes to DynamicConfig
 // are thread-safe and don't cause race conditions or data corruption.

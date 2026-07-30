@@ -191,22 +191,37 @@ func (r *ConfigMapReconciler) handleSaturationConfigMap(ctx context.Context, cm 
 // controller startup. Analyzer registration cannot change without a restart,
 // so a divergence means this ConfigMap edit is silently inert; it emits a
 // Warning event on cm plus a log line telling the operator to restart.
-// Namespace-local config does not participate: startup registration reads
-// only the global saturation config, so a namespace-local edit can never
-// cause this kind of drift.
+//
+// It runs only after the initial ConfigMap bootstrap has completed. The frozen
+// decision (ThroughputRegistered) is captured just after bootstrap returns
+// (cmd/main.go); during the synchronous bootstrap pass it is still its zero
+// value, so comparing against it would emit a spurious "restart required"
+// warning on every healthy startup. The manager — and therefore all runtime
+// reconciles — starts only after the decision is frozen, so gating on bootstrap
+// completion leaves genuine runtime edits fully covered.
+//
+// Namespace-local config does not participate: startup registration reads only
+// the global saturation config, so a namespace-local edit can never cause this
+// kind of drift.
 func (r *ConfigMapReconciler) warnIfThroughputRegistrationDiverged(logger logr.Logger, cm *corev1.ConfigMap) {
+	if !r.Config.ConfigMapsBootstrapComplete() {
+		// Bootstrap pass: the registration decision has not been frozen yet.
+		return
+	}
+
 	want := r.Config.ThroughputAnalyzerEnabled()
 	if want == r.ThroughputRegistered {
 		return
 	}
 
-	msg := fmt.Sprintf(
-		"Throughput analyzer enablement in config (%t) differs from the registration "+
-			"frozen at controller startup (%t); analyzer registration cannot change at "+
-			"runtime. Restart the wva-controller-manager to apply.",
-		want, r.ThroughputRegistered)
-	logger.Info(msg)
+	logger.Info("Throughput analyzer registration diverged from live config; controller restart required to apply",
+		"wantEnabled", want, "registered", r.ThroughputRegistered, "configMap", cm.Name)
 	if r.Recorder != nil {
+		msg := fmt.Sprintf(
+			"Throughput analyzer enablement in config (%t) differs from the registration "+
+				"frozen at controller startup (%t); analyzer registration cannot change at "+
+				"runtime. Restart the wva-controller-manager to apply.",
+			want, r.ThroughputRegistered)
 		r.Recorder.Event(cm, corev1.EventTypeWarning, constants.K8SEventThroughputAnalyzerRestartRequired, msg)
 	}
 }
