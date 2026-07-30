@@ -1,6 +1,7 @@
 package saturation_v2
 
 import (
+	"fmt"
 	"math"
 	"time"
 
@@ -391,5 +392,43 @@ var _ = Describe("Rate-anchored k2", func() {
 		rm.ArrivalRate = 1
 		_, _, ok := a.rateAnchoredK2(rm, "m", domain.RolePrefill, 1, k1, queueThreshold, now)
 		Expect(ok).To(BeTrue(), "the ceiling measured under backlog still applies")
+	})
+})
+
+var _ = Describe("Bucket store — bounded growth", func() {
+	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+
+	It("prunes stale buckets when a new one is inserted", func() {
+		s := newBucketStore()
+		// Fill past the prune threshold with buckets nobody has touched in a day.
+		old := now.Add(-2 * HistoryEvictionTimeout)
+		for i := 0; i < BucketPruneThreshold; i++ {
+			s.ObserveCeiling(fmt.Sprintf("stale-%d", i), 1000, old)
+		}
+		Expect(s.entries).To(HaveLen(BucketPruneThreshold))
+
+		s.ObserveCeiling("fresh", 2000, now)
+		Expect(s.entries).To(HaveLen(1), "the stale buckets went with the insert")
+		_, ok := s.Ceiling("fresh", now)
+		Expect(ok).To(BeTrue())
+	})
+
+	It("keeps buckets that are still in use", func() {
+		s := newBucketStore()
+		for i := 0; i < BucketPruneThreshold; i++ {
+			s.ObserveCeiling(fmt.Sprintf("live-%d", i), 1000, now)
+		}
+		s.ObserveCeiling("one-more", 1000, now)
+		Expect(s.entries).To(HaveLen(BucketPruneThreshold + 1))
+	})
+
+	It("prunes per-pod arrival entries the same way", func() {
+		s := newArrivalSmoother()
+		old := now.Add(-2 * HistoryEvictionTimeout)
+		for i := 0; i < BucketPruneThreshold; i++ {
+			_ = s.Smooth(fmt.Sprintf("gone-%d", i), 4, 60, old)
+		}
+		_ = s.Smooth("current", 4, 60, now)
+		Expect(s.entries).To(HaveLen(1))
 	})
 })

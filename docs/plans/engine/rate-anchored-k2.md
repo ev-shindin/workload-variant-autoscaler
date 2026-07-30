@@ -149,38 +149,32 @@ constant.
 The backlog path needs none of this: it compares no rates, so it is unaffected by
 the delay. That is a second reason to keep it ahead of the completions fallback.
 
-## Lambda fallback chain
+## Detector inputs, in order
 
-`saturationRatio` takes the most direct signal available:
+1. **Backlog** — a queue at least `QueueLengthThreshold` deep. Needs no rates at all,
+   which makes it the safety net for a fleet with no EPP and no prior calibration,
+   and it is exactly the prefill-heavy case the occupancy estimator misreads as idle.
+   A shallower queue does not qualify: arrival jitter produces one at any load.
+2. **Arrivals reaching the service rate** — λ from the EPP dispatch rate, smoothed
+   over a residence time, against the bucket's μ at `SaturationEnterRatio`. This
+   catches the limit before a queue forms.
+3. **Completions as λ** — without EPP, and only when there is no queue, completions
+   are arrivals. Invalid under backlog, which is why it sits behind that check.
 
-1. **EPP arrival rate** (`k2SrcRateAnchored`) — the intended path. λ is measured
-   independently of the engine, so μ/λ holds whether or not the replica keeps up.
-2. **Backlog** (`k2SrcRateBacklog`) — a queueing replica is saturated by
-   observation, so the ratio is 1 and capacity is the current occupancy. Needs
-   neither λ nor a calibrated μ, which makes it the safety net for a fleet with no
-   EPP and no prior calibration — and it is exactly the prefill-heavy case the
-   occupancy estimator misreads as idle.
-3. **Completions as λ** (`k2SrcRateNoEPP`) — with no queue, everything arriving is
-   served within the scrape window, so completions are arrivals. Valid only in that
-   case, which is why it sits behind the backlog check.
-
-Only an idle, never-calibrated replica with no EPP declines, and there is nothing
-at risk in that state. Each source has its own `k2Source` label (`RATE-λ`,
-`RATE-q`, `RATE-c`) so the active path is visible per replica.
-
-## What the capacity store learns
-
-`capacityStore` feeds zero-replica estimation, cross-variant `FindCompatible`
-lookups and the fallback path — all of which need a **ceiling**, what a replica can
-do. Everything this estimator produces is a limit measured under load, so the store
-learns it directly. `MinRateAnchoredFraction` floors it so a stalled replica cannot
-teach the bucket a near-zero capacity; there is no upper clamp, because `min(k1, k2)`
-already prevents a compute bound from exceeding the memory bound.
+The two `k2Source` labels do **not** identify which of these fired; they distinguish
+a limit measured this cycle (`RATE-now`) from one carried over from an earlier one
+(`RATE-learned`), which is what the offline replay needs to tell apart. A replica
+declines only when nothing has been learned for its bucket and it is not at its limit
+now — a state in which nothing is at risk.
 
 ## Guards
 
 - Require `KvUsageInstant > 0` and a usable ratio; otherwise decline and fall through.
-- Clamp `μ/λ` to `[0.05, 20]` so a mis-scraped rate cannot swing capacity wildly.
+- `MinRateRatio` floors the ratio a mis-scraped rate can produce; there is no upper
+  clamp, since `min(k1, k2)` already bounds the compute estimate by the memory one.
+- Both stores prune themselves on insert past `BucketPruneThreshold`, because nothing
+  in the engine drives eviction for the analyzer's other stores either — a store that
+  relied on being swept would grow unbounded the moment the flag was flipped.
 - Never exceed `k1`: `min(k1, k2)` already handles this, but the estimator also
   refuses to return a value below a floor fraction of `k1` to avoid a stalled
   replica collapsing capacity to near zero.

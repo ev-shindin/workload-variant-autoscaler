@@ -94,6 +94,11 @@ const (
 	// previous arrival average is discarded rather than blended.
 	ArrivalSmoothingResetFactor = 3.0
 
+	// BucketPruneThreshold is the map size at which adding a new bucket first tries
+	// pruning stale ones. Small enough that the map stays bounded, large enough that
+	// a normal fleet never pays for a sweep.
+	BucketPruneThreshold = 32
+
 	// MinRateAnchoredFraction floors the learned ceiling at a fraction of k1. A
 	// replica that stalled completely while requests queued would otherwise teach
 	// the bucket a near-zero capacity and demand an unbounded scale-up.
@@ -125,14 +130,41 @@ func newBucketStore() *bucketStore {
 	return &bucketStore{entries: make(map[string]*bucketEntry)}
 }
 
-// entry returns the bucket's entry, creating it when absent. Callers hold s.mu.
-func (s *bucketStore) entry(key string) *bucketEntry {
+// entry returns the bucket's entry, creating it when absent, and opportunistically
+// prunes buckets nothing has touched for HistoryEvictionTimeout. Callers hold s.mu.
+//
+// Pruning on write rather than from a periodic caller is deliberate: nothing in the
+// engine currently drives eviction for the analyzer's other stores either, so a
+// store that depended on being swept would grow without bound the moment the
+// estimator was switched on. Buckets are keyed by model, accelerator, role, GPU
+// count and request shape, so the map is small and a sweep is cheap.
+func (s *bucketStore) entry(key string, now time.Time) *bucketEntry {
 	e, ok := s.entries[key]
 	if !ok {
+		if len(s.entries) >= BucketPruneThreshold {
+			s.pruneLocked(HistoryEvictionTimeout, now)
+		}
 		e = &bucketEntry{}
 		s.entries[key] = e
 	}
 	return e
+}
+
+// pruneLocked drops buckets with no observation of either kind within timeout.
+// Callers hold s.mu.
+func (s *bucketStore) pruneLocked(timeout time.Duration, now time.Time) int {
+	removed := 0
+	for k, e := range s.entries {
+		last := e.rateSeen
+		if e.ceilingSeen.After(last) {
+			last = e.ceilingSeen
+		}
+		if now.Sub(last) > timeout {
+			delete(s.entries, k)
+			removed++
+		}
+	}
+	return removed
 }
 
 // ObserveRate records a completion rate for a bucket, keeping the running maximum.
@@ -145,7 +177,7 @@ func (s *bucketStore) ObserveRate(key string, rate float64, now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	e := s.entry(key)
+	e := s.entry(key, now)
 	if e.rateSamples == 0 {
 		e.rate, e.rateSamples, e.rateSeen = rate, 1, now
 		return
@@ -191,7 +223,7 @@ func (s *bucketStore) ObserveCeiling(key string, tokens float64, now time.Time) 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	e := s.entry(key)
+	e := s.entry(key, now)
 	if !e.ceilingKnown {
 		e.ceiling, e.ceilingKnown, e.ceilingSeen = tokens, true, now
 		return
@@ -232,19 +264,7 @@ func (s *bucketStore) Ceiling(key string, now time.Time) (float64, bool) {
 func (s *bucketStore) EvictStale(timeout time.Duration, now time.Time) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	removed := 0
-	for k, e := range s.entries {
-		last := e.rateSeen
-		if e.ceilingSeen.After(last) {
-			last = e.ceilingSeen
-		}
-		if now.Sub(last) > timeout {
-			delete(s.entries, k)
-			removed++
-		}
-	}
-	return removed
+	return s.pruneLocked(timeout, now)
 }
 
 // decayRate applies exponential decay so an unrefreshed service rate loses
@@ -300,6 +320,15 @@ func (s *arrivalSmoother) Smooth(key string, rate, tau float64, now time.Time) f
 
 	e, ok := s.entries[key]
 	if !ok {
+		// Keyed per pod, so this map grows with pod churn; prune on insert for the
+		// same reason bucketStore does.
+		if len(s.entries) >= BucketPruneThreshold {
+			for k, old := range s.entries {
+				if now.Sub(old.observed) > HistoryEvictionTimeout {
+					delete(s.entries, k)
+				}
+			}
+		}
 		s.entries[key] = &arrivalEntry{rate: rate, observed: now}
 		return rate
 	}
