@@ -1,6 +1,7 @@
 package saturation_v2
 
 import (
+	"math"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -94,8 +95,8 @@ var _ = Describe("Service rate store", func() {
 	})
 
 	It("separates buckets by input length", func() {
-		short := serviceRateKey("m", "H100", 1, 300, 300)
-		long := serviceRateKey("m", "H100", 1, 1000, 300)
+		short := serviceRateKey("m", "H100", "decode", 1, 300, 300)
+		long := serviceRateKey("m", "H100", "decode", 1, 1000, 300)
 		Expect(short).NotTo(Equal(long))
 	})
 })
@@ -111,7 +112,7 @@ var _ = Describe("Rate-anchored k2", func() {
 	// calibrate drives enough qualifying observations to establish mu for the bucket.
 	calibrate := func(a *SaturationAnalyzer, rm domain.ReplicaMetrics) {
 		for i := 0; i < MinServiceRateSamples; i++ {
-			_, _, _, _ = a.rateAnchoredK2(rm, "m", 1, k1, queueThreshold, now)
+			_, _, _, _ = a.rateAnchoredK2(rm, "m", "", 1, k1, queueThreshold, now)
 		}
 	}
 
@@ -124,6 +125,7 @@ var _ = Describe("Rate-anchored k2", func() {
 			RequestRate:           8.0,
 			ArrivalRate:           8.0,
 			KvUsageInstant:        0.16,
+			TokensInUse:           int64(0.16 * float64(kvCapacity)),
 			TotalKvCapacityTokens: kvCapacity,
 			AvgInputTokens:        1000,
 			AvgOutputTokens:       250,
@@ -132,19 +134,36 @@ var _ = Describe("Rate-anchored k2", func() {
 
 	It("declines when the estimator is not enabled", func() {
 		a := NewSaturationAnalyzer(NewCapacityKnowledgeStore())
-		_, _, _, ok := a.rateAnchoredK2(saturatedReplica(), "m", 1, k1, queueThreshold, now)
+		_, _, _, ok := a.rateAnchoredK2(saturatedReplica(), "m", "", 1, k1, queueThreshold, now)
 		Expect(ok).To(BeFalse())
 	})
 
-	It("reads 100% utilization for a replica at rate saturation", func() {
+	It("reads 100% utilization from the backlog before mu is calibrated", func() {
 		a := NewSaturationAnalyzer(NewCapacityKnowledgeStore(), withRateAnchoredK2(true))
 		rm := saturatedReplica()
 
-		k2, _, _, ok := a.rateAnchoredK2(rm, "m", 1, k1, queueThreshold, now)
+		k2, src, _, ok := a.rateAnchoredK2(rm, "m", "", 1, k1, queueThreshold, now)
 		Expect(ok).To(BeTrue())
-		// lambda == mu, so capacity equals current occupancy: demand/supply == 1
-		// even though only 16% of KV is in use.
+		// No mu yet, so this is the backlog path — assert the source, otherwise the
+		// numeric result is indistinguishable from the lambda path.
+		Expect(src).To(Equal(k2SrcRateBacklog))
 		Expect(k2).To(BeNumerically("~", float64(kvCapacity)*0.16, 1))
+	})
+
+	It("reads 100% utilization from lambda == mu with no queue", func() {
+		a := NewSaturationAnalyzer(NewCapacityKnowledgeStore(), withRateAnchoredK2(true))
+		rm := saturatedReplica()
+		calibrate(a, rm) // mu = 8 req/s
+
+		// Arrivals exactly at the ceiling, nothing queued yet: this is the case the
+		// ratio arithmetic exists for, and it must come from the lambda path.
+		rm.QueueLength = 0
+		rm.ArrivalRate = 8.0
+		k2, src, _, ok := a.rateAnchoredK2(rm, "m", "", 1, k1, queueThreshold, now)
+		Expect(ok).To(BeTrue())
+		Expect(src).To(Equal(k2SrcRateAnchored))
+		Expect(k2).To(BeNumerically("~", float64(kvCapacity)*0.16, 1),
+			"capacity equals occupancy, so utilization reads 100% at 16% KV")
 	})
 
 	It("scales capacity by the distance to saturation", func() {
@@ -155,7 +174,7 @@ var _ = Describe("Rate-anchored k2", func() {
 		// Same bucket, half the arrival rate and no backlog: twice the headroom.
 		rm.QueueLength = 0
 		rm.ArrivalRate = 4.0
-		k2, _, _, ok := a.rateAnchoredK2(rm, "m", 1, k1, queueThreshold, now)
+		k2, _, _, ok := a.rateAnchoredK2(rm, "m", "", 1, k1, queueThreshold, now)
 		Expect(ok).To(BeTrue())
 		Expect(k2).To(BeNumerically("~", float64(kvCapacity)*0.16*2, 1))
 	})
@@ -165,7 +184,7 @@ var _ = Describe("Rate-anchored k2", func() {
 		rm := saturatedReplica()
 		rm.ArrivalRate = 0
 
-		k2, src, _, ok := a.rateAnchoredK2(rm, "m", 1, k1, queueThreshold, now)
+		k2, src, _, ok := a.rateAnchoredK2(rm, "m", "", 1, k1, queueThreshold, now)
 		Expect(ok).To(BeTrue())
 		Expect(src).To(Equal(k2SrcRateBacklog))
 		Expect(k2).To(BeNumerically("~", float64(kvCapacity)*0.16, 1))
@@ -179,7 +198,7 @@ var _ = Describe("Rate-anchored k2", func() {
 		rm.QueueLength = 0
 		rm.ArrivalRate = 0
 		rm.RequestRate = 4.0 // no queue, so completions are arrivals
-		k2, src, _, ok := a.rateAnchoredK2(rm, "m", 1, k1, queueThreshold, now)
+		k2, src, _, ok := a.rateAnchoredK2(rm, "m", "", 1, k1, queueThreshold, now)
 		Expect(ok).To(BeTrue())
 		Expect(src).To(Equal(k2SrcRateNoEPP))
 		Expect(k2).To(BeNumerically("~", float64(kvCapacity)*0.16*2, 1))
@@ -191,7 +210,7 @@ var _ = Describe("Rate-anchored k2", func() {
 		rm.QueueLength = 0 // no backlog to fall back on
 		rm.ArrivalRate = 0 // no EPP
 		rm.RequestRate = 0 // and nothing completing
-		_, _, _, ok := a.rateAnchoredK2(rm, "m", 1, k1, queueThreshold, now)
+		_, _, _, ok := a.rateAnchoredK2(rm, "m", "", 1, k1, queueThreshold, now)
 		Expect(ok).To(BeFalse())
 	})
 
@@ -200,23 +219,23 @@ var _ = Describe("Rate-anchored k2", func() {
 		rm := saturatedReplica()
 
 		// Before calibration the backlog itself is the only usable signal.
-		_, src, _, ok := a.rateAnchoredK2(rm, "m", 1, k1, queueThreshold, now)
+		_, src, _, ok := a.rateAnchoredK2(rm, "m", "", 1, k1, queueThreshold, now)
 		Expect(ok).To(BeTrue())
 		Expect(src).To(Equal(k2SrcRateBacklog))
 
 		// Once the bucket has enough qualifying observations, lambda wins.
 		calibrate(a, rm)
-		_, src, _, ok = a.rateAnchoredK2(rm, "m", 1, k1, queueThreshold, now)
+		_, src, _, ok = a.rateAnchoredK2(rm, "m", "", 1, k1, queueThreshold, now)
 		Expect(ok).To(BeTrue())
 		Expect(src).To(Equal(k2SrcRateAnchored))
 	})
 
-	It("declines when the instantaneous KV reading is missing", func() {
+	It("declines when the occupancy reading is missing", func() {
 		a := NewSaturationAnalyzer(NewCapacityKnowledgeStore(), withRateAnchoredK2(true))
 		rm := saturatedReplica()
-		rm.KvUsageInstant = 0
+		rm.TokensInUse = 0
 
-		_, _, _, ok := a.rateAnchoredK2(rm, "m", 1, k1, queueThreshold, now)
+		_, _, _, ok := a.rateAnchoredK2(rm, "m", "", 1, k1, queueThreshold, now)
 		Expect(ok).To(BeFalse())
 	})
 
@@ -227,7 +246,7 @@ var _ = Describe("Rate-anchored k2", func() {
 
 		rm.QueueLength = 0
 		rm.ArrivalRate = 0.0001 // mu/lambda would be 80000×
-		k2, _, _, ok := a.rateAnchoredK2(rm, "m", 1, k1, queueThreshold, now)
+		k2, _, _, ok := a.rateAnchoredK2(rm, "m", "", 1, k1, queueThreshold, now)
 		Expect(ok).To(BeTrue())
 		Expect(k2).To(BeNumerically("<=", int64(float64(kvCapacity)*0.16*MaxRateRatio)))
 	})
@@ -237,9 +256,9 @@ var _ = Describe("Rate-anchored k2", func() {
 		rm := saturatedReplica()
 		rm.RequestRate = 0.01
 		rm.ArrivalRate = 50.0
-		rm.KvUsageInstant = 0.01
+		rm.TokensInUse = int64(0.01 * float64(kvCapacity))
 
-		k2, _, _, ok := a.rateAnchoredK2(rm, "m", 1, k1, queueThreshold, now)
+		k2, _, _, ok := a.rateAnchoredK2(rm, "m", "", 1, k1, queueThreshold, now)
 		Expect(ok).To(BeTrue())
 		Expect(k2).To(BeNumerically(">=", int64(float64(k1)*MinRateAnchoredFraction)))
 	})
@@ -260,6 +279,7 @@ var _ = Describe("Rate-anchored k2 and the capacity store", func() {
 			RequestRate:           8.0,
 			ArrivalRate:           8.0,
 			KvUsageInstant:        0.16,
+			TokensInUse:           int64(0.16 * float64(kvCapacity)),
 			TotalKvCapacityTokens: kvCapacity,
 			AvgInputTokens:        1000,
 			AvgOutputTokens:       250,
@@ -268,7 +288,7 @@ var _ = Describe("Rate-anchored k2 and the capacity store", func() {
 
 	It("marks a saturated reading as a ceiling", func() {
 		a := NewSaturationAnalyzer(NewCapacityKnowledgeStore(), withRateAnchoredK2(true))
-		_, _, ceiling, ok := a.rateAnchoredK2(replica(), "m", 1, int64(320_000), queueThreshold, now)
+		_, _, ceiling, ok := a.rateAnchoredK2(replica(), "m", "", 1, int64(320_000), queueThreshold, now)
 		Expect(ok).To(BeTrue())
 		Expect(ceiling).To(BeTrue(), "lambda >= mu means the replica demonstrated this capacity")
 	})
@@ -277,12 +297,12 @@ var _ = Describe("Rate-anchored k2 and the capacity store", func() {
 		a := NewSaturationAnalyzer(NewCapacityKnowledgeStore(), withRateAnchoredK2(true))
 		rm := replica()
 		for i := 0; i < MinServiceRateSamples; i++ {
-			_, _, _, _ = a.rateAnchoredK2(rm, "m", 1, int64(320_000), queueThreshold, now)
+			_, _, _, _ = a.rateAnchoredK2(rm, "m", "", 1, int64(320_000), queueThreshold, now)
 		}
 
 		rm.QueueLength = 0
 		rm.ArrivalRate = 2.0 // well below mu: this is headroom, not a ceiling
-		_, _, ceiling, ok := a.rateAnchoredK2(rm, "m", 1, int64(320_000), queueThreshold, now)
+		_, _, ceiling, ok := a.rateAnchoredK2(rm, "m", "", 1, int64(320_000), queueThreshold, now)
 		Expect(ok).To(BeTrue())
 		Expect(ceiling).To(BeFalse())
 	})
@@ -306,6 +326,7 @@ var _ = Describe("Rate-anchored k2 and transient queues", func() {
 			RequestRate:           3.0,
 			ArrivalRate:           3.0,
 			KvUsageInstant:        0.08,
+			TokensInUse:           int64(0.08 * float64(kvCapacity)),
 			TotalKvCapacityTokens: kvCapacity,
 			AvgInputTokens:        1000,
 			AvgOutputTokens:       250,
@@ -316,10 +337,10 @@ var _ = Describe("Rate-anchored k2 and transient queues", func() {
 		a := NewSaturationAnalyzer(NewCapacityKnowledgeStore(), withRateAnchoredK2(true))
 		rm := keepingUp()
 		for i := 0; i < 5; i++ {
-			_, _, _, _ = a.rateAnchoredK2(rm, "m", 1, k1, queueThreshold, now)
+			_, _, _, _ = a.rateAnchoredK2(rm, "m", "", 1, k1, queueThreshold, now)
 		}
 
-		_, _, _, ok := a.rateAnchoredK2(rm, "m", 1, k1, queueThreshold, now)
+		_, _, _, ok := a.rateAnchoredK2(rm, "m", "", 1, k1, queueThreshold, now)
 		Expect(ok).To(BeFalse(), "a one-deep queue is arrival jitter, not a ceiling")
 	})
 
@@ -328,7 +349,7 @@ var _ = Describe("Rate-anchored k2 and transient queues", func() {
 		rm := keepingUp()
 		rm.QueueLength = 6 // one qualifying observation, below MinServiceRateSamples
 
-		_, src, _, ok := a.rateAnchoredK2(rm, "m", 1, k1, queueThreshold, now)
+		_, src, _, ok := a.rateAnchoredK2(rm, "m", "", 1, k1, queueThreshold, now)
 		// The backlog path still fires — a deep queue now is saturation now — but mu
 		// is not yet established, so no ratio is derived from it.
 		Expect(ok).To(BeTrue())
@@ -414,5 +435,219 @@ var _ = Describe("Residence estimate", func() {
 		Expect(residenceSeconds(domain.ReplicaMetrics{
 			AvgTTFT: 1e6, AvgITL: 1, AvgOutputTokens: 1,
 		})).To(Equal(MaxResidenceSeconds))
+	})
+})
+
+var _ = Describe("Rate-anchored k2 across roles and load levels", func() {
+	const (
+		kvCapacity     = int64(400_000)
+		k1             = int64(320_000)
+		queueThreshold = 5.0
+	)
+	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+
+	backlogged := func(role string, rate float64) domain.ReplicaMetrics {
+		return domain.ReplicaMetrics{
+			PodName:               "pod-" + role,
+			AcceleratorName:       "H100",
+			QueueLength:           12,
+			RequestRate:           rate,
+			ArrivalRate:           rate,
+			KvUsageInstant:        0.16,
+			TokensInUse:           int64(0.16 * float64(kvCapacity)),
+			TotalKvCapacityTokens: kvCapacity,
+			AvgInputTokens:        1000,
+			AvgOutputTokens:       250,
+		}
+	}
+
+	It("does not let one role calibrate another's ceiling", func() {
+		a := NewSaturationAnalyzer(NewCapacityKnowledgeStore(), withRateAnchoredK2(true))
+
+		// A decode replica establishes mu = 20 req/s.
+		dec := backlogged(domain.RoleDecode, 20)
+		for i := 0; i < MinServiceRateSamples; i++ {
+			_, _, _, _ = a.rateAnchoredK2(dec, "m", domain.RoleDecode, 1, k1, queueThreshold, now)
+		}
+
+		// A prefill replica of the same model on the same accelerator must not
+		// inherit it: prefill completes at a different rate for the same requests.
+		pre := backlogged(domain.RolePrefill, 3)
+		pre.QueueLength = 0
+		_, src, _, ok := a.rateAnchoredK2(pre, "m", domain.RolePrefill, 1, k1, queueThreshold, now)
+		Expect(ok).To(BeFalse(), "prefill has no calibration of its own yet")
+		Expect(src).To(Equal(k2Source(0)))
+	})
+
+	It("calibrates each role independently", func() {
+		a := NewSaturationAnalyzer(NewCapacityKnowledgeStore(), withRateAnchoredK2(true))
+		for _, role := range []string{domain.RolePrefill, domain.RoleDecode, domain.RoleBoth} {
+			rm := backlogged(role, 10)
+			for i := 0; i < MinServiceRateSamples; i++ {
+				_, _, _, _ = a.rateAnchoredK2(rm, "m", role, 1, k1, queueThreshold, now)
+			}
+			rm.QueueLength = 0
+			rm.ArrivalRate = 5 // half the ceiling
+			k2, src, _, ok := a.rateAnchoredK2(rm, "m", role, 1, k1, queueThreshold, now)
+			Expect(ok).To(BeTrue(), "role %s", role)
+			Expect(src).To(Equal(k2SrcRateAnchored))
+			Expect(k2).To(BeNumerically(">", int64(float64(kvCapacity)*0.16)), "role %s has headroom", role)
+		}
+	})
+
+	It("does not cut capacity below what a queue-free replica is visibly handling", func() {
+		a := NewSaturationAnalyzer(NewCapacityKnowledgeStore(), withRateAnchoredK2(true))
+
+		// Calibrated conservatively at 8 req/s during a rough patch.
+		rm := backlogged(domain.RoleBoth, 8)
+		for i := 0; i < MinServiceRateSamples; i++ {
+			_, _, _, _ = a.rateAnchoredK2(rm, "m", domain.RoleBoth, 1, k1, queueThreshold, now)
+		}
+
+		// Now running slightly past that rate with nothing queued: the replica is
+		// keeping up, so capacity must not be reported below its occupancy.
+		rm.QueueLength = 0
+		rm.ArrivalRate = 12
+		rm.RequestRate = 12
+		k2, _, _, ok := a.rateAnchoredK2(rm, "m", domain.RoleBoth, 1, k1, queueThreshold, now.Add(time.Minute))
+		Expect(ok).To(BeTrue())
+		Expect(k2).To(BeNumerically(">=", int64(float64(kvCapacity)*0.16)),
+			"utilization must not exceed 100% for a replica with an empty queue")
+	})
+
+	It("leaves k1 as the bound when the replica has ample headroom", func() {
+		a := NewSaturationAnalyzer(NewCapacityKnowledgeStore(), withRateAnchoredK2(true))
+		rm := backlogged(domain.RoleBoth, 20)
+		for i := 0; i < MinServiceRateSamples; i++ {
+			_, _, _, _ = a.rateAnchoredK2(rm, "m", domain.RoleBoth, 1, k1, queueThreshold, now)
+		}
+
+		// A quarter of the ceiling, and holding a healthy chunk of KV.
+		rm.QueueLength = 0
+		rm.ArrivalRate = 5
+		rm.TokensInUse = int64(0.5 * float64(kvCapacity))
+		k2, _, _, ok := a.rateAnchoredK2(rm, "m", domain.RoleBoth, 1, k1, queueThreshold, now)
+		Expect(ok).To(BeTrue())
+		// 0.5 × 400k × 4 = 800k > k1, so min(k1, k2) keeps the memory bound.
+		Expect(k2).To(BeNumerically(">", k1), "the memory bound should win, not be undercut")
+	})
+})
+
+var _ = Describe("Rate-anchored k2 with degenerate or missing signals", func() {
+	const (
+		kvCapacity     = int64(400_000)
+		k1             = int64(320_000)
+		queueThreshold = 5.0
+	)
+	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+
+	base := func() domain.ReplicaMetrics {
+		return domain.ReplicaMetrics{
+			PodName:               "pod-a",
+			AcceleratorName:       "H100",
+			QueueLength:           12,
+			RequestRate:           8.0,
+			ArrivalRate:           8.0,
+			KvUsageInstant:        0.16,
+			TokensInUse:           int64(0.16 * float64(kvCapacity)),
+			TotalKvCapacityTokens: kvCapacity,
+			AvgInputTokens:        1000,
+			AvgOutputTokens:       250,
+		}
+	}
+
+	It("never calibrates a prefill replica that reports no completions", func() {
+		a := NewSaturationAnalyzer(NewCapacityKnowledgeStore(), withRateAnchoredK2(true))
+		// A disaggregated prefill pod completes few or no generation tokens, so the
+		// completion-rate metric can read zero even under a deep backlog.
+		rm := base()
+		rm.RequestRate = 0
+		for i := 0; i < 5; i++ {
+			_, src, _, ok := a.rateAnchoredK2(rm, "m", domain.RolePrefill, 1, k1, queueThreshold, now)
+			Expect(ok).To(BeTrue())
+			// The backlog is real, so saturation is reported — but from the queue,
+			// never from a fabricated ceiling.
+			Expect(src).To(Equal(k2SrcRateBacklog))
+		}
+
+		// With the queue drained there is nothing left to conclude from.
+		rm.QueueLength = 0
+		_, _, _, ok := a.rateAnchoredK2(rm, "m", domain.RolePrefill, 1, k1, queueThreshold, now)
+		Expect(ok).To(BeFalse())
+	})
+
+	It("declines a negative arrival rate rather than inverting the ratio", func() {
+		a := NewSaturationAnalyzer(NewCapacityKnowledgeStore(), withRateAnchoredK2(true))
+		rm := base()
+		for i := 0; i < MinServiceRateSamples; i++ {
+			_, _, _, _ = a.rateAnchoredK2(rm, "m", "", 1, k1, queueThreshold, now)
+		}
+
+		rm.QueueLength = 0
+		rm.ArrivalRate = -5 // mis-scraped
+		rm.RequestRate = 0
+		_, _, _, ok := a.rateAnchoredK2(rm, "m", "", 1, k1, queueThreshold, now)
+		Expect(ok).To(BeFalse())
+	})
+
+	It("does not propagate a NaN arrival rate into capacity", func() {
+		a := NewSaturationAnalyzer(NewCapacityKnowledgeStore(), withRateAnchoredK2(true))
+		rm := base()
+		for i := 0; i < MinServiceRateSamples; i++ {
+			_, _, _, _ = a.rateAnchoredK2(rm, "m", "", 1, k1, queueThreshold, now)
+		}
+
+		rm.QueueLength = 0
+		rm.ArrivalRate = math.NaN()
+		k2, _, _, ok := a.rateAnchoredK2(rm, "m", "", 1, k1, queueThreshold, now)
+		// A NaN ratio is caught before the int64 conversion, so either the estimator
+		// declines or it returns a sane positive token count — never garbage.
+		if ok {
+			Expect(k2).To(BeNumerically(">", 0))
+			Expect(k2).To(BeNumerically("<=", k1))
+		}
+	})
+
+	It("declines a cold replica with no occupancy and no calibration", func() {
+		a := NewSaturationAnalyzer(NewCapacityKnowledgeStore(), withRateAnchoredK2(true))
+		rm := base()
+		rm.QueueLength = 0
+		rm.TokensInUse = 0 // just became ready, KV still empty
+		_, _, _, ok := a.rateAnchoredK2(rm, "m", "", 1, k1, queueThreshold, now)
+		Expect(ok).To(BeFalse())
+	})
+
+	It("shares mu across replicas of a variant but smooths arrivals per replica", func() {
+		a := NewSaturationAnalyzer(NewCapacityKnowledgeStore(), withRateAnchoredK2(true))
+
+		// pod-a is backlogged and establishes the bucket's ceiling.
+		hot := base()
+		for i := 0; i < MinServiceRateSamples; i++ {
+			_, _, _, _ = a.rateAnchoredK2(hot, "m", "", 1, k1, queueThreshold, now)
+		}
+
+		// pod-b, same variant and shape, idle at a quarter of the ceiling. It gets
+		// the shared mu, and its own arrival history — not pod-a's.
+		cold := base()
+		cold.PodName = "pod-b"
+		cold.QueueLength = 0
+		cold.ArrivalRate = 2.0
+		k2, src, _, ok := a.rateAnchoredK2(cold, "m", "", 1, k1, queueThreshold, now)
+		Expect(ok).To(BeTrue())
+		Expect(src).To(Equal(k2SrcRateAnchored))
+		Expect(k2).To(BeNumerically(">", int64(float64(kvCapacity)*0.16)),
+			"an idle replica must read as having headroom, not as saturated")
+	})
+
+	It("collapses onto one smoothing entry when replicas report no pod name", func() {
+		// Documents a real limitation rather than asserting it is harmless: with
+		// PodName empty the smoother falls back to the bucket key, so two such
+		// replicas share one arrival average.
+		s := newArrivalSmoother()
+		first := s.Smooth("bucket", 4.0, 60, now)
+		second := s.Smooth("bucket", 40.0, 60, now.Add(time.Second))
+		Expect(first).To(Equal(4.0))
+		Expect(second).To(BeNumerically("<", 40.0),
+			"the second replica's rate is blended into the first's average")
 	})
 })

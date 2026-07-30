@@ -223,7 +223,7 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 	// headroom rather than being a ceiling, and the store feeds zero-replica
 	// estimation and cross-variant lookups that need a ceiling.
 	storedK2 := k2
-	if rateK2, rateSrc, ceiling, ok := a.rateAnchoredK2(rm, modelID, gpuCount, k1, config.QueueLengthThreshold, time.Now()); ok {
+	if rateK2, rateSrc, ceiling, ok := a.rateAnchoredK2(rm, modelID, role, gpuCount, k1, config.QueueLengthThreshold, time.Now()); ok {
 		k2, k2Priority = rateK2, rateSrc
 		if ceiling {
 			storedK2 = rateK2

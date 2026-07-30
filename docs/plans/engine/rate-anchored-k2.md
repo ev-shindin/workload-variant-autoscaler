@@ -71,8 +71,12 @@ Properties that matter here:
 - **Does not need a live queue.** Once `μ` is known for a bucket it stays valid
   until the workload shape changes, unlike an occupancy sample which is meaningful
   only at the instant it was taken.
-- **Uses the instantaneous KV reading**, not the 1-minute peak. The peak stays where
-  it belongs — on the demand side, where erring high is deliberate.
+- **Scales by the same occupancy figure demand is built from** (`TokensInUse`).
+  Dividing a max-aggregated demand by an instant-aggregated capacity would inflate
+  utilization by the peak-to-instant spread, so a spiky replica would look more
+  saturated than a steady one at identical load. With both sides on the same
+  aggregation the occupancy term cancels and, with no queue, utilization reduces to
+  λ/μ — which is the whole intent.
 
 ### Why not an ITL model
 
@@ -90,13 +94,14 @@ throughput analyzer is enabled, which this plan removes as a dependency.
 |---|---|---|---|
 | λ arrival rate | `rate(inference_extension_scheduler_attempts_total{status="success"}[1m])` (EPP) | `ArrivalRate` | unconditional |
 | μ completion rate | `rate(vllm:request_generation_tokens_count[1m])` | `RequestRate` | throughput-analyzer only |
-| occupancy (no peak bias) | `vllm:kv_cache_usage_perc` (instant) | `KvUsageInstant` | throughput-analyzer only |
+| occupancy | `max_over_time(vllm:kv_cache_usage_perc[1m])` × capacity | `TokensInUse` | unconditional |
 | queue | `max_over_time(vllm:num_requests_waiting[1m])` | `QueueLength` | unconditional |
 | KV capacity | `vllm:cache_config_info` | `TotalKvCapacityTokens` | unconditional |
 
-No new PromQL. `QueryRequestRate` and `QueryKvUsageInstant` move to a shared
-registrar called unconditionally by the saturation engine; the throughput analyzer
-registers the same two only if absent, so either order works and neither panics.
+No new PromQL. `QueryRequestRate` moves to a shared registrar called unconditionally
+by the saturation engine (`QueryKvUsageInstant` moves with it, since the throughput
+analyzer needs it and the registrar is shared); the throughput analyzer registers
+them only if absent, so either order works and neither panics.
 
 SGLang equivalents (`sglang:generation_tokens_histogram_count`, `sglang:token_usage`)
 are already defined and move with them.
@@ -198,6 +203,16 @@ scales on) separately from `storedCapacity` (what the store learns).
 - **Prompt-token throughput is still not collected.** Useful as a diagnostic to
   confirm the prefill-bound reading of the sustained run; not required by the
   estimator.
+
+## Where the two estimators actually differ
+
+Under a deep backlog they agree: the occupancy path records `TokensInUse` as k2 and
+the rate path's backlog branch returns the same figure. The divergence is entirely
+in the **post-drain** state — queue empty, occupancy collapsed, arrivals unchanged.
+There the occupancy path answers from its inflated history and reports abundant
+spare capacity (the shed-to-one), while the rate path reads λ still at the ceiling
+and holds capacity at the current load. That is the behaviour the cluster legs must
+confirm, and it is pinned by a test at the `computeReplicaCapacity` level.
 
 ## Validation
 

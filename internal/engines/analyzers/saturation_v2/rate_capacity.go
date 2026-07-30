@@ -275,12 +275,17 @@ func residenceSeconds(rm domain.ReplicaMetrics) float64 {
 
 // serviceRateKey identifies a workload bucket for service-rate purposes.
 //
-// The input bucket is part of the key, unlike the k2 history key: mu is a property
+// Role is part of the key because a prefill replica and a decode replica of the
+// same model on the same accelerator are different services: they do different
+// work per request and complete at entirely different rates. Sharing a bucket
+// would let one calibrate the other's ceiling.
+//
+// The input bucket is part of it too, unlike the k2 history key: mu is a property
 // of the request shape, and 1000-token prompts and 300-token prompts are different
 // services on the same hardware. Keying only by output length would average them.
-func serviceRateKey(modelID, accelerator string, gpuCount int, avgInput, avgOutput float64) string {
-	return fmt.Sprintf("%s|%s|%d|in:%s|out:%s",
-		modelID, accelerator, gpuCount,
+func serviceRateKey(modelID, accelerator, role string, gpuCount int, avgInput, avgOutput float64) string {
+	return fmt.Sprintf("%s|%s|%s|%d|in:%s|out:%s",
+		modelID, accelerator, canonicalRole(role), gpuCount,
 		classifyOutputLength(avgInput), classifyOutputLength(avgOutput))
 }
 
@@ -300,6 +305,7 @@ func serviceRateKey(modelID, accelerator string, gpuCount int, avgInput, avgOutp
 func (a *SaturationAnalyzer) rateAnchoredK2(
 	rm domain.ReplicaMetrics,
 	modelID string,
+	role string,
 	gpuCount int,
 	k1 int64,
 	queueThreshold float64,
@@ -309,7 +315,7 @@ func (a *SaturationAnalyzer) rateAnchoredK2(
 		return 0, 0, false, false
 	}
 
-	key := serviceRateKey(modelID, rm.AcceleratorName, gpuCount, rm.AvgInputTokens, rm.AvgOutputTokens)
+	key := serviceRateKey(modelID, rm.AcceleratorName, role, gpuCount, rm.AvgInputTokens, rm.AvgOutputTokens)
 
 	// Only a sustained backlog establishes a ceiling; see the package comment.
 	backlogged := float64(rm.QueueLength) >= queueThreshold
@@ -325,9 +331,14 @@ func (a *SaturationAnalyzer) rateAnchoredK2(
 	}
 	lambda := a.arrivals.Smooth(smoothingKey, rm.ArrivalRate, residenceSeconds(rm), now)
 
-	// KvUsageInstant is the un-peaked reading; the 1-minute max used for demand
-	// would over-state the operating point and inflate the estimate.
-	occupancy := rm.KvUsageInstant * float64(rm.TotalKvCapacityTokens)
+	// Scale by the same occupancy figure demand is built from, not the instantaneous
+	// reading. Demand is TokensInUse (a 1-minute max) plus the queue charge, so
+	// dividing it by a capacity derived from an instantaneous reading would inflate
+	// utilization by whatever the peak-to-instant spread happens to be — a spiky
+	// replica would look far more saturated than a steady one at the same load.
+	// Using the same aggregation on both sides makes the occupancy term cancel:
+	// with no queue, utilization reduces to lambda/mu, which is the whole intent.
+	occupancy := float64(rm.TokensInUse)
 	if occupancy <= 0 {
 		return 0, 0, false, false
 	}
@@ -346,6 +357,15 @@ func (a *SaturationAnalyzer) rateAnchoredK2(
 	}
 
 	k2 := occupancy * ratio
+	// A replica with no queue is, by observation, coping with what it currently
+	// holds, so its capacity is at least that. Without this floor a lambda that
+	// momentarily edges past a conservatively-measured mu would cut capacity below
+	// the load the replica is visibly handling and demand a scale-up on evidence
+	// that does not exist. It binds only when ratio < 1 with an empty queue; a
+	// backlogged replica is genuinely over capacity and keeps the raw value.
+	if !backlogged && k2 < occupancy {
+		k2 = occupancy
+	}
 	if floor := float64(k1) * MinRateAnchoredFraction; k2 < floor {
 		k2 = floor
 	}
