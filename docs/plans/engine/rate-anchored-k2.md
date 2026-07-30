@@ -35,48 +35,51 @@ against that workload and none of them broke the cycling.
 
 ## Approach
 
-Add a second, **rate-anchored** estimator for `k2`, selected by an internal flag,
-leaving the existing estimator in place and untouched when the flag is off.
+Add a second, **rate-anchored** estimator for `k2`, selected by an internal switch,
+leaving the existing estimator in place and untouched when it is off.
 
-When a replica *cannot keep up*, its completion rate is its service rate — this
-holds whichever resource binds (prefill compute, decode bandwidth, memory), which
-is what makes it the right anchor for a workload-agnostic capacity model:
+The design separates two questions that the occupancy-based estimator conflates:
 
 ```
-μ  = max completion rate for this bucket, observed only while the queue was
-     at least QueueLengthThreshold deep, over ≥ MinServiceRateSamples samples
-λ  = this replica's arrival rate (EPP dispatch rate)
-k2 = KvUsageInstant × TotalKvCapacityTokens × (μ / λ)
+detector:    rates decide WHEN a replica is at its limit
+measurement: tokens record WHAT that limit is
 ```
 
-**μ must be a ceiling, and that has to be established rather than assumed.** With
-no backlog, completions equal arrivals at any load — flow conservation — so an idle
-replica's completion rate carries no information about its limit. If μ were
-recorded from a momentary queue, `μ = λ` would later read as saturation on a
-replica that is merely keeping up comfortably at low occupancy, and the estimator
-would over-provision: the mirror image of the bug it replaces. Hence two gates: a
-queue depth of at least `QueueLengthThreshold` (default 5) to record at all, and
-`MinServiceRateSamples` (2) qualifying observations before a bucket answers.
+A replica is at its limit when it has a backlog at least `QueueLengthThreshold`
+deep, or when its arrival rate has reached the service rate measured while it *was*
+backlogged. At that moment its resident token count is a measurement of the limit.
+That measurement is stored **per workload bucket** — model, accelerator, role,
+request shape — as a running minimum, and every replica of the bucket reads the
+same value.
 
-At `λ = μ` the replica is exactly saturated and `k2` equals its current occupancy,
-so utilization reads 100% **even at 16% KV**. At `λ = μ/2`, `k2` is twice the
-occupancy and utilization reads 50%. The result stays in KV tokens, so `min(k1, k2)`,
-`spareCapacity`, and every downstream consumer are unchanged.
+Two properties follow, and both were learned the hard way from earlier versions of
+this code:
 
-Properties that matter here:
+- **The value is identical across replicas of a variant.** `aggregateByVariant`
+  takes the MEDIAN of per-replica capacities. A number that varied with each
+  replica's own load was not commensurable across siblings: an idle replica's
+  figure blended with a backlogged one's and lifted variant capacity enough to turn
+  a scale-up into a scale-down, reintroducing shed-to-one by a new route. A bucket
+  ceiling makes the median a no-op.
+- **The value does not move with this cycle's load.** A capacity recomputed from
+  the current arrival rate changed every cycle, which is an oscillation waiting to
+  happen. A stored ceiling changes only as the running minimum is lowered by a new
+  measurement or relaxed upward by age — both slow by construction.
 
-- **Blind to which resource binds.** No assumption that the workload is decode-heavy.
-- **Monotone in the right direction.** `μ` is a ceiling measured only under backlog;
-  heavier load cannot inflate it. The current estimator moves the wrong way.
-- **Does not need a live queue.** Once `μ` is known for a bucket it stays valid
-  until the workload shape changes, unlike an occupancy sample which is meaningful
-  only at the instant it was taken.
-- **Scales by the same occupancy figure demand is built from** (`TokensInUse`).
-  Dividing a max-aggregated demand by an instant-aggregated capacity would inflate
-  utilization by the peak-to-instant spread, so a spiky replica would look more
-  saturated than a steady one at identical load. With both sides on the same
-  aggregation the occupancy term cancels and, with no queue, utilization reduces to
-  λ/μ — which is the whole intent.
+Why a limit measured at 16% KV utilization is the whole point: on a prefill-heavy
+workload the engine exhausts prompt-token throughput long before memory, so the
+binding constraint is invisible to an occupancy-only model. The detector notices it
+from rates; the measurement records it in the units the rest of the engine speaks.
+
+### Damping, by construction
+
+- `SaturationEnterRatio` (0.95) means the detector fires just before arrivals cross
+  the service rate, and a lambda hovering at mu does not toggle it between cycles.
+- The service rate is a running maximum with slow decay; the ceiling is a running
+  minimum with slow upward relaxation. Neither tracks a single cycle.
+- `MinServiceRateSamples` keeps one slow interval from establishing a limit.
+- lambda is smoothed over a residence time, so a completion-derived rate and an
+  arrival rate are compared on the same time base.
 
 ### Why not an ITL model
 
@@ -165,32 +168,14 @@ Only an idle, never-calibrated replica with no EPP declines, and there is nothin
 at risk in that state. Each source has its own `k2Source` label (`RATE-λ`,
 `RATE-q`, `RATE-c`) so the active path is visible per replica.
 
-## The estimator answers only at or past saturation
-
-Below saturation, `occupancy × μ/λ` is occupancy scaled by *headroom* — a statement
-about slack, not a capacity. It must not be returned, for two reasons:
-
-- **It is not a ceiling**, so it has no business in the capacity store.
-- **`aggregateByVariant` takes the MEDIAN of per-replica capacities.** An idle
-  replica's headroom-scaled number would sit under that median next to a backlogged
-  sibling's genuine ceiling as though the two were commensurable. With one replica
-  queueing twelve deep and one idle sibling, the median rose far enough to turn a
-  scale-up into a scale-down — reintroducing shed-to-one by a new route.
-
-So the estimator declines when `μ/λ > 1`. Nothing is lost: detecting saturation the
-occupancy path misses is the entire purpose, and where a replica genuinely has
-headroom the occupancy path's ceiling is the better answer. Because everything
-returned is now a measured ceiling, the capacity store can learn it unconditionally
-and no separate stored value is needed.
-
 ## What the capacity store learns
 
 `capacityStore` feeds zero-replica estimation, cross-variant `FindCompatible`
 lookups and the fallback path — all of which need a **ceiling**, what a replica can
-do. Since the estimator only answers at or past saturation, every value it produces
-is what the replica actually held under load, so the store learns it directly.
-`MinRateRatio` floors the ratio; there is no upper clamp, because a ratio above 1
-means headroom and the estimator declines instead.
+do. Everything this estimator produces is a limit measured under load, so the store
+learns it directly. `MinRateAnchoredFraction` floors it so a stalled replica cannot
+teach the bucket a near-zero capacity; there is no upper clamp, because `min(k1, k2)`
+already prevents a compute bound from exceeding the memory bound.
 
 ## Guards
 

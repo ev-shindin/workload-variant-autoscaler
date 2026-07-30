@@ -17,25 +17,30 @@ import (
 // engine exhausts prompt-token throughput and queues while KV occupancy is still
 // low, so the estimate carries no information about the binding constraint.
 //
-// This estimator anchors on the one quantity that is meaningful whichever resource
-// binds: while a replica cannot keep up, its completion rate IS its service rate.
+// This estimator splits the problem in two:
 //
-// "Cannot keep up" has to be established, not assumed. With no backlog, completions
-// equal arrivals at any load — flow conservation — so an idle replica's completion
-// rate says nothing about its ceiling. mu is therefore recorded only from replicas
-// with a queue at least QueueLengthThreshold deep, and a bucket needs
-// MinServiceRateSamples such observations before it will answer. Without that,
-// one burst of arrival jitter would pin mu at whatever the replica happened to be
-// doing, and every later lambda near that value would read as saturation at low
-// occupancy — over-provisioning, the mirror of the bug this replaces.
+//	detector:    rates decide WHEN a replica is at its limit
+//	measurement: tokens record WHAT that limit is
 //
-//	mu = highest completion rate seen for this workload bucket while queued
-//	k2 = occupancy × (mu / lambda)
+// A replica is at its limit when it has a sustained backlog, or when its arrival
+// rate has reached the service rate observed while it was backlogged. At that
+// moment its resident token count is a measurement of the limit, and it is stored
+// per workload bucket — model, accelerator, role, request shape — because it is a
+// property of that bucket, not of the individual replica or of the current cycle.
 //
-// At lambda == mu the replica is exactly saturated and k2 equals its current
-// occupancy, so utilization reads 100% even at 16% KV. At lambda == mu/2, k2 is
-// twice the occupancy and utilization reads 50%. The result stays in KV tokens, so
-// every downstream consumer (min(k1,k2), spareCapacity, the optimizer) is unchanged.
+// Keeping the measurement out of the per-cycle path is what makes the estimate
+// usable downstream, for two reasons that both bit earlier versions of this code:
+//
+//   - aggregateByVariant takes the MEDIAN of per-replica capacities. A number that
+//     varied per replica with that replica's own load was not commensurable across
+//     siblings: an idle replica's figure blended with a backlogged one's and lifted
+//     variant capacity enough to turn a scale-up into a scale-down. A bucket
+//     ceiling is identical for every replica of the variant, so the median is a
+//     no-op and cannot mix kinds.
+//   - a value recomputed from this cycle's lambda moved every cycle, which is a
+//     scaling oscillation waiting to happen. A stored ceiling changes only as the
+//     running minimum is lowered by a new observation or relaxed by decay, both of
+//     which are slow by construction.
 //
 // See docs/plans/engine/rate-anchored-k2.md.
 
@@ -50,27 +55,34 @@ import (
 const EnableRateAnchoredK2 = false
 
 const (
-	// ServiceRateWindow is how long an observed service rate stays authoritative
-	// for its bucket. A replica only calibrates while it has a backlog, which may
-	// be rare, so this is generous relative to the optimize interval.
+	// ServiceRateWindow is how long an observation stays authoritative for its
+	// bucket. A replica only calibrates while it is at its limit, which may be
+	// rare, so this is generous relative to the optimize interval.
 	ServiceRateWindow = 30 * time.Minute
 
-	// ServiceRateDecayPerWindow is the fraction the retained maximum decays to
+	// ServiceRateDecayPerWindow is the fraction the retained service rate decays to
 	// over one ServiceRateWindow with no fresh observation. Decay matters because
-	// mu is a running maximum: without it, one unusually fast interval would pin
-	// the estimate high for as long as the entry lives.
+	// the rate is a running maximum: without it, one unusually fast interval would
+	// pin it high for as long as the entry lives.
 	ServiceRateDecayPerWindow = 0.75
 
-	// MinRateRatio floors mu/lambda so a mis-scraped or transiently collapsed
-	// service rate cannot drive capacity to nearly zero. There is no upper clamp:
-	// a ratio above 1 means the replica has headroom, and the estimator declines
-	// rather than reporting a headroom-scaled figure as capacity.
-	MinRateRatio = 0.05
+	// CeilingRelaxPerWindow is the factor the learned token ceiling relaxes by over
+	// one ServiceRateWindow with no fresh observation. The ceiling is a running
+	// minimum, so it relaxes *upward*: a single pessimistic measurement — taken
+	// while a node was degraded, say — must not cap the variant forever. Capacity
+	// drifts back toward the memory bound in the absence of evidence.
+	CeilingRelaxPerWindow = 1.25
 
 	// MinServiceRateSamples is how many qualifying observations a bucket needs
 	// before its service rate is usable. One observation cannot distinguish a real
-	// ceiling from a single slow interval.
+	// limit from a single slow interval.
 	MinServiceRateSamples = 2
+
+	// SaturationEnterRatio is the fraction of the service rate at which arrivals
+	// are treated as having reached it. Slightly below 1 so the limit is recognised
+	// just before it is crossed, and so a lambda hovering at mu does not toggle the
+	// detector between cycles.
+	SaturationEnterRatio = 0.95
 
 	// MinResidenceSeconds and MaxResidenceSeconds bound the residence estimate used
 	// as the arrival-smoothing time constant, so a garbage latency reading cannot
@@ -82,88 +94,152 @@ const (
 	// previous arrival average is discarded rather than blended.
 	ArrivalSmoothingResetFactor = 3.0
 
-	// MinRateAnchoredFraction floors the estimate at a fraction of k1. A replica
-	// that has stalled completely (mu near zero while requests are queued) would
-	// otherwise drive capacity to ~0 and demand an unbounded scale-up.
+	// MinRateAnchoredFraction floors the learned ceiling at a fraction of k1. A
+	// replica that stalled completely while requests queued would otherwise teach
+	// the bucket a near-zero capacity and demand an unbounded scale-up.
 	MinRateAnchoredFraction = 0.05
 )
 
-// serviceRateStore holds the observed service rate (mu, requests/second) per
-// workload bucket. Entries are updated only from replicas that had a backlog at
-// the time of observation — an idle replica's completion rate reflects arrivals,
-// not capacity.
-type serviceRateStore struct {
+// bucketStore holds what has been learned about a workload bucket: the service
+// rate observed while a replica could not keep up (mu, requests/second), and the
+// resident token count measured at that moment (the compute-bound ceiling).
+//
+// Both are per bucket rather than per replica. Replicas of a variant run the same
+// model on the same hardware, so a limit measured on one applies to all — which is
+// what makes the value safe to put through aggregateByVariant's median.
+type bucketStore struct {
 	mu      sync.Mutex
-	entries map[string]*serviceRateEntry
+	entries map[string]*bucketEntry
 }
 
-type serviceRateEntry struct {
-	rate     float64
-	observed time.Time
-	samples  int
+type bucketEntry struct {
+	rate         float64 // mu: running max of completion rate under backlog
+	rateSamples  int
+	rateSeen     time.Time
+	ceiling      float64 // running min of resident tokens at the limit
+	ceilingSeen  time.Time
+	ceilingKnown bool
 }
 
-func newServiceRateStore() *serviceRateStore {
-	return &serviceRateStore{entries: make(map[string]*serviceRateEntry)}
+func newBucketStore() *bucketStore {
+	return &bucketStore{entries: make(map[string]*bucketEntry)}
 }
 
-// Observe records a completion rate for a bucket, keeping the running maximum.
-// Callers must only pass rates measured while the replica had a backlog.
-func (s *serviceRateStore) Observe(key string, rate float64, now time.Time) {
+// entry returns the bucket's entry, creating it when absent. Callers hold s.mu.
+func (s *bucketStore) entry(key string) *bucketEntry {
+	e, ok := s.entries[key]
+	if !ok {
+		e = &bucketEntry{}
+		s.entries[key] = e
+	}
+	return e
+}
+
+// ObserveRate records a completion rate for a bucket, keeping the running maximum.
+// Callers must only pass rates measured while the replica had a backlog: with no
+// backlog, completions equal arrivals at any load and say nothing about the limit.
+func (s *bucketStore) ObserveRate(key string, rate float64, now time.Time) {
 	if rate <= 0 {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	e, ok := s.entries[key]
-	if !ok {
-		s.entries[key] = &serviceRateEntry{rate: rate, observed: now, samples: 1}
+	e := s.entry(key)
+	if e.rateSamples == 0 {
+		e.rate, e.rateSamples, e.rateSeen = rate, 1, now
 		return
 	}
-	e.samples++
+	e.rateSamples++
 	// Compare against the decayed value so a stale peak yields to a fresh, lower
 	// observation rather than persisting until eviction.
-	if decayed := decayRate(e.rate, now.Sub(e.observed)); rate >= decayed {
+	if decayed := decayRate(e.rate, now.Sub(e.rateSeen)); rate >= decayed {
 		e.rate = rate
 	} else {
 		e.rate = decayed
 	}
-	e.observed = now
+	e.rateSeen = now
 }
 
-// Rate returns the current service-rate estimate for a bucket, decayed by age,
-// and false when the bucket has no usable observation.
-func (s *serviceRateStore) Rate(key string, now time.Time) (float64, bool) {
+// Rate returns the bucket's service-rate estimate, decayed by age, and false when
+// it has too few observations or has gone stale.
+func (s *bucketStore) Rate(key string, now time.Time) (float64, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	e, ok := s.entries[key]
-	if !ok {
+	if !ok || e.rateSamples < MinServiceRateSamples {
 		return 0, false
 	}
-	if e.samples < MinServiceRateSamples {
+	if now.Sub(e.rateSeen) > ServiceRateWindow {
 		return 0, false
 	}
-	if now.Sub(e.observed) > ServiceRateWindow {
-		return 0, false
-	}
-	r := decayRate(e.rate, now.Sub(e.observed))
+	r := decayRate(e.rate, now.Sub(e.rateSeen))
 	if r <= 0 {
 		return 0, false
 	}
 	return r, true
 }
 
-// EvictStale drops entries with no observation within timeout, returning the
-// number removed. Mirrors EvictStaleHistory so both stores age out together.
-func (s *serviceRateStore) EvictStale(timeout time.Duration, now time.Time) int {
+// ObserveCeiling records the resident token count measured while a replica was at
+// its limit, keeping the running minimum — the lowest occupancy at which a replica
+// was seen unable to keep up is the conservative reading of the bucket's capacity.
+func (s *bucketStore) ObserveCeiling(key string, tokens float64, now time.Time) {
+	if tokens <= 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	e := s.entry(key)
+	if !e.ceilingKnown {
+		e.ceiling, e.ceilingKnown, e.ceilingSeen = tokens, true, now
+		return
+	}
+	// Compare against the relaxed value so an old pessimistic reading gives way to
+	// a fresh higher one instead of capping the bucket indefinitely.
+	if relaxed := relaxCeiling(e.ceiling, now.Sub(e.ceilingSeen)); tokens <= relaxed {
+		e.ceiling = tokens
+	} else {
+		e.ceiling = relaxed
+	}
+	e.ceilingSeen = now
+}
+
+// Ceiling returns the bucket's learned token ceiling, relaxed by age, and false
+// when nothing has been measured or the measurement has gone stale.
+func (s *bucketStore) Ceiling(key string, now time.Time) (float64, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	e, ok := s.entries[key]
+	if !ok || !e.ceilingKnown {
+		return 0, false
+	}
+	if now.Sub(e.ceilingSeen) > ServiceRateWindow {
+		return 0, false
+	}
+	c := relaxCeiling(e.ceiling, now.Sub(e.ceilingSeen))
+	if c <= 0 {
+		return 0, false
+	}
+	return c, true
+}
+
+// EvictStale drops buckets with no observation of either kind within timeout,
+// returning the number removed. Mirrors EvictStaleHistory so the stores age out
+// together.
+func (s *bucketStore) EvictStale(timeout time.Duration, now time.Time) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	removed := 0
 	for k, e := range s.entries {
-		if now.Sub(e.observed) > timeout {
+		last := e.rateSeen
+		if e.ceilingSeen.After(last) {
+			last = e.ceilingSeen
+		}
+		if now.Sub(last) > timeout {
 			delete(s.entries, k)
 			removed++
 		}
@@ -171,15 +247,23 @@ func (s *serviceRateStore) EvictStale(timeout time.Duration, now time.Time) int 
 	return removed
 }
 
-// decayRate applies exponential decay so an unrefreshed maximum loses authority
-// smoothly: after one ServiceRateWindow it retains ServiceRateDecayPerWindow of
-// its value.
+// decayRate applies exponential decay so an unrefreshed service rate loses
+// authority smoothly: after one ServiceRateWindow it retains
+// ServiceRateDecayPerWindow of its value.
 func decayRate(rate float64, age time.Duration) float64 {
 	if age <= 0 {
 		return rate
 	}
-	windows := age.Seconds() / ServiceRateWindow.Seconds()
-	return rate * math.Pow(ServiceRateDecayPerWindow, windows)
+	return rate * math.Pow(ServiceRateDecayPerWindow, age.Seconds()/ServiceRateWindow.Seconds())
+}
+
+// relaxCeiling grows an unrefreshed ceiling so capacity drifts back toward the
+// memory bound when no fresh evidence of a limit arrives.
+func relaxCeiling(ceiling float64, age time.Duration) float64 {
+	if age <= 0 {
+		return ceiling
+	}
+	return ceiling * math.Pow(CeilingRelaxPerWindow, age.Seconds()/ServiceRateWindow.Seconds())
 }
 
 // arrivalSmoother holds a per-replica exponentially-weighted arrival rate.
@@ -187,9 +271,8 @@ func decayRate(rate float64, age time.Duration) float64 {
 // A completion happens one residence time after the arrival that caused it, so a
 // completion-derived mu and an instantaneous lambda are measured on different time
 // bases: during a ramp, completions still reflect the lighter load of W seconds
-// ago and mu/lambda reads as saturation on a replica that is coping. Occupancy has
-// the same property — it is a stock that already integrates arrivals over W.
-// Averaging lambda over roughly W puts all three on the same footing.
+// ago and the comparison reads as saturation on a replica that is coping.
+// Averaging lambda over roughly W puts the two on the same footing.
 type arrivalSmoother struct {
 	mu      sync.Mutex
 	entries map[string]*arrivalEntry
@@ -209,10 +292,7 @@ func newArrivalSmoother() *arrivalSmoother {
 // The weight is derived from the actual gap between samples, so an irregular
 // optimize interval or a missed cycle does not distort the average.
 func (s *arrivalSmoother) Smooth(key string, rate, tau float64, now time.Time) float64 {
-	if rate <= 0 {
-		return rate
-	}
-	if tau <= 0 {
+	if rate <= 0 || tau <= 0 {
 		return rate
 	}
 	s.mu.Lock()
@@ -274,43 +354,34 @@ func residenceSeconds(rm domain.ReplicaMetrics) float64 {
 	return w
 }
 
-// serviceRateKey identifies a workload bucket for service-rate purposes.
+// serviceRateKey identifies a workload bucket.
 //
 // Role is part of the key because a prefill replica and a decode replica of the
 // same model on the same accelerator are different services: they do different
 // work per request and complete at entirely different rates. Sharing a bucket
-// would let one calibrate the other's ceiling.
+// would let one calibrate the other's limit.
 //
-// The input bucket is part of it too, unlike the k2 history key: mu is a property
-// of the request shape, and 1000-token prompts and 300-token prompts are different
-// services on the same hardware. Keying only by output length would average them.
+// The input bucket is part of it too, unlike the k2 history key: the limit is a
+// property of the request shape, and 1000-token prompts and 300-token prompts are
+// different services on the same hardware. Keying only by output length would
+// average them.
 func serviceRateKey(modelID, accelerator, role string, gpuCount int, avgInput, avgOutput float64) string {
 	return fmt.Sprintf("%s|%s|%s|%d|in:%s|out:%s",
 		modelID, accelerator, canonicalRole(role), gpuCount,
 		classifyOutputLength(avgInput), classifyOutputLength(avgOutput))
 }
 
-// rateAnchoredK2 estimates the compute-bound capacity in KV tokens from the
-// replica's distance to rate saturation, returning the value and which signal
-// produced it.
+// rateAnchoredK2 returns the compute-bound capacity in KV tokens for this
+// replica's bucket, and which signal produced it.
 //
-// It answers ONLY when the replica is at or past saturation (lambda >= mu). Below
-// saturation, occupancy × mu/lambda is occupancy scaled by headroom — a statement
-// about slack, not a capacity. Returning it would be wrong in two places: it is not
-// a ceiling, so it must not be persisted; and aggregateByVariant takes the MEDIAN
-// of per-replica capacities, where an idle replica's headroom-scaled number sits
-// next to a backlogged sibling's genuine ceiling as though the two were
-// commensurable. With one replica queueing twelve deep and an idle sibling, that
-// median lifted variant capacity enough to turn a scale-up into a scale-down —
-// reintroducing the shed-to-one this estimator exists to prevent, by a new route.
+// The value is the bucket's learned ceiling wherever one exists, so it is the same
+// for every replica of the variant and does not move with this cycle's arrival
+// rate. Before anything has been learned, a replica that is over its limit right
+// now still reports its own occupancy, so the first overload is not missed.
 //
-// Declining above saturation loses nothing: detecting saturation the occupancy path
-// misses is the whole purpose, and when a replica genuinely has headroom the
-// occupancy path's ceiling is the better answer. Everything this function returns
-// is therefore a measured ceiling, which is what makes it safe to persist.
-//
-// Returns false when no signal is usable or the replica has headroom, in which case
-// the caller falls through to the existing occupancy-based chain.
+// Returns false when nothing has been learned and the replica is not currently
+// over its limit, in which case the caller falls through to the occupancy-based
+// chain.
 func (a *SaturationAnalyzer) rateAnchoredK2(
 	rm domain.ReplicaMetrics,
 	modelID string,
@@ -326,99 +397,75 @@ func (a *SaturationAnalyzer) rateAnchoredK2(
 
 	key := serviceRateKey(modelID, rm.AcceleratorName, role, gpuCount, rm.AvgInputTokens, rm.AvgOutputTokens)
 
-	// Only a sustained backlog establishes a ceiling; see the package comment.
+	// Detector: rates decide whether this replica is at its limit.
 	backlogged := float64(rm.QueueLength) >= queueThreshold
 	if backlogged && rm.RequestRate > 0 {
-		a.serviceRates.Observe(key, rm.RequestRate, now)
+		a.serviceRates.ObserveRate(key, rm.RequestRate, now)
+	}
+	atLimit := backlogged || a.arrivalsReachedServiceRate(rm, key, now)
+
+	// Whether anything was known before this cycle, purely so the source label can
+	// distinguish a fresh measurement from a carried-over one. Both are the same
+	// number and take the same path; the distinction is for the cycle log.
+	_, hadCeiling := a.serviceRates.Ceiling(key, now)
+
+	// Measurement: at the limit, resident tokens are what the limit is worth.
+	occupancy := float64(rm.TokensInUse)
+	if atLimit && occupancy > 0 {
+		a.serviceRates.ObserveCeiling(key, occupancy, now)
 	}
 
-	// Put lambda on the same time base as the completion-derived mu and the
-	// occupancy stock, both of which integrate over a residence time.
+	ceiling, ok := a.serviceRates.Ceiling(key, now)
+	if !ok {
+		return 0, 0, false
+	}
+	src := k2SrcRateAnchored
+	if !hadCeiling {
+		src = k2SrcRateBacklog
+	}
+	return clampCeiling(ceiling, k1), src, true
+}
+
+// arrivalsReachedServiceRate reports whether arrivals have caught up with the
+// service rate measured while the replica was backlogged — the limit being reached
+// before a queue has formed.
+//
+// lambda comes from the EPP dispatch rate where available. Without EPP, and only
+// when there is no queue, completions stand in for arrivals: everything that
+// arrives is served within the window, so the two are equal. That substitution is
+// invalid under backlog, which is why the caller checks the queue first.
+func (a *SaturationAnalyzer) arrivalsReachedServiceRate(rm domain.ReplicaMetrics, key string, now time.Time) bool {
+	muRate, ok := a.serviceRates.Rate(key, now)
+	if !ok {
+		return false
+	}
+
 	smoothingKey := rm.PodName
 	if smoothingKey == "" {
 		smoothingKey = key
 	}
 	lambda := a.arrivals.Smooth(smoothingKey, rm.ArrivalRate, residenceSeconds(rm), now)
-
-	// Scale by the same occupancy figure demand is built from, not the instantaneous
-	// reading. Demand is TokensInUse (a 1-minute max) plus the queue charge, so
-	// dividing it by a capacity derived from an instantaneous reading would inflate
-	// utilization by whatever the peak-to-instant spread happens to be — a spiky
-	// replica would look far more saturated than a steady one at the same load.
-	// Using the same aggregation on both sides makes the occupancy term cancel:
-	// with no queue, utilization reduces to lambda/mu, which is the whole intent.
-	occupancy := float64(rm.TokensInUse)
-	if occupancy <= 0 {
-		return 0, 0, false
+	if lambda <= 0 {
+		lambda = rm.RequestRate
 	}
-
-	ratio, src, ok := a.saturationRatio(rm, key, lambda, backlogged, now)
-	if !ok {
-		return 0, 0, false
+	if lambda <= 0 || math.IsNaN(lambda) || math.IsInf(lambda, 0) {
+		return false
 	}
-	// Headroom is not a capacity: stay silent and let the occupancy path answer.
-	if ratio > 1.0 {
-		return 0, 0, false
-	}
-	if ratio < MinRateRatio {
-		ratio = MinRateRatio
-	}
-
-	k2 := occupancy * ratio
-	// A replica with no queue is, by observation, coping with what it currently
-	// holds, so its capacity is at least that. Without this floor a lambda that
-	// momentarily edges past a conservatively-measured mu would cut capacity below
-	// the load the replica is visibly handling and demand a scale-up on evidence
-	// that does not exist. It binds only when ratio < 1 with an empty queue; a
-	// backlogged replica is genuinely over capacity and keeps the raw value.
-	if !backlogged && k2 < occupancy {
-		k2 = occupancy
-	}
-	if floor := float64(k1) * MinRateAnchoredFraction; k2 < floor {
-		k2 = floor
-	}
-	if k2 <= 0 || math.IsNaN(k2) || math.IsInf(k2, 0) {
-		return 0, 0, false
-	}
-	return int64(k2), src, true
+	return lambda >= muRate*SaturationEnterRatio
 }
 
-// saturationRatio returns mu/lambda — how much service headroom the replica has —
-// from the best signal available, in descending order of directness:
-//
-//  1. EPP arrival rate, smoothed over a residence time. The intended path: lambda
-//     is measured independently of the engine, so the ratio holds whether or not
-//     the replica is keeping up. Smoothing matters because completions lag their
-//     arrivals — see arrivalSmoother.
-//  2. Backlog. A replica queueing at least QueueLengthThreshold deep is saturated
-//     by observation: arrivals exceed service, so the ratio is at most 1 and
-//     capacity is the current occupancy. This needs neither lambda nor a calibrated
-//     mu, which makes it the safety net for a fleet with no EPP and no prior
-//     calibration — and it is exactly the prefill-heavy case the occupancy
-//     estimator misreads as idle. A shallower queue does not qualify: arrival
-//     jitter produces one every so often at any load.
-//  3. Completion rate as lambda. With no queue, everything that arrives is served
-//     within the scrape window, so completions are arrivals. Valid only in that
-//     case, which is why it sits behind the backlog check rather than in front.
-//
-// Returning false leaves the decision to the occupancy-based chain.
-func (a *SaturationAnalyzer) saturationRatio(
-	rm domain.ReplicaMetrics,
-	key string,
-	lambda float64,
-	backlogged bool,
-	now time.Time,
-) (float64, k2Source, bool) {
-	muRate, haveMu := a.serviceRates.Rate(key, now)
-
-	if lambda > 0 && haveMu {
-		return muRate / lambda, k2SrcRateAnchored, true
+// clampCeiling keeps a learned ceiling within usable bounds. There is no upper
+// clamp: min(k1, k2) in the caller already prevents a compute bound from exceeding
+// the memory bound.
+func clampCeiling(tokens float64, k1 int64) int64 {
+	if math.IsNaN(tokens) || math.IsInf(tokens, 0) {
+		return k1
 	}
-	if backlogged {
-		return 1.0, k2SrcRateBacklog, true
+	if floor := float64(k1) * MinRateAnchoredFraction; tokens < floor {
+		tokens = floor
 	}
-	if haveMu && rm.RequestRate > 0 {
-		return muRate / rm.RequestRate, k2SrcRateNoEPP, true
+	if tokens <= 0 {
+		return k1
 	}
-	return 0, 0, false
+	return int64(tokens)
 }

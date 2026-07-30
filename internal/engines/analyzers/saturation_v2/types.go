@@ -14,9 +14,8 @@ const (
 	k2SrcHistorical                       // rolling average from prior observations
 	k2SrcDerived                          // estimated from deployment args
 	k2SrcFallback                         // fallback to k1 (memory-bound)
-	k2SrcRateAnchored                     // rate-anchored: mu/lambda from the EPP arrival rate
-	k2SrcRateBacklog                      // rate-anchored: replica had a backlog, so it is saturated
-	k2SrcRateNoEPP                        // rate-anchored: mu/lambda with completions standing in for lambda
+	k2SrcRateAnchored                     // rate-anchored: the bucket's learned token ceiling
+	k2SrcRateBacklog                      // rate-anchored: limit measured this cycle, nothing carried over
 )
 
 var k2Labels = map[k2Source]string{
@@ -24,9 +23,8 @@ var k2Labels = map[k2Source]string{
 	k2SrcHistorical:   "P2-hist",
 	k2SrcDerived:      "P3-k2",
 	k2SrcFallback:     "P4-k1",
-	k2SrcRateAnchored: "RATE-λ",
-	k2SrcRateBacklog:  "RATE-q",
-	k2SrcRateNoEPP:    "RATE-c",
+	k2SrcRateAnchored: "RATE-learned",
+	k2SrcRateBacklog:  "RATE-now",
 }
 
 const (

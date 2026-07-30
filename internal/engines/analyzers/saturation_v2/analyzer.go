@@ -27,10 +27,11 @@ type SaturationAnalyzer struct {
 	computeCapacityHistory map[string]*rollingAverage
 	capacityStore          *CapacityKnowledgeStore
 
-	// serviceRates holds observed service rates for the rate-anchored k2
-	// estimator. Nil unless that estimator is enabled, which is what keeps the
-	// occupancy-based path byte-identical when the flag is off.
-	serviceRates *serviceRateStore
+	// serviceRates holds what has been learned per workload bucket for the
+	// rate-anchored k2 estimator: the service rate under backlog and the token
+	// ceiling measured at the limit. Nil unless that estimator is enabled, which is
+	// what keeps the occupancy-based path byte-identical when the flag is off.
+	serviceRates *bucketStore
 	// arrivals smooths per-replica arrival rates over a residence time so they are
 	// comparable with the completion-derived service rate. Allocated with
 	// serviceRates.
@@ -47,7 +48,7 @@ type Option func(*SaturationAnalyzer)
 func withRateAnchoredK2(enabled bool) Option { //nolint:unparam // tests pass true; the parameter documents the switch
 	return func(a *SaturationAnalyzer) {
 		if enabled {
-			a.serviceRates = newServiceRateStore()
+			a.serviceRates = newBucketStore()
 			a.arrivals = newArrivalSmoother()
 		}
 	}
@@ -61,7 +62,7 @@ func NewSaturationAnalyzer(store *CapacityKnowledgeStore, opts ...Option) *Satur
 		capacityStore:          store,
 	}
 	if EnableRateAnchoredK2 {
-		a.serviceRates = newServiceRateStore()
+		a.serviceRates = newBucketStore()
 		a.arrivals = newArrivalSmoother()
 	}
 	for _, opt := range opts {
@@ -218,10 +219,9 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 	// after computeK2 so the occupancy history keeps being maintained, which keeps
 	// the two estimators comparable in the same run.
 	//
-	// It only answers at or past saturation, so whatever it returns is a measured
-	// ceiling — the same thing the capacity store wants to learn. No separate
-	// stored value is needed: see rateAnchoredK2 for why a headroom-scaled figure
-	// is withheld instead of being special-cased here.
+	// What it returns is a per-bucket ceiling measured at the limit, identical for
+	// every replica of the variant and stable across cycles — see rateAnchoredK2 for
+	// why anything per-replica or per-cycle was unusable downstream.
 	if rateK2, rateSrc, ok := a.rateAnchoredK2(rm, modelID, role, gpuCount, k1, config.QueueLengthThreshold, time.Now()); ok {
 		k2, k2Priority = rateK2, rateSrc
 	}
