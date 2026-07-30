@@ -71,7 +71,7 @@ var _ = Describe("Rate-anchored k2 through computeReplicaCapacity", func() {
 		Expect(rec.EffectiveCapacity).To(Equal(rc.EffectiveCapacity))
 	})
 
-	It("keeps a below-saturation reading out of the store", func() {
+	It("leaves the store untouched by a replica with headroom", func() {
 		store := NewCapacityKnowledgeStore()
 		a := NewSaturationAnalyzer(store, withRateAnchoredK2(true))
 		cfg := scalingConfig()
@@ -80,22 +80,54 @@ var _ = Describe("Rate-anchored k2 through computeReplicaCapacity", func() {
 		for i := 0; i < MinServiceRateSamples; i++ {
 			_ = a.computeReplicaCapacity(rm, cfg, modelID, namespace, 1, domain.RoleBoth)
 		}
+		saturated := store.Get(namespace, modelID, variant)
+		Expect(saturated).NotTo(BeNil())
 
-		// Now idle at a quarter of the ceiling: the estimate is occupancy scaled by
-		// headroom, which is not a property of the variant.
+		// Now idle at a quarter of the ceiling. The estimator declines rather than
+		// returning a headroom-scaled figure, so both this cycle's capacity and the
+		// persisted record come from the occupancy path — no headroom number can
+		// reach the store or the variant-level median.
 		rm.QueueLength = 0
 		rm.ArrivalRate = 2.0
 		rc := a.computeReplicaCapacity(rm, cfg, modelID, namespace, 1, domain.RoleBoth)
 		Expect(rc).NotTo(BeNil())
+		Expect(rc.K2Priority).NotTo(Equal(k2SrcRateAnchored))
+		Expect(rc.K2Priority).NotTo(Equal(k2SrcRateNoEPP))
+		Expect(rc.K2Priority).NotTo(Equal(k2SrcRateBacklog))
 
 		rec := store.Get(namespace, modelID, variant)
 		Expect(rec).NotTo(BeNil())
-		Expect(rec.EffectiveCapacity).NotTo(Equal(rc.EffectiveCapacity),
-			"the headroom-scaled value must not become the learned ceiling")
-		// What the store learns must still be usable for zero-replica sizing, i.e.
-		// bounded by the memory bound rather than by this cycle's arrival rate.
+		Expect(rec.EffectiveCapacity).To(Equal(rc.EffectiveCapacity))
 		Expect(rec.EffectiveCapacity).To(BeNumerically("<=", int64(0.8*float64(kvCapacity))))
-		Expect(rec.EffectiveCapacity).To(BeNumerically(">", 0))
+	})
+
+	It("does not let an idle replica inflate capacity beside a backlogged sibling", func() {
+		cfg := scalingConfig()
+		a := NewSaturationAnalyzer(NewCapacityKnowledgeStore(), withRateAnchoredK2(true))
+
+		// pod-a is queueing twelve deep and calibrates the bucket.
+		hot := backlogged()
+		for i := 0; i < MinServiceRateSamples+1; i++ {
+			_ = a.computeReplicaCapacity(hot, cfg, modelID, namespace, 1, domain.RoleBoth)
+		}
+		hotRC := a.computeReplicaCapacity(hot, cfg, modelID, namespace, 1, domain.RoleBoth)
+
+		// pod-b is idle in the same bucket. aggregateByVariant takes the MEDIAN of
+		// per-replica capacities, so if the idle replica reported occupancy × its
+		// headroom the median would rise far above the backlogged replica's real
+		// ceiling and the variant would read as having spare capacity while a pod
+		// queues. Its capacity must therefore stay in the same range as its sibling's.
+		cold := backlogged()
+		cold.PodName = "pod-b"
+		cold.QueueLength = 0
+		cold.ArrivalRate = 2.0
+		coldRC := a.computeReplicaCapacity(cold, cfg, modelID, namespace, 1, domain.RoleBoth)
+
+		Expect(coldRC).NotTo(BeNil())
+		Expect(coldRC.EffectiveCapacity).To(BeNumerically("<=", int64(0.8*float64(kvCapacity))),
+			"an idle replica must never exceed the memory bound")
+		Expect(coldRC.EffectiveCapacity).To(BeNumerically("<=", hotRC.EffectiveCapacity*4),
+			"and must not tower over the backlogged sibling under a median")
 	})
 
 	It("is inert when the estimator is off", func() {

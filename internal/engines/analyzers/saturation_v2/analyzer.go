@@ -218,25 +218,17 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 	// after computeK2 so the occupancy history keeps being maintained, which keeps
 	// the two estimators comparable in the same run.
 	//
-	// storedK2 tracks what the capacity store should learn, which is not always what
-	// this cycle scales on: a below-saturation rate-anchored value is scaled by
-	// headroom rather than being a ceiling, and the store feeds zero-replica
-	// estimation and cross-variant lookups that need a ceiling.
-	storedK2 := k2
-	if rateK2, rateSrc, ceiling, ok := a.rateAnchoredK2(rm, modelID, role, gpuCount, k1, config.QueueLengthThreshold, time.Now()); ok {
+	// It only answers at or past saturation, so whatever it returns is a measured
+	// ceiling — the same thing the capacity store wants to learn. No separate
+	// stored value is needed: see rateAnchoredK2 for why a headroom-scaled figure
+	// is withheld instead of being special-cased here.
+	if rateK2, rateSrc, ok := a.rateAnchoredK2(rm, modelID, role, gpuCount, k1, config.QueueLengthThreshold, time.Now()); ok {
 		k2, k2Priority = rateK2, rateSrc
-		if ceiling {
-			storedK2 = rateK2
-		}
 	}
 
 	effectiveCapacity := k1
 	if k2 < k1 {
 		effectiveCapacity = k2
-	}
-	storedCapacity := k1
-	if storedK2 < k1 {
-		storedCapacity = storedK2
 	}
 
 	isSaturated := replicaDemand >= effectiveCapacity
@@ -253,7 +245,7 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 		NumGpuBlocks:          rm.NumGpuBlocks,
 		BlockSize:             rm.BlockSize,
 		TotalKvCapacityTokens: rm.TotalKvCapacityTokens,
-		EffectiveCapacity:     storedCapacity,
+		EffectiveCapacity:     effectiveCapacity,
 		EngineParams:          existingParams,
 		LearnedFrom:           learnedFromLive,
 	})

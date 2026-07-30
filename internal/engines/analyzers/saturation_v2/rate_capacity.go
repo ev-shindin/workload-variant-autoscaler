@@ -61,10 +61,11 @@ const (
 	// the estimate high for as long as the entry lives.
 	ServiceRateDecayPerWindow = 0.75
 
-	// MinRateRatio and MaxRateRatio clamp mu/lambda. A mis-scraped or transiently
-	// zero rate must not be able to swing capacity by orders of magnitude.
+	// MinRateRatio floors mu/lambda so a mis-scraped or transiently collapsed
+	// service rate cannot drive capacity to nearly zero. There is no upper clamp:
+	// a ratio above 1 means the replica has headroom, and the estimator declines
+	// rather than reporting a headroom-scaled figure as capacity.
 	MinRateRatio = 0.05
-	MaxRateRatio = 20.0
 
 	// MinServiceRateSamples is how many qualifying observations a bucket needs
 	// before its service rate is usable. One observation cannot distinguish a real
@@ -290,18 +291,26 @@ func serviceRateKey(modelID, accelerator, role string, gpuCount int, avgInput, a
 }
 
 // rateAnchoredK2 estimates the compute-bound capacity in KV tokens from the
-// replica's distance to rate saturation, returning the value, which signal
-// produced it, and whether that value is a measured ceiling.
+// replica's distance to rate saturation, returning the value and which signal
+// produced it.
 //
-// The ceiling flag governs persistence, not the scaling decision. At lambda >= mu
-// the replica is at or past saturation, so occupancy × mu/lambda is what it was
-// actually able to hold — worth writing to the capacity store. Below saturation
-// the same expression is occupancy scaled by headroom: correct for this cycle's
-// utilization, but not a property of the variant, and persisting it would
-// under-state capacity for zero-replica estimation and cross-variant lookups.
+// It answers ONLY when the replica is at or past saturation (lambda >= mu). Below
+// saturation, occupancy × mu/lambda is occupancy scaled by headroom — a statement
+// about slack, not a capacity. Returning it would be wrong in two places: it is not
+// a ceiling, so it must not be persisted; and aggregateByVariant takes the MEDIAN
+// of per-replica capacities, where an idle replica's headroom-scaled number sits
+// next to a backlogged sibling's genuine ceiling as though the two were
+// commensurable. With one replica queueing twelve deep and an idle sibling, that
+// median lifted variant capacity enough to turn a scale-up into a scale-down —
+// reintroducing the shed-to-one this estimator exists to prevent, by a new route.
 //
-// Returns false when no signal is usable, in which case the caller falls through
-// to the existing occupancy-based chain.
+// Declining above saturation loses nothing: detecting saturation the occupancy path
+// misses is the whole purpose, and when a replica genuinely has headroom the
+// occupancy path's ceiling is the better answer. Everything this function returns
+// is therefore a measured ceiling, which is what makes it safe to persist.
+//
+// Returns false when no signal is usable or the replica has headroom, in which case
+// the caller falls through to the existing occupancy-based chain.
 func (a *SaturationAnalyzer) rateAnchoredK2(
 	rm domain.ReplicaMetrics,
 	modelID string,
@@ -310,9 +319,9 @@ func (a *SaturationAnalyzer) rateAnchoredK2(
 	k1 int64,
 	queueThreshold float64,
 	now time.Time,
-) (int64, k2Source, bool, bool) {
+) (int64, k2Source, bool) {
 	if a.serviceRates == nil {
-		return 0, 0, false, false
+		return 0, 0, false
 	}
 
 	key := serviceRateKey(modelID, rm.AcceleratorName, role, gpuCount, rm.AvgInputTokens, rm.AvgOutputTokens)
@@ -340,20 +349,19 @@ func (a *SaturationAnalyzer) rateAnchoredK2(
 	// with no queue, utilization reduces to lambda/mu, which is the whole intent.
 	occupancy := float64(rm.TokensInUse)
 	if occupancy <= 0 {
-		return 0, 0, false, false
+		return 0, 0, false
 	}
 
 	ratio, src, ok := a.saturationRatio(rm, key, lambda, backlogged, now)
 	if !ok {
-		return 0, 0, false, false
+		return 0, 0, false
 	}
-	// At or past saturation the replica demonstrated this capacity; below it, the
-	// value is headroom-scaled and must not be persisted as a ceiling.
-	ceiling := ratio <= 1.0
+	// Headroom is not a capacity: stay silent and let the occupancy path answer.
+	if ratio > 1.0 {
+		return 0, 0, false
+	}
 	if ratio < MinRateRatio {
 		ratio = MinRateRatio
-	} else if ratio > MaxRateRatio {
-		ratio = MaxRateRatio
 	}
 
 	k2 := occupancy * ratio
@@ -370,9 +378,9 @@ func (a *SaturationAnalyzer) rateAnchoredK2(
 		k2 = floor
 	}
 	if k2 <= 0 || math.IsNaN(k2) || math.IsInf(k2, 0) {
-		return 0, 0, false, false
+		return 0, 0, false
 	}
-	return int64(k2), src, ceiling, true
+	return int64(k2), src, true
 }
 
 // saturationRatio returns mu/lambda — how much service headroom the replica has —

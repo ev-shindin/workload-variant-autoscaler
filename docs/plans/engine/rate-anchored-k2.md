@@ -165,22 +165,32 @@ Only an idle, never-calibrated replica with no EPP declines, and there is nothin
 at risk in that state. Each source has its own `k2Source` label (`RATE-λ`,
 `RATE-q`, `RATE-c`) so the active path is visible per replica.
 
+## The estimator answers only at or past saturation
+
+Below saturation, `occupancy × μ/λ` is occupancy scaled by *headroom* — a statement
+about slack, not a capacity. It must not be returned, for two reasons:
+
+- **It is not a ceiling**, so it has no business in the capacity store.
+- **`aggregateByVariant` takes the MEDIAN of per-replica capacities.** An idle
+  replica's headroom-scaled number would sit under that median next to a backlogged
+  sibling's genuine ceiling as though the two were commensurable. With one replica
+  queueing twelve deep and one idle sibling, the median rose far enough to turn a
+  scale-up into a scale-down — reintroducing shed-to-one by a new route.
+
+So the estimator declines when `μ/λ > 1`. Nothing is lost: detecting saturation the
+occupancy path misses is the entire purpose, and where a replica genuinely has
+headroom the occupancy path's ceiling is the better answer. Because everything
+returned is now a measured ceiling, the capacity store can learn it unconditionally
+and no separate stored value is needed.
+
 ## What the capacity store learns
 
 `capacityStore` feeds zero-replica estimation, cross-variant `FindCompatible`
 lookups and the fallback path — all of which need a **ceiling**, what a replica can
-do. The rate-anchored value is operating-point-relative, so it is persisted only
-when it is ceiling-like:
-
-- **λ ≥ μ** — the replica is at or past saturation, so `occupancy × μ/λ` is what it
-  actually held. Persisted.
-- **λ < μ** — the same expression is occupancy scaled by headroom. Correct for this
-  cycle's utilization, not a property of the variant. The store keeps the
-  occupancy-based estimate instead; persisting the headroom-scaled value would
-  under-state capacity for a variant that later scales from zero.
-
-`computeReplicaCapacity` therefore tracks `effectiveCapacity` (what this cycle
-scales on) separately from `storedCapacity` (what the store learns).
+do. Since the estimator only answers at or past saturation, every value it produces
+is what the replica actually held under load, so the store learns it directly.
+`MinRateRatio` floors the ratio; there is no upper clamp, because a ratio above 1
+means headroom and the estimator declines instead.
 
 ## Guards
 
