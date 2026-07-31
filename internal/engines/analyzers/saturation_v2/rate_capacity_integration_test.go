@@ -1,6 +1,8 @@
 package saturation_v2
 
 import (
+	"time"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
@@ -19,6 +21,8 @@ var _ = Describe("Rate-anchored k2 through computeReplicaCapacity", func() {
 		modelID    = "m"
 		variant    = "v1"
 	)
+
+	start := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
 
 	scalingConfig := func() *config.SaturationScalingConfig {
 		return &config.SaturationScalingConfig{
@@ -95,39 +99,66 @@ var _ = Describe("Rate-anchored k2 through computeReplicaCapacity", func() {
 	It("holds capacity after a drain where the occupancy estimator releases it", func() {
 		cfg := scalingConfig()
 
+		// The peak that validation round 1 actually measured: a replica queueing with
+		// KV near full. Its occupancy is ABOVE k1, so the learned ceiling is discarded
+		// by min(k1, k2) and cannot help — only the operating point can. Little's law
+		// ties the numbers together: mu=8 req/s x W=34 s x 1250 tokens = 340k.
 		peak := atLimit()
 		peak.KvCacheUsage = 0.85
 		peak.TokensInUse = int64(0.85 * float64(kvCapacity)) // 340k, above k1
+		peak.AvgTTFT = 4.0
+		peak.AvgITL = 0.12 // W = 4 + 250 x 0.12 = 34 s
 
-		off := NewSaturationAnalyzer(NewCapacityKnowledgeStore())
-		on := NewSaturationAnalyzer(NewCapacityKnowledgeStore(), withRateAnchoredK2(true))
+		clock := start
+		tick := func() time.Time {
+			clock = clock.Add(15 * time.Second)
+			return clock
+		}
+		off := NewSaturationAnalyzer(NewCapacityKnowledgeStore(), withClock(tick))
+		on := NewSaturationAnalyzer(NewCapacityKnowledgeStore(), withRateAnchoredK2(true), withClock(tick))
 		for i := 0; i < MinServiceRateSamples+1; i++ {
+			on.serviceRates.FreezeWork(clock)
 			_ = off.computeReplicaCapacity(peak, cfg, modelID, namespace, 1, domain.RoleBoth)
 			_ = on.computeReplicaCapacity(peak, cfg, modelID, namespace, 1, domain.RoleBoth)
 		}
 
-		// Queue drained, occupancy collapsed — but arrivals are unchanged, still at
-		// the measured service rate. Nothing about the load has improved.
+		// Queue drained and contention with it: residence falls to 6 s, so occupancy
+		// falls in step (8 x 6 x 1250 = 60k). Arrivals are unchanged — nothing about
+		// the load has improved, only the crowding.
 		drained := peak
 		drained.QueueLength = 0
-		drained.KvCacheUsage = 0.16
-		drained.TokensInUse = int64(0.16 * float64(kvCapacity)) // 64k
+		drained.KvCacheUsage = 0.15
+		drained.TokensInUse = 60_000
 		drained.ArrivalRate = 8.0
+		drained.AvgTTFT = 1.0
+		drained.AvgITL = 0.02 // W = 6 s
 
-		occupancyBased := off.computeReplicaCapacity(drained, cfg, modelID, namespace, 1, domain.RoleBoth)
-		rateBased := on.computeReplicaCapacity(drained, cfg, modelID, namespace, 1, domain.RoleBoth)
+		var occupancyBased, rateBased *ReplicaCapacity
+		for i := 0; i < 2; i++ { // the operating point reaches replicas one cycle later
+			on.serviceRates.FreezeWork(clock)
+			occupancyBased = off.computeReplicaCapacity(drained, cfg, modelID, namespace, 1, domain.RoleBoth)
+			rateBased = on.computeReplicaCapacity(drained, cfg, modelID, namespace, 1, domain.RoleBoth)
+		}
 
 		// The occupancy path answers from its inflated history and reports abundant
-		// spare capacity: demand 64k against a capacity of k1. That is the shed.
+		// spare capacity: demand 60k against a capacity of k1. That is the shed.
 		Expect(occupancyBased.EffectiveCapacity).To(BeNumerically(">", drained.TokensInUse*3),
 			"documents the behaviour being replaced")
 		Expect(occupancyBased.IsSaturated).To(BeFalse())
 
-		// The rate path still holds the limit it measured, so utilization stays high
-		// and nothing is shed.
+		// The rate path scales its capacity to the operating point, so utilization is
+		// where it was under load and nothing is shed.
 		Expect(rateBased.EffectiveCapacity).To(BeNumerically("<=", drained.TokensInUse),
-			"capacity tracks the measured limit, not a stale peak")
+			"capacity follows the operating point, not a stale peak")
 		Expect(rateBased.IsSaturated).To(BeTrue())
+		Expect(rateBased.K2Priority).To(Equal(k2SrcRateResidence))
+
+		// What the store kept is the load-independent measurement, not the scaled
+		// value this cycle decided on: the store feeds variants with no live replicas
+		// and cross-variant estimation, where "what it is doing now" is meaningless.
+		rec := on.capacityStore.Get(namespace, modelID, variant)
+		Expect(rec).NotTo(BeNil())
+		Expect(rec.EffectiveCapacity).To(BeNumerically(">", rateBased.EffectiveCapacity))
 	})
 
 	It("gives a backlogged replica and an idle sibling the same capacity", func() {
@@ -141,7 +172,7 @@ var _ = Describe("Rate-anchored k2 through computeReplicaCapacity", func() {
 		hotRC := a.computeReplicaCapacity(hot, cfg, modelID, namespace, 1, domain.RoleBoth)
 
 		cold := atLimit()
-		cold.PodName = "pod-b"
+		cold.PodName = siblingPod
 		cold.QueueLength = 0
 		cold.ArrivalRate = 2.0
 		coldRC := a.computeReplicaCapacity(cold, cfg, modelID, namespace, 1, domain.RoleBoth)
