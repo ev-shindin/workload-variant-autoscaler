@@ -102,10 +102,23 @@ throughput analyzer is enabled, which this plan removes as a dependency.
 | queue | `max_over_time(vllm:num_requests_waiting[1m])` | `QueueLength` | unconditional |
 | KV capacity | `vllm:cache_config_info` | `TotalKvCapacityTokens` | unconditional |
 
-No new PromQL. `QueryRequestRate` moves to a shared registrar called unconditionally
-by the saturation engine (`QueryKvUsageInstant` moves with it, since the throughput
-analyzer needs it and the registrar is shared); the throughput analyzer registers
-them only if absent, so either order works and neither panics.
+One new query, and it is not optional: `QueryQueueLengthInstant`, the waiting-request
+count without `max_over_time`. `QueryQueueLength` is the same counter as a one-minute
+peak, which the demand path wants and a capacity gate cannot use — the peak latches for
+a minute after a queue drains, long enough to record a replica that is now keeping up
+as though it were at its limit. The gate and the measurement have to be read at the
+same instant, so both instantaneous readings are collected.
+
+`QueryRequestRate` moves to a shared registrar called unconditionally by the saturation
+engine (`QueryKvUsageInstant` moves with it, since the throughput analyzer needs it and
+the registrar is shared); the throughput analyzer registers them only if absent, so
+either order works and neither panics.
+
+This is the one part of the change that is not behind the flag: with the estimator off,
+the controller still issues the extra per-pod query each cycle and populates two fields
+nothing reads. The cost is one range query per model per interval, and the alternative —
+registering it from inside a flagged path — would mean the flag could not be flipped
+without a collector restart.
 
 SGLang equivalents (`sglang:generation_tokens_histogram_count`, `sglang:token_usage`)
 are already defined and move with them.

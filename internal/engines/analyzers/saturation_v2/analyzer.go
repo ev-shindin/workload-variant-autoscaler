@@ -139,8 +139,12 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input domain.AnalyzerI
 	}
 
 	// The request shape that keys a workload bucket is a property of the variant, not
-	// of whichever replica happens to be reporting — see variantShape.
-	shapes := variantShapes(input.ReplicaMetrics)
+	// of whichever replica happens to be reporting — see variantShape. Only the
+	// rate-anchored estimator consumes it, so with that off this costs nothing.
+	var shapes map[string]variantShape
+	if a.serviceRates != nil {
+		shapes = variantShapes(input.ReplicaMetrics)
+	}
 
 	// Phase 1: Per-replica capacity computation
 	replicaCapacities := make([]ReplicaCapacity, 0, len(input.ReplicaMetrics))

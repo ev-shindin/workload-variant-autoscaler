@@ -730,10 +730,18 @@ func (a *SaturationAnalyzer) rateAnchoredK2(
 	// made. Capacity is held at the current occupancy, which reads as fully utilized
 	// without claiming the replica is over its limit.
 	//
+	// The figure used here is the one demand is built from, not the instantaneous
+	// sample the ceiling is measured with. Demand is TokensInUse, a one-minute peak;
+	// holding capacity at a lower instantaneous reading would make utilization the
+	// ratio between the two, which on bursty traffic is several times one and would
+	// ask for several times the replicas. Matching it lands utilization at exactly
+	// one: saturated, scale up by the threshold's margin, nothing more.
+	//
 	// One direction only, and floored by clampCeiling, so a mis-scraped arrival rate
 	// cannot drive capacity toward zero.
-	if atLimit && !backlogged && occupancy > 0 && occupancy < float64(capacity) {
-		capacity = clampCeiling(occupancy, k1)
+	if demandSide := float64(rm.TokensInUse); atLimit && !backlogged &&
+		demandSide > 0 && demandSide < float64(capacity) {
+		capacity = clampCeiling(demandSide, k1)
 	}
 	return capacity, reference, src, true
 }
