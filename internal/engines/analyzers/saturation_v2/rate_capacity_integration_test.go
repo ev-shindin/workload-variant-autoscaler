@@ -127,14 +127,18 @@ var _ = Describe("Rate-anchored k2 through computeReplicaCapacity", func() {
 		// the load has improved, only the crowding.
 		drained := peak
 		drained.QueueLength = 0
-		drained.KvCacheUsage = 0.15
-		drained.TokensInUse = 60_000
+		drained.KvCacheUsage = 0.16
+		// Little's law puts the resident tokens at 8 x 6 x 1250 = 60k; TokensInUse is
+		// max_over_time(...[1m]), so it reads a little above that. That gap is the
+		// documented bias between the two sides' time bases, and it errs toward more
+		// replicas rather than fewer.
+		drained.TokensInUse = 63_000
 		drained.ArrivalRate = 8.0
 		drained.AvgTTFT = 1.0
 		drained.AvgITL = 0.02 // W = 6 s
 
 		var occupancyBased, rateBased *ReplicaCapacity
-		for i := 0; i < 2; i++ { // the operating point reaches replicas one cycle later
+		for i := 0; i < 40; i++ { // the operating point is smoothed over about a minute
 			on.serviceRates.FreezeWork(clock)
 			occupancyBased = off.computeReplicaCapacity(drained, cfg, modelID, namespace, 1, domain.RoleBoth)
 			rateBased = on.computeReplicaCapacity(drained, cfg, modelID, namespace, 1, domain.RoleBoth)

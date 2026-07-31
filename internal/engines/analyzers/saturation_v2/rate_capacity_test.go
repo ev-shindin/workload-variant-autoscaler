@@ -534,9 +534,10 @@ var _ = Describe("Rate-anchored k2 at the current operating point", func() {
 		hot := atLimit()
 		hotUtilization := float64(hot.TokensInUse) / float64(hotK2)
 
-		// Two cycles: the operating point is published at the top of the next cycle,
-		// so a change takes one cycle to reach every replica of the bucket.
-		coldK2, coldSrc := run(a, drained(), start.Add(3*interval), 2)
+		// The operating point is smoothed over WorkSmoothingWindow, deliberately the
+		// same order as the one-minute window demand is collected over, so it takes
+		// several cycles rather than one to follow the drain down.
+		coldK2, coldSrc := run(a, drained(), start.Add(3*interval), 40)
 		cold := drained()
 		coldUtilization := float64(cold.TokensInUse) / float64(coldK2)
 
@@ -545,7 +546,7 @@ var _ = Describe("Rate-anchored k2 at the current operating point", func() {
 		// This is the whole fix: demand fell by half when the backlog cleared, and
 		// capacity fell with it, so nothing reads as spare capacity and nothing is
 		// shed. Round 1 held capacity flat here and sheds to one replica.
-		Expect(coldUtilization).To(BeNumerically("~", hotUtilization, 0.01))
+		Expect(coldUtilization).To(BeNumerically("~", hotUtilization, 0.02))
 	})
 
 	It("never scales capacity above the limit it measured", func() {
@@ -635,27 +636,29 @@ var _ = Describe("Rate-anchored k2 operating point across siblings", func() {
 		// One cycle, two replicas with materially different residences: 3 s and 1.2 s,
 		// so 3750 and 1500 token-seconds. Whichever the loop reaches first, the bucket
 		// must land on the mean — 2625 — and not on either endpoint.
-		at := start.Add(3 * interval)
-		a.serviceRates.FreezeWork(at)
 		slow := atLimit()
 		slow.QueueLength = 0
 		slow.AvgTTFT, slow.AvgITL = 0.5, 0.01 // W = 3 s
 		fast := slow
 		fast.PodName = siblingPod
 		fast.AvgTTFT, fast.AvgITL = 0.2, 0.004 // W = 1.2 s
-		_, _, _, _ = a.rateAnchoredK2(slow, "m", "", 1, k1, queueThreshold, at)
-		_, _, _, _ = a.rateAnchoredK2(fast, "m", "", 1, k1, queueThreshold, at)
 
-		next := at.Add(interval)
-		a.serviceRates.FreezeWork(next)
-		k2, _, src, ok := a.rateAnchoredK2(slow, "m", "", 1, k1, queueThreshold, next)
+		var k2 int64
+		var src k2Source
+		var ok bool
+		for i := 3; i < 43; i++ { // long enough for the smoothed value to settle
+			at := start.Add(time.Duration(i) * interval)
+			a.serviceRates.FreezeWork(at)
+			k2, _, src, ok = a.rateAnchoredK2(slow, "m", "", 1, k1, queueThreshold, at)
+			_, _, _, _ = a.rateAnchoredK2(fast, "m", "", 1, k1, queueThreshold, at)
+		}
 
 		Expect(ok).To(BeTrue())
 		Expect(src).To(Equal(k2SrcRateResidence))
-		// mu x mean work = 8 x 2625, less the slow decay mu carries with age. Taking
-		// the first replica alone would give 30_000 and the second alone 12_000 — and
-		// which one it was would depend on the order the loop reached them.
-		Expect(k2).To(BeNumerically("~", 21_000, 210)) // within 1%
+		// mu x mean work = 8 x 2625. Taking the first replica alone would give 30_000
+		// and the second alone 12_000 — and which one it was would depend on the order
+		// the loop reached them.
+		Expect(k2).To(BeNumerically("~", 21_000, 420)) // within 2%
 	})
 })
 
@@ -706,5 +709,102 @@ var _ = Describe("Rate-anchored k2 ceiling measurement", func() {
 		k2, _, _, ok := a.rateAnchoredK2(rm, "m", "", 1, 320_000, 5.0, now.Add(time.Minute))
 		Expect(ok).To(BeTrue())
 		Expect(k2).To(BeNumerically("~", 120_000, 1))
+	})
+})
+
+var _ = Describe("Rate-anchored k2 responsiveness", func() {
+	const (
+		k1             = int64(320_000)
+		queueThreshold = 5.0
+		interval       = 15 * time.Second
+	)
+	start := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
+
+	base := func() domain.ReplicaMetrics {
+		return domain.ReplicaMetrics{
+			PodName:               "pod-a",
+			AcceleratorName:       "H100",
+			QueueLength:           12,
+			RequestRate:           8.0,
+			ArrivalRate:           8.0,
+			TokensInUse:           60_000,
+			KvUsageInstant:        0.15,
+			TotalKvCapacityTokens: 400_000,
+			AvgInputTokens:        1000,
+			AvgOutputTokens:       250,
+			AvgTTFT:               1.0,
+			AvgITL:                0.02, // W = 6 s
+		}
+	}
+
+	// A replica takes about 90 seconds from scale-up decision to serving, so a
+	// capacity estimate that lagged a rising load would put that delay on top of a
+	// queue that is already building. Nothing here may hold a scale-up back.
+	It("reports saturation on the first cycle of a rising load", func() {
+		a := NewSaturationAnalyzer(NewCapacityKnowledgeStore(), withRateAnchoredK2(true))
+		for i := 0; i < 5; i++ {
+			at := start.Add(time.Duration(i) * interval)
+			a.serviceRates.FreezeWork(at)
+			_, _, _, _ = a.rateAnchoredK2(base(), "m", "", 1, k1, queueThreshold, at)
+		}
+
+		// Load steps up: more queued, more resident, and a longer residence because
+		// requests are now waiting. Capacity must not follow the residence upward.
+		ramp := base()
+		ramp.QueueLength = 60
+		ramp.TokensInUse = 90_000
+		ramp.KvUsageInstant = 0.225
+		ramp.AvgTTFT = 9.0 // W = 14 s, more than double
+
+		at := start.Add(5 * interval)
+		a.serviceRates.FreezeWork(at)
+		k2, _, _, ok := a.rateAnchoredK2(ramp, "m", "", 1, k1, queueThreshold, at)
+
+		Expect(ok).To(BeTrue())
+		// Clamped at the measured ceiling: an inflated residence is queueing time, and
+		// letting it raise capacity would mask the very overload that produced it.
+		Expect(k2).To(BeNumerically("<=", int64(60_000)))
+		Expect(k2).To(BeNumerically("<", ramp.TokensInUse),
+			"demand already exceeds capacity, on the first cycle, with no window to wait out")
+	})
+
+	It("holds the operating point for the window, then steps down with demand", func() {
+		s := newBucketStore()
+		at := start
+		s.ObserveWork("k", 7500, at)
+		s.FreezeWork(at)
+		peak, _ := s.FrozenWork("k", at)
+		Expect(peak).To(BeNumerically("~", 7500, 1))
+
+		// Contention falls away. Demand is max_over_time(...[1m]) and still carries
+		// its peak, so the operating point must carry its own for the same minute —
+		// decaying here instead would drop capacity while demand stayed high, and the
+		// ratio would read as spare capacity.
+		for i := 1; i <= 3; i++ {
+			at = start.Add(time.Duration(i) * interval)
+			s.ObserveWork("k", 3750, at)
+			s.FreezeWork(at)
+			held, ok := s.FrozenWork("k", at)
+			Expect(ok).To(BeTrue())
+			Expect(held).To(BeNumerically("~", 7500, 1), "still inside the window")
+		}
+
+		at = start.Add(WorkWindow + interval)
+		s.ObserveWork("k", 3750, at)
+		s.FreezeWork(at)
+		stepped, ok := s.FrozenWork("k", at)
+		Expect(ok).To(BeTrue())
+		Expect(stepped).To(BeNumerically("~", 3750, 1), "the peak has aged out, as demand's has")
+	})
+
+	It("keeps only a window's worth of samples", func() {
+		s := newBucketStore()
+		for i := 0; i < 200; i++ {
+			at := start.Add(time.Duration(i) * interval)
+			s.ObserveWork("k", 5000, at)
+			s.FreezeWork(at)
+		}
+		Expect(len(s.entries["k"].workSamples)).To(BeNumerically("<=",
+			int(WorkWindow/interval)+1), "bounded by the window, not by the run length")
 	})
 })

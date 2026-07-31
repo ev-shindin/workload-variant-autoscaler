@@ -70,6 +70,20 @@ const (
 	// Five minutes is responsive within a load stage without chasing a single scrape.
 	ServiceRateSmoothingWindow = 5 * time.Minute
 
+	// WorkWindow is the window the bucket's operating point is held over, and it
+	// mirrors the demand side exactly: TokensInUse and QueueLength are collected as
+	// max_over_time(...[1m]), so the operating point is the MAXIMUM of what replicas
+	// reported over the same minute.
+	//
+	// Matching the operator, not just the timescale, is what keeps the ratio stable
+	// through a transient. An average would decay smoothly while demand held its peak
+	// and then stepped down, so at the moment demand's window rolled off, capacity
+	// would still be high and the fleet would shed — the exact failure this estimator
+	// exists to prevent. Reacting within a single cycle instead would drop capacity
+	// while demand still carried the peak, spiking utilization into a scale-up right
+	// after the fleet caught up. Both sides rise and fall together.
+	WorkWindow = time.Minute
+
 	// CeilingRelaxPerWindow is the factor the learned token ceiling relaxes by over
 	// one ServiceRateWindow with no fresh observation. The ceiling is a running
 	// minimum, so it relaxes *upward*: a single pessimistic measurement — taken
@@ -128,13 +142,18 @@ type bucketEntry struct {
 	ceiling      float64 // running min of resident tokens at the limit
 	ceilingSeen  time.Time
 	ceilingKnown bool
-	work         float64 // EWMA of residence x tokens-per-request, in token-seconds
 	workSeen     time.Time
-	workKnown    bool
-	workFrozen   float64 // the value every replica of the bucket reads this cycle
-	workSum      float64 // this cycle's samples, averaged at the next freeze
-	workTauSum   float64 // and their time constants, averaged with them
+	workSamples  []workSample // one per cycle, held for WorkWindow
+	workFrozen   float64      // the value every replica of the bucket reads this cycle
+	workSum      float64      // this cycle's samples, averaged at the next freeze
 	workCount    int
+}
+
+// workSample is one cycle's operating point: residence x tokens-per-request,
+// averaged across the replicas that reported it.
+type workSample struct {
+	at    time.Time
+	value float64
 }
 
 func newBucketStore() *bucketStore {
@@ -273,8 +292,7 @@ func (s *bucketStore) Ceiling(key string, now time.Time) (float64, bool) {
 
 // ObserveWork records this replica's work-per-request — residence time multiplied
 // by tokens per request, in token-seconds — as one sample of the bucket's operating
-// point. tau is the averaging time constant; the quantity changes on the residence
-// timescale, so that is what it is smoothed over at the next freeze.
+// point, to be averaged and folded in at the next freeze.
 //
 // Samples accumulate rather than folding in one at a time, because every replica of
 // a bucket reports in the same cycle at the same timestamp. Folding each in turn
@@ -284,8 +302,8 @@ func (s *bucketStore) Ceiling(key string, now time.Time) (float64, bool) {
 // then pull the whole bucket's capacity down and drive a spurious scale-up.
 //
 // The value is deliberately not read back here: see FrozenWork.
-func (s *bucketStore) ObserveWork(key string, work, tau float64, now time.Time) {
-	if work <= 0 || tau <= 0 {
+func (s *bucketStore) ObserveWork(key string, work float64, now time.Time) {
+	if work <= 0 {
 		return
 	}
 	s.mu.Lock()
@@ -293,7 +311,6 @@ func (s *bucketStore) ObserveWork(key string, work, tau float64, now time.Time) 
 
 	e := s.entry(key, now)
 	e.workSum += work
-	e.workTauSum += tau
 	e.workCount++
 }
 
@@ -313,9 +330,9 @@ func (s *bucketStore) FrozenWork(key string, now time.Time) (float64, bool) {
 	return e.workFrozen, true
 }
 
-// FreezeWork averages the samples each bucket collected last cycle, folds that mean
-// into the bucket's EWMA, and publishes it as the value this cycle's replicas will
-// read. It must be called once at the top of a cycle.
+// FreezeWork averages the samples each bucket collected last cycle, drops anything
+// older than WorkWindow, and publishes the maximum of what remains as the value this
+// cycle's replicas will read. It must be called once at the top of a cycle.
 //
 // Publishing at the cycle boundary is what makes the number identical across
 // siblings: aggregateByVariant takes the MEDIAN of per-replica capacities, so a
@@ -328,18 +345,24 @@ func (s *bucketStore) FreezeWork(now time.Time) {
 
 	for _, e := range s.entries {
 		if e.workCount > 0 {
-			n := float64(e.workCount)
-			sample, tau := e.workSum/n, e.workTauSum/n
-			e.workSum, e.workTauSum, e.workCount = 0, 0, 0
-			if e.workKnown {
-				e.work = ewmaStep(e.work, sample, now.Sub(e.workSeen).Seconds(), tau)
-			} else {
-				e.work, e.workKnown = sample, true
-			}
+			e.workSamples = append(e.workSamples, workSample{at: now, value: e.workSum / float64(e.workCount)})
+			e.workSum, e.workCount = 0, 0
 			e.workSeen = now
 		}
-		if e.workKnown {
-			e.workFrozen = e.work
+		kept := e.workSamples[:0]
+		peak := 0.0
+		for _, w := range e.workSamples {
+			if now.Sub(w.at) > WorkWindow {
+				continue
+			}
+			kept = append(kept, w)
+			if w.value > peak {
+				peak = w.value
+			}
+		}
+		e.workSamples = kept
+		if peak > 0 {
+			e.workFrozen = peak
 		}
 	}
 }
@@ -537,9 +560,7 @@ func (a *SaturationAnalyzer) rateAnchoredK2(
 	// It is the operating point, not a measurement of the limit, so it is recorded
 	// unconditionally — the whole point is to know how far below the limit we sit.
 	if residence := residenceSeconds(rm); residence > 0 {
-		if work := residence * tokensPerRequest(rm); work > 0 {
-			a.serviceRates.ObserveWork(key, work, residence, now)
-		}
+		a.serviceRates.ObserveWork(key, residence*tokensPerRequest(rm), now)
 	}
 
 	ceiling, ok := a.serviceRates.Ceiling(key, now)
