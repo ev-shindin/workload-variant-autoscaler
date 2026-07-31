@@ -163,7 +163,8 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input domain.AnalyzerI
 	}
 
 	// Phase 2: Per-variant aggregation
-	variantCapacities := a.aggregateByVariant(replicaCapacities, input.ReplicaMetrics, input.VariantStates, input.ModelID, input.Namespace, satConfig.KvCacheThreshold)
+	variantCapacities := a.aggregateByVariant(replicaCapacities, input.ReplicaMetrics, input.VariantStates, input.ModelID, input.Namespace, satConfig.KvCacheThreshold,
+		satConfig.ScaleDownBoundary)
 
 	// Phase 3: Model-level aggregation via shared helpers (enforces linearity invariant).
 	totalSupply := aggregation.SumTotalSupply(variantCapacities)
@@ -260,8 +261,12 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 	// every replica of the variant and stable across cycles — see rateAnchoredK2 for
 	// why anything per-replica or per-cycle was unusable downstream.
 	var rateReference int64
+	// One timestamp for the whole replica: everything computed here belongs to the
+	// same cycle, and reading the clock twice would place the two halves in different
+	// ones.
+	now := a.now()
 	if rateK2, ref, rateSrc, ok := a.rateAnchoredK2(rm, modelID, role, gpuCount, shape, k1,
-		config.QueueLengthThreshold, a.now()); ok {
+		config.QueueLengthThreshold, now); ok {
 		k2, rateReference, k2Priority = rateK2, ref, rateSrc
 	}
 
@@ -302,6 +307,7 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 	})
 
 	return &ReplicaCapacity{
+		ServiceRate:           a.serviceRate(modelID, role, gpuCount, rm.AcceleratorName, shape, now),
 		PodName:               rm.PodName,
 		VariantName:           rm.VariantName,
 		AcceleratorName:       rm.AcceleratorName,
@@ -437,6 +443,7 @@ func (a *SaturationAnalyzer) aggregateByVariant(
 	variantStates []domain.VariantReplicaState,
 	modelID, namespace string,
 	kvCacheThreshold float64,
+	scaleDownBoundary float64,
 ) []domain.VariantCapacity {
 	// Group replicas by variant
 	byVariant := make(map[string][]ReplicaCapacity)
@@ -482,6 +489,7 @@ func (a *SaturationAnalyzer) aggregateByVariant(
 		pendingCount := vs.PendingReplicas
 
 		var capacityLabel string
+		var serviceRatePerReplica float64
 		if len(replicas) > 0 {
 			// len(replicas) counts vLLM engine instances (DP ranks), not pods: a DP=8
 			// pod hosts 8 independently-capacitied instances. Using the pod count would
@@ -513,6 +521,8 @@ func (a *SaturationAnalyzer) aggregateByVariant(
 				accelerator = replicas[0].AcceleratorName
 			}
 			capacityLabel = k2SourceLabel(replicas)
+			// Every replica of the bucket reports the same figure; take the first.
+			serviceRatePerReplica = replicas[0].ServiceRate
 		} else if rec := a.capacityStore.Get(namespace, modelID, vs.VariantName); rec != nil && rec.EffectiveCapacity > 0 {
 			// No ready replicas — use stored capacity, enhanced with k2 derivation
 			// for deployment-derived records when workload data is available.
@@ -526,6 +536,29 @@ func (a *SaturationAnalyzer) aggregateByVariant(
 			capacityLabel = satReasonNoData
 		}
 
+		// The rate-space pair the optimizer needs to evaluate a scale-down. Arrivals
+		// are summed over the variant's own replicas: they are what this variant is
+		// actually being asked to serve. Without EPP the dispatch rate is absent and
+		// completions stand in — a substitution that is only wrong under backlog,
+		// which is not a state anything is considering a scale-down in.
+		var arrivals float64
+		for _, rm := range inputMetrics {
+			if rm.VariantName != vs.VariantName {
+				continue
+			}
+			if rm.ArrivalRate > 0 {
+				arrivals += rm.ArrivalRate
+			} else {
+				arrivals += rm.RequestRate
+			}
+		}
+		var requiredServiceRate float64
+		if serviceRatePerReplica > 0 && arrivals > 0 && scaleDownBoundary > 0 {
+			requiredServiceRate = arrivals / scaleDownBoundary
+		} else {
+			serviceRatePerReplica = 0
+		}
+
 		totalCapacity := float64(replicaCount) * perReplicaCapacity
 
 		var utilization float64
@@ -534,6 +567,9 @@ func (a *SaturationAnalyzer) aggregateByVariant(
 		}
 
 		result = append(result, domain.VariantCapacity{
+			ServiceRatePerReplica: serviceRatePerReplica,
+			RequiredServiceRate:   requiredServiceRate,
+
 			VariantName:        vs.VariantName,
 			AcceleratorName:    accelerator,
 			Cost:               cost,

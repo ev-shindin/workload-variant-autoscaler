@@ -675,8 +675,9 @@ func (a *SaturationAnalyzer) rateAnchoredK2(
 
 	// Detector and measurement, read at the same instant — see limitEvidence.
 	backlogged, occupancy := limitEvidence(rm, queueThreshold)
-	if backlogged && rm.RequestRate > 0 {
-		a.serviceRates.ObserveRate(key, rm.RequestRate, now)
+	completions := completionRate(rm, role)
+	if backlogged && completions > 0 {
+		a.serviceRates.ObserveRate(key, completions, now)
 	}
 	atLimit := backlogged || a.arrivalsReachedServiceRate(rm, key, now)
 
@@ -808,6 +809,37 @@ func limitEvidence(rm domain.ReplicaMetrics, queueThreshold float64) (bool, floa
 		}
 	}
 	return float64(rm.QueueLength) >= queueThreshold, float64(rm.TokensInUse)
+}
+
+// serviceRate returns the bucket's calibrated service rate in requests per second,
+// or 0 when it has not been established. Unlike the capacity estimate this is not
+// clamped or scaled: it is the measured throughput of a replica that could not keep
+// up, which is exactly what a scale-down counterfactual needs.
+func (a *SaturationAnalyzer) serviceRate(modelID, role string, gpuCount int, accelerator string,
+	shape variantShape, now time.Time) float64 {
+	if a.serviceRates == nil {
+		return 0
+	}
+	rate, ok := a.serviceRates.Rate(serviceRateKey(modelID, accelerator, role, gpuCount, shape), now)
+	if !ok {
+		return 0
+	}
+	return rate
+}
+
+// completionRate is the rate at which this replica finishes the work its role is
+// responsible for: prompts processed for a prefill replica, generations completed
+// for a decode replica or an undisaggregated one.
+//
+// A prefill pod completes few or no generations, so measuring it with the
+// generation-tokens counter would either learn nothing or learn a service rate an
+// order of magnitude below the truth. Falls back to completions when the prompt rate
+// is unavailable, which is no worse than before it was collected.
+func completionRate(rm domain.ReplicaMetrics, role string) float64 {
+	if canonicalRole(role) == domain.RolePrefill && rm.PromptTokenRate > 0 {
+		return rm.PromptTokenRate
+	}
+	return rm.RequestRate
 }
 
 // tokensPerRequest is the KV footprint of one request of this bucket's shape.

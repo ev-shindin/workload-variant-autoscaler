@@ -152,4 +152,19 @@ type VariantCapacity struct {
 
 	// Utilization is TotalDemand / TotalCapacity (0.0-1.0).
 	Utilization float64
+
+	// ServiceRatePerReplica is the measured requests per second one replica of this
+	// variant sustains at its limit, and RequiredServiceRate is what this variant's
+	// share of arrivals demands at the scale-down boundary. Both are zero when the
+	// service rate has not been calibrated, which is the signal to ignore them.
+	//
+	// They exist because a scale-down decision is a counterfactual — "would N-1
+	// replicas still cope?" — and the token-space figures cannot answer it. Demand in
+	// resident tokens is measured at the current replica count and does not survive
+	// the change being evaluated: remove a replica and residence rises, occupancy per
+	// replica rises more than proportionally, and past a point a queue appears out of
+	// nothing. Arrivals are the one quantity the decision does not move, so the same
+	// question in rate space has an answer that holds.
+	ServiceRatePerReplica float64
+	RequiredServiceRate   float64
 }

@@ -58,6 +58,10 @@ const (
 	// count's peak over the last minute.
 	QueryQueueLengthInstant = "queue_length_instant"
 
+	// QueryPromptTokenRate is the query name for per-pod prompt-processing rate, the
+	// service rate of a prefill replica.
+	QueryPromptTokenRate = "prompt_token_rate"
+
 	// QueryRequestRate is the query name for the engine-side request completion
 	// rate per pod (req/s), derived from the generation tokens histogram count.
 	// It is engine-agnostic: the vLLM variant reads

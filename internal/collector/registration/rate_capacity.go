@@ -31,9 +31,11 @@ func RegisterRateCapacityQueries(sourceRegistry *source.SourceRegistry) {
 	registerIfAbsent(registry, kvUsageInstantQuery())
 	registerIfAbsent(registry, queueLengthInstantQuery())
 	registerIfAbsent(registry, requestRateQuery())
+	registerIfAbsent(registry, promptTokenRateQuery())
 	registerForEngineIfAbsent(registry, inferenceengine.EngineSGLang, sglangKvUsageInstantQuery())
 	registerForEngineIfAbsent(registry, inferenceengine.EngineSGLang, sglangQueueLengthInstantQuery())
 	registerForEngineIfAbsent(registry, inferenceengine.EngineSGLang, sglangRequestRateQuery())
+	registerForEngineIfAbsent(registry, inferenceengine.EngineSGLang, sglangPromptTokenRateQuery())
 }
 
 // registerIfAbsent registers tmpl unless a query of that name already exists.
@@ -111,6 +113,34 @@ func requestRateQuery() source.QueryTemplate {
 		Template:    `sum by (instance, pod, llm_d_ai_variant) (rate(vllm:request_generation_tokens_count{namespace="{{.namespace}}",model_name="{{.modelID}}"}[1m]))`,
 		Params:      []string{source.ParamNamespace, source.ParamModelID},
 		Description: "Request completion rate per pod (req/s); service rate under backlog, fallback for λ_dec without EPP",
+	}
+}
+
+// promptTokenRateQuery is the per-pod rate of prompts processed (req/s), from the
+// prompt-tokens histogram _count, which increments once per prefilled request.
+//
+// A prefill replica in a disaggregated deployment completes few or no generations,
+// so the generation-tokens counter that measures a decode replica's service rate
+// says nothing about it. Prompts processed is the same quantity for the prefill
+// role, and the counter is already collected for average input tokens.
+func promptTokenRateQuery() source.QueryTemplate {
+	return source.QueryTemplate{
+		Name:        QueryPromptTokenRate,
+		Type:        source.QueryTypePromQL,
+		Template:    `sum by (instance, pod, llm_d_ai_variant) (rate(vllm:request_prompt_tokens_count{namespace="{{.namespace}}",model_name="{{.modelID}}"}[1m]))`,
+		Params:      []string{source.ParamNamespace, source.ParamModelID},
+		Description: "Prompts processed per pod (req/s); service rate of a prefill replica",
+	}
+}
+
+// sglangPromptTokenRateQuery is the SGLang form of promptTokenRateQuery.
+func sglangPromptTokenRateQuery() source.QueryTemplate {
+	return source.QueryTemplate{
+		Name:        QueryPromptTokenRate,
+		Type:        source.QueryTypePromQL,
+		Template:    `sum by (instance, pod, llm_d_ai_variant) (rate(sglang:prompt_tokens_histogram_count{namespace="{{.namespace}}",model_name="{{.modelID}}"}[1m]))`,
+		Params:      []string{source.ParamNamespace, source.ParamModelID},
+		Description: "Prompts processed per pod (req/s); service rate of a prefill replica (SGLang)",
 	}
 }
 

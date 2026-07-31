@@ -421,6 +421,7 @@ func (c *ReplicaMetricsCollector) collectReplicaMetrics(
 		generationTokenRate float64
 		kvUsageInstant      float64
 		queueLengthInstant  float64
+		promptTokenRate     float64
 		hasQueueInstant     bool
 		requestRate         float64
 	}
@@ -839,6 +840,21 @@ func (c *ReplicaMetricsCollector) collectReplicaMetrics(
 		}
 	}
 
+	// Process prompt-processing rate (req/s) — service rate of a prefill replica
+	if result := results[registration.QueryPromptTokenRate]; result != nil {
+		if !result.HasError() {
+			for _, value := range result.Values {
+				instanceKey, _, _ := c.buildInstanceKey(ctx, namespace, value.Labels)
+				if instanceKey == "" || podData[instanceKey] == nil {
+					continue
+				}
+				if !math.IsNaN(value.Value) && !math.IsInf(value.Value, 0) && value.Value >= 0 {
+					podData[instanceKey].promptTokenRate = value.Value
+				}
+			}
+		}
+	}
+
 	// Process engine request completion rate (req/s) — throughput analyzer fallback λ_req
 	if result := results[registration.QueryRequestRate]; result != nil {
 		if !result.HasError() {
@@ -1020,6 +1036,7 @@ func (c *ReplicaMetricsCollector) collectReplicaMetrics(
 			GenerationTokenRate:   data.generationTokenRate,
 			KvUsageInstant:        data.kvUsageInstant,
 			QueueLengthInstant:    data.queueLengthInstant,
+			PromptTokenRate:       data.promptTokenRate,
 			HasQueueLengthInstant: data.hasQueueInstant,
 			RequestRate:           data.requestRate,
 			Metadata: &domain.ReplicaMetricsMetadata{

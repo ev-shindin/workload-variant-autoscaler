@@ -329,6 +329,45 @@ as replicas drift across it. Input and output thresholds are also separate now: 
 run an order of magnitude longer than generations, and bucketing input at the output
 thresholds put almost every real workload in one bucket.
 
+### The scale-down floor
+
+Capacity estimation alone cannot make a scale-down safe, because the decision is a
+counterfactual — would `N−1` replicas still cope? — and the token-space figures cannot
+answer it. Demand in resident tokens is measured at the current replica count and does
+not survive the removal being evaluated: residence rises, occupancy per replica rises
+with it, and past a point a queue appears from nothing. Arrivals are the one quantity
+the decision does not move, so the same question asked in rate space has an answer that
+holds.
+
+The constraint is on the aggregate service rate within a role, not on replicas within a
+variant:
+
+```
+sum over v in role of (N_v x mu_v)  >=  lambda_role / scaleDownBoundary
+```
+
+Per-variant would be wrong: shedding from one variant re-routes its traffic to a
+sibling, so a variant's own arrival rate is itself a function of the decision. Only the
+role's total stream is invariant. Heterogeneous accelerators fall out naturally, since
+`mu_v` is per bucket and the bucket key already carries accelerator and GPU count.
+
+The optimizer enforces it in `scaleDownVariantSet`, which is already role-scoped, and
+only bounds *how many* replicas may go — which variant gives one up is still the cost
+ordering's decision. One consequence worth expecting: when the expensive variant's
+replicas are individually large in service-rate terms, the floor can hold them and shed
+a cheap one instead. That is correct. Capacity you need cannot be removed merely
+because it is the capacity you would rather not pay for.
+
+If any variant holding replicas in a role has no calibrated `mu`, the role's available
+side is understated while its arrivals still count, which would hold replicas that are
+not needed. Partial knowledge is therefore treated as no knowledge and the constraint is
+skipped.
+
+For P/D, both roles see the same request stream and each gets its own constraint. A
+prefill replica completes few or no generations, so its service rate comes from prompts
+processed (`vllm:request_prompt_tokens_count`, `sglang:prompt_tokens_histogram_count`)
+rather than from the generation-tokens counter.
+
 ### Residual risks
 
 - **Mixed time bases.** Demand still uses `TokensInUse`, a 1-minute peak, while capacity uses

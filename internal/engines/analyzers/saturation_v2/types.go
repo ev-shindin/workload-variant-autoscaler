@@ -50,7 +50,12 @@ type ReplicaCapacity struct {
 	ComputeBoundCapacity  int64    // k2: compute/scheduling-limited capacity
 	K2Priority            k2Source // how k2 was computed
 	EffectiveCapacity     int64    // min(k1, k2)
-	IsSaturated           bool
+	// ServiceRate is the bucket's measured requests per second per replica, or 0
+	// when nothing has been calibrated. Carried per replica only because this is
+	// where the bucket key is already in hand; every replica of a variant reports
+	// the same figure.
+	ServiceRate float64
+	IsSaturated bool
 	// ReplicaDemand is the replica's resident KV tokens — TokensInUse on the main
 	// path, kvCacheUsage * effectiveCapacity on the fallback path — plus the
 	// role-aware waiting-queue footprint: queueLength * avgInputTokens for
