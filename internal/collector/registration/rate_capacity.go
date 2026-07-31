@@ -29,8 +29,10 @@ func RegisterRateCapacityQueries(sourceRegistry *source.SourceRegistry) {
 	registry := metricsSource.QueryList()
 
 	registerIfAbsent(registry, kvUsageInstantQuery())
+	registerIfAbsent(registry, queueLengthInstantQuery())
 	registerIfAbsent(registry, requestRateQuery())
 	registerForEngineIfAbsent(registry, inferenceengine.EngineSGLang, sglangKvUsageInstantQuery())
+	registerForEngineIfAbsent(registry, inferenceengine.EngineSGLang, sglangQueueLengthInstantQuery())
 	registerForEngineIfAbsent(registry, inferenceengine.EngineSGLang, sglangRequestRateQuery())
 }
 
@@ -65,6 +67,35 @@ func kvUsageInstantQuery() source.QueryTemplate {
 		Template:    `max by (instance, pod, llm_d_ai_variant) (vllm:kv_cache_usage_perc{namespace="{{.namespace}}",model_name="{{.modelID}}"})`,
 		Params:      []string{source.ParamNamespace, source.ParamModelID},
 		Description: "Instantaneous KV cache utilization per pod (0.0–1.0); operating point for capacity estimation",
+	}
+}
+
+// queueLengthInstantQuery is the per-pod count of requests waiting right now.
+//
+// QueryQueueLength is the same counter under max_over_time(...[1m]), which the demand
+// path wants: erring high on how much work is outstanding is the safe direction. A
+// capacity estimator cannot use it, because the peak latches for a full minute after
+// a queue drains — long enough to record occupancy from a replica that is now keeping
+// up comfortably and call it the occupancy at which the replica could not keep up.
+// The gate and the measurement have to be read at the same instant.
+func queueLengthInstantQuery() source.QueryTemplate {
+	return source.QueryTemplate{
+		Name:        QueryQueueLengthInstant,
+		Type:        source.QueryTypePromQL,
+		Template:    `max by (instance, pod, llm_d_ai_variant) (vllm:num_requests_waiting{namespace="{{.namespace}}",model_name="{{.modelID}}"})`,
+		Params:      []string{source.ParamNamespace, source.ParamModelID},
+		Description: "Requests waiting per pod right now; the gate for capacity measurement",
+	}
+}
+
+// sglangQueueLengthInstantQuery is the SGLang form of queueLengthInstantQuery.
+func sglangQueueLengthInstantQuery() source.QueryTemplate {
+	return source.QueryTemplate{
+		Name:        QueryQueueLengthInstant,
+		Type:        source.QueryTypePromQL,
+		Template:    `max by (instance, pod, llm_d_ai_variant) (sglang:num_queue_reqs{namespace="{{.namespace}}",model_name="{{.modelID}}"})`,
+		Params:      []string{source.ParamNamespace, source.ParamModelID},
+		Description: "Requests waiting per pod right now; the gate for capacity measurement (SGLang)",
 	}
 }
 

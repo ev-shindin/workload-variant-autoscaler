@@ -420,6 +420,8 @@ func (c *ReplicaMetricsCollector) collectReplicaMetrics(
 		// Throughput analyzer fields
 		generationTokenRate float64
 		kvUsageInstant      float64
+		queueLengthInstant  float64
+		hasQueueInstant     bool
 		requestRate         float64
 	}
 
@@ -818,6 +820,25 @@ func (c *ReplicaMetricsCollector) collectReplicaMetrics(
 		}
 	}
 
+	// Process instantaneous waiting-request count — the gate for capacity measurement
+	if result := results[registration.QueryQueueLengthInstant]; result != nil {
+		if !result.HasError() {
+			for _, value := range result.Values {
+				instanceKey, _, _ := c.buildInstanceKey(ctx, namespace, value.Labels)
+				if instanceKey == "" {
+					continue
+				}
+				if podData[instanceKey] == nil {
+					continue // skip pods the KV/queue queries didn't see (scrape skew)
+				}
+				if !math.IsNaN(value.Value) && !math.IsInf(value.Value, 0) && value.Value >= 0 {
+					podData[instanceKey].queueLengthInstant = value.Value
+					podData[instanceKey].hasQueueInstant = true
+				}
+			}
+		}
+	}
+
 	// Process engine request completion rate (req/s) — throughput analyzer fallback λ_req
 	if result := results[registration.QueryRequestRate]; result != nil {
 		if !result.HasError() {
@@ -998,6 +1019,8 @@ func (c *ReplicaMetricsCollector) collectReplicaMetrics(
 			AvgITL:                data.avgITL,
 			GenerationTokenRate:   data.generationTokenRate,
 			KvUsageInstant:        data.kvUsageInstant,
+			QueueLengthInstant:    data.queueLengthInstant,
+			HasQueueLengthInstant: data.hasQueueInstant,
 			RequestRate:           data.requestRate,
 			Metadata: &domain.ReplicaMetricsMetadata{
 				CollectedAt:     collectedAt,

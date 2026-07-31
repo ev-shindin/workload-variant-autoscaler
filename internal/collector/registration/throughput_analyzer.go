@@ -53,6 +53,11 @@ const (
 	// Source: vllm:kv_cache_usage_perc (gauge)
 	QueryKvUsageInstant = "kv_usage_instant"
 
+	// QueryQueueLengthInstant is the query name for the instantaneous count of
+	// requests waiting on a replica, as opposed to QueryQueueLength which is that
+	// count's peak over the last minute.
+	QueryQueueLengthInstant = "queue_length_instant"
+
 	// QueryRequestRate is the query name for the engine-side request completion
 	// rate per pod (req/s), derived from the generation tokens histogram count.
 	// It is engine-agnostic: the vLLM variant reads

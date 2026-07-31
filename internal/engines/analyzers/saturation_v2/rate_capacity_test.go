@@ -11,14 +11,31 @@ import (
 	"github.com/llm-d/llm-d-workload-variant-autoscaler/internal/domain"
 )
 
+// rateCycle and ceilingCycle mirror one optimize cycle: replicas observe, then the
+// boundary folds what they observed. Reading without crossing a boundary is not a
+// state production can be in, so the tests do not exercise one.
+func rateCycle(s *bucketStore, key string, rates []float64, at time.Time) { //nolint:unparam // one bucket is enough for these; the parameter keeps the helper honest
+	for _, r := range rates {
+		s.ObserveRate(key, r, at)
+	}
+	s.BeginCycle(at)
+}
+
+func ceilingCycle(s *bucketStore, key string, tokens []float64, at time.Time) {
+	for _, t := range tokens {
+		s.ObserveCeiling(key, t, at)
+	}
+	s.BeginCycle(at)
+}
+
 var _ = Describe("Bucket store — service rate", func() {
 	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
 
 	It("tracks the mean of what it sees, in both directions", func() {
 		s := newBucketStore()
-		s.ObserveRate("k", 4.0, now)
-		s.ObserveRate("k", 9.0, now.Add(time.Minute))
-		s.ObserveRate("k", 6.0, now.Add(2*time.Minute))
+		rateCycle(s, "k", []float64{4.0}, now)
+		rateCycle(s, "k", []float64{9.0}, now.Add(time.Minute))
+		rateCycle(s, "k", []float64{6.0}, now.Add(2*time.Minute))
 
 		rate, ok := s.Rate("k", now.Add(2*time.Minute))
 		Expect(ok).To(BeTrue())
@@ -33,13 +50,13 @@ var _ = Describe("Bucket store — service rate", func() {
 		s := newBucketStore()
 		at := now
 		for i := 0; i < 6; i++ { // calibrate at 10 req/s
-			s.ObserveRate("k", 10.0, at)
+			rateCycle(s, "k", []float64{10.0}, at)
 			at = at.Add(30 * time.Second)
 		}
 		fast, _ := s.Rate("k", at)
 
 		for i := 0; i < 12; i++ { // longer prompts: the same replica now serves 5/s
-			s.ObserveRate("k", 5.0, at)
+			rateCycle(s, "k", []float64{5.0}, at)
 			at = at.Add(30 * time.Second)
 		}
 		slow, ok := s.Rate("k", at)
@@ -49,29 +66,60 @@ var _ = Describe("Bucket store — service rate", func() {
 			"a running maximum would still be reporting the old rate here")
 	})
 
-	It("withholds an estimate until a second observation", func() {
+	It("withholds an estimate until a second cycle", func() {
 		s := newBucketStore()
-		s.ObserveRate("k", 7.0, now)
+		rateCycle(s, "k", []float64{7.0}, now)
 		_, ok := s.Rate("k", now)
-		Expect(ok).To(BeFalse(), "one observation cannot distinguish a limit from a slow interval")
+		Expect(ok).To(BeFalse(), "one cycle cannot distinguish a limit from a slow interval")
 
-		s.ObserveRate("k", 7.0, now)
-		_, ok = s.Rate("k", now)
+		rateCycle(s, "k", []float64{7.0}, now.Add(time.Minute))
+		_, ok = s.Rate("k", now.Add(time.Minute))
 		Expect(ok).To(BeTrue())
 	})
 
-	It("ignores non-positive rates", func() {
+	It("counts cycles, not the replicas reporting in them", func() {
 		s := newBucketStore()
-		s.ObserveRate("k", 0, now)
-		s.ObserveRate("k", -3, now)
+		// Four replicas of one bucket, all backlogged, all in the same cycle. That is
+		// one interval of evidence however many pods produced it.
+		rateCycle(s, "k", []float64{7.0, 7.0, 7.0, 7.0}, now)
 		_, ok := s.Rate("k", now)
+		Expect(ok).To(BeFalse(), "MinServiceRateSamples must not be satisfiable within one cycle")
+	})
+
+	It("averages the cycle's replicas rather than taking whichever reported first", func() {
+		s := newBucketStore()
+		rateCycle(s, "k", []float64{4.0, 8.0, 12.0}, now)
+		rateCycle(s, "k", []float64{4.0, 8.0, 12.0}, now.Add(time.Minute))
+
+		rate, ok := s.Rate("k", now.Add(time.Minute))
+		Expect(ok).To(BeTrue())
+		// ReplicaMetrics is built by ranging a map, so "whichever reported first" is
+		// not even stable between cycles — mu would jitter with no smoothing at all.
+		Expect(rate).To(BeNumerically("~", 8.0, 0.01))
+	})
+
+	It("ignores rates that are not usable numbers", func() {
+		s := newBucketStore()
+		rateCycle(s, "k", []float64{0, -3, math.NaN(), math.Inf(1)}, now)
+		rateCycle(s, "k", []float64{0, -3, math.NaN(), math.Inf(1)}, now.Add(time.Minute))
+		_, ok := s.Rate("k", now.Add(time.Minute))
 		Expect(ok).To(BeFalse())
+
+		// And a poisoned value must not survive a later good one: NaN folded into the
+		// EWMA would stay NaN forever, and Rate's own `<= 0` guard does not catch it.
+		rateCycle(s, "k", []float64{math.NaN()}, now.Add(2*time.Minute))
+		rateCycle(s, "k", []float64{6.0}, now.Add(3*time.Minute))
+		rateCycle(s, "k", []float64{6.0}, now.Add(4*time.Minute))
+		rate, ok := s.Rate("k", now.Add(4*time.Minute))
+		Expect(ok).To(BeTrue())
+		Expect(math.IsNaN(rate)).To(BeFalse())
+		Expect(rate).To(BeNumerically("~", 6.0, 0.01))
 	})
 
 	It("holds an unrefreshed rate and expires it past the window", func() {
 		s := newBucketStore()
-		s.ObserveRate("k", 10.0, now)
-		s.ObserveRate("k", 10.0, now)
+		rateCycle(s, "k", []float64{10.0}, now)
+		rateCycle(s, "k", []float64{10.0}, now)
 
 		rate, ok := s.Rate("k", now.Add(ServiceRateWindow))
 		Expect(ok).To(BeTrue())
@@ -87,9 +135,7 @@ var _ = Describe("Bucket store — token ceiling", func() {
 
 	It("keeps the lowest occupancy at which a limit was seen", func() {
 		s := newBucketStore()
-		s.ObserveCeiling("k", 90_000, now)
-		s.ObserveCeiling("k", 64_000, now)
-		s.ObserveCeiling("k", 80_000, now)
+		ceilingCycle(s, "k", []float64{90_000, 64_000, 80_000}, now)
 
 		c, ok := s.Ceiling("k", now)
 		Expect(ok).To(BeTrue())
@@ -99,7 +145,7 @@ var _ = Describe("Bucket store — token ceiling", func() {
 
 	It("relaxes upward when no fresh limit is observed", func() {
 		s := newBucketStore()
-		s.ObserveCeiling("k", 64_000, now)
+		ceilingCycle(s, "k", []float64{64_000}, now)
 
 		c, ok := s.Ceiling("k", now.Add(ServiceRateWindow))
 		Expect(ok).To(BeTrue())
@@ -109,8 +155,8 @@ var _ = Describe("Bucket store — token ceiling", func() {
 
 	It("lets a fresh higher measurement win over a relaxed one", func() {
 		s := newBucketStore()
-		s.ObserveCeiling("k", 64_000, now)
-		s.ObserveCeiling("k", 120_000, now.Add(ServiceRateWindow))
+		ceilingCycle(s, "k", []float64{64_000}, now)
+		ceilingCycle(s, "k", []float64{120_000}, now.Add(ServiceRateWindow))
 
 		c, ok := s.Ceiling("k", now.Add(ServiceRateWindow))
 		Expect(ok).To(BeTrue())
@@ -193,11 +239,19 @@ var _ = Describe("Residence estimate", func() {
 		Expect(residenceSeconds(domain.ReplicaMetrics{AvgITL: 0.02})).To(BeZero())
 	})
 
-	It("bounds an implausible reading", func() {
-		Expect(residenceSeconds(domain.ReplicaMetrics{AvgITL: 1e-7, AvgOutputTokens: 1})).
-			To(Equal(MinResidenceSeconds))
+	It("bounds an implausible reading from above", func() {
 		Expect(residenceSeconds(domain.ReplicaMetrics{AvgTTFT: 1e6, AvgITL: 1, AvgOutputTokens: 1})).
 			To(Equal(MaxResidenceSeconds))
+	})
+
+	It("floors the smoothing constant but not the residence itself", func() {
+		short := domain.ReplicaMetrics{AvgITL: 0.008, AvgOutputTokens: 16} // W = 0.128 s
+		Expect(residenceSeconds(short)).To(BeNumerically("~", 0.128, 1e-9),
+			"capacity is mu x W x tokensPerRequest, so a floor here inflates supply "+
+				"in one direction while demand has no matching floor")
+		Expect(smoothingTau(short)).To(Equal(MinResidenceSeconds),
+			"the floor exists to keep the arrival average from becoming a passthrough")
+		Expect(smoothingTau(domain.ReplicaMetrics{})).To(BeZero())
 	})
 })
 
@@ -227,10 +281,17 @@ var _ = Describe("Rate-anchored k2", func() {
 		}
 	}
 
+	// step is one optimize cycle: cross the boundary that folds what the last cycle
+	// observed, then look at the replica. Mirrors Analyze.
+	step := func(a *SaturationAnalyzer, rm domain.ReplicaMetrics, at time.Time) (int64, int64, k2Source, bool) {
+		a.serviceRates.BeginCycle(at)
+		return a.rateAnchoredK2(rm, "m", "", 1, k1, queueThreshold, at)
+	}
+
 	// learn drives enough cycles to establish both the service rate and the ceiling.
 	learn := func(a *SaturationAnalyzer, rm domain.ReplicaMetrics) {
-		for i := 0; i < MinServiceRateSamples+1; i++ {
-			_, _, _, _ = a.rateAnchoredK2(rm, "m", "", 1, k1, queueThreshold, now)
+		for i := 0; i <= MinServiceRateSamples+1; i++ {
+			_, _, _, _ = step(a, rm, now.Add(time.Duration(i)*15*time.Second))
 		}
 	}
 
@@ -240,9 +301,15 @@ var _ = Describe("Rate-anchored k2", func() {
 		Expect(ok).To(BeFalse())
 	})
 
-	It("reports the current occupancy on a first overload, before anything is learned", func() {
+	It("reports the measured occupancy from the cycle after a first overload", func() {
 		a := NewSaturationAnalyzer(NewCapacityKnowledgeStore(), withRateAnchoredK2(true))
-		k2, _, src, ok := a.rateAnchoredK2(atLimit(), "m", "", 1, k1, queueThreshold, now)
+
+		// Nothing is folded until a cycle boundary, so the first overloaded cycle has
+		// nothing to answer with and the occupancy chain handles it.
+		_, _, _, ok := step(a, atLimit(), now)
+		Expect(ok).To(BeFalse())
+
+		k2, _, src, ok := step(a, atLimit(), now.Add(15*time.Second))
 		Expect(ok).To(BeTrue())
 		Expect(src).To(Equal(k2SrcRateBacklog))
 		Expect(k2).To(BeNumerically("~", float64(occupancy), 1),
@@ -254,7 +321,7 @@ var _ = Describe("Rate-anchored k2", func() {
 		hot := atLimit()
 		learn(a, hot)
 
-		hotK2, _, hotSrc, ok := a.rateAnchoredK2(hot, "m", "", 1, k1, queueThreshold, now)
+		hotK2, _, hotSrc, ok := step(a, hot, now.Add(time.Minute))
 		Expect(ok).To(BeTrue())
 		Expect(hotSrc).To(Equal(k2SrcRateBacklog), "backlogged: at its limit this cycle")
 
@@ -267,7 +334,7 @@ var _ = Describe("Rate-anchored k2", func() {
 		cold.PodName = siblingPod
 		cold.QueueLength = 0
 		cold.ArrivalRate = 2.0
-		coldK2, _, coldSrc, ok := a.rateAnchoredK2(cold, "m", "", 1, k1, queueThreshold, now)
+		coldK2, _, coldSrc, ok := a.rateAnchoredK2(cold, "m", "", 1, k1, queueThreshold, now.Add(time.Minute))
 		Expect(ok).To(BeTrue())
 		Expect(coldSrc).To(Equal(k2SrcRateAnchored), "not at its limit: carrying the bucket's ceiling")
 		Expect(coldK2).To(Equal(hotK2), "the median across replicas must be a no-op")
@@ -300,34 +367,31 @@ var _ = Describe("Rate-anchored k2", func() {
 	It("detects the limit from arrivals reaching the service rate, with no queue", func() {
 		a := NewSaturationAnalyzer(NewCapacityKnowledgeStore(), withRateAnchoredK2(true))
 		rm := atLimit()
-		for i := 0; i < MinServiceRateSamples; i++ {
-			_, _, _, _ = a.rateAnchoredK2(rm, "m", "", 1, k1, queueThreshold, now)
-		}
+		learn(a, rm)
 
 		// Queue drained but arrivals still at the service rate: the replica is at its
 		// limit, and the detector says so with no queue to go on.
 		rm.QueueLength = 0
 		rm.TokensInUse = 48_000
-		k2, _, src, ok := a.rateAnchoredK2(rm, "m", "", 1, k1, queueThreshold, now)
+		k2, _, src, ok := step(a, rm, now.Add(time.Minute))
 		Expect(ok).To(BeTrue())
 		Expect(src).To(Equal(k2SrcRateBacklog), "the arrivals path fired without a queue")
 		// The lower occupancy must NOT become the new ceiling. With no queue it is
 		// evidence the replica is keeping up, not evidence its limit has fallen —
-		// recording it would ratchet capacity down on evidence of health.
-		Expect(k2).To(BeNumerically("~", occupancy, 1))
+		// recording it would ratchet capacity down on evidence of health. (Within a
+		// per-cent: an unrefreshed ceiling relaxes upward with age.)
+		Expect(k2).To(BeNumerically("~", occupancy, float64(occupancy)*0.01))
 	})
 
 	It("uses completions as arrivals when there is no EPP and no queue", func() {
 		a := NewSaturationAnalyzer(NewCapacityKnowledgeStore(), withRateAnchoredK2(true))
 		rm := atLimit()
-		for i := 0; i < MinServiceRateSamples; i++ {
-			_, _, _, _ = a.rateAnchoredK2(rm, "m", "", 1, k1, queueThreshold, now)
-		}
+		learn(a, rm)
 
 		rm.QueueLength = 0
 		rm.ArrivalRate = 0   // no EPP
 		rm.RequestRate = 8.0 // completions == arrivals with no queue
-		_, _, src, ok := a.rateAnchoredK2(rm, "m", "", 1, k1, queueThreshold, now)
+		_, _, src, ok := step(a, rm, now.Add(time.Minute))
 		Expect(ok).To(BeTrue())
 		// RATE-now is only reachable here through the completions substitution: with
 		// no queue and no EPP there is nothing else that could flag the limit.
@@ -361,13 +425,49 @@ var _ = Describe("Rate-anchored k2", func() {
 		}
 	})
 
-	It("floors the ceiling so a stalled replica cannot demand unbounded scale-up", func() {
+	It("ignores a replica that queues without completing anything", func() {
 		a := NewSaturationAnalyzer(NewCapacityKnowledgeStore(), withRateAnchoredK2(true))
-		rm := atLimit()
-		rm.TokensInUse = 100 // stalled with a deep queue and almost nothing resident
-		k2, _, _, ok := a.rateAnchoredK2(rm, "m", "", 1, k1, queueThreshold, now)
+		healthy := atLimit()
+		learn(a, healthy)
+		before, _, _, ok := step(a, healthy, now.Add(time.Minute))
 		Expect(ok).To(BeTrue())
-		Expect(k2).To(BeNumerically(">=", int64(float64(k1)*MinRateAnchoredFraction)))
+
+		// A replica with a deep queue, almost nothing resident, and no completions: a
+		// pod that has just started and taken a routed burst, or one that has stalled.
+		// Either way it is not evidence of what this bucket can hold, and letting it
+		// set the ceiling would pin every sibling near the floor for hours.
+		cold := atLimit()
+		cold.PodName = siblingPod
+		cold.TokensInUse = 100
+		cold.KvUsageInstant = 0
+		cold.RequestRate = 0
+		for i := 1; i <= 4; i++ {
+			_, _, _, _ = step(a, cold, now.Add(time.Minute+time.Duration(i)*15*time.Second))
+		}
+		after, _, _, ok := step(a, healthy, now.Add(2*time.Minute))
+		Expect(ok).To(BeTrue())
+		Expect(after).To(BeNumerically(">=", before), "the cold replica taught the bucket nothing")
+	})
+
+	It("needs the same reading twice before it lowers the ceiling", func() {
+		a := NewSaturationAnalyzer(NewCapacityKnowledgeStore(), withRateAnchoredK2(true))
+		learn(a, atLimit())
+
+		lower := atLimit()
+		lower.TokensInUse = 20_000 // well under the learned 64k
+		first, _, _, ok := step(a, lower, now.Add(time.Minute))
+		Expect(ok).To(BeTrue())
+		Expect(first).To(BeNumerically("~", occupancy, float64(occupancy)*0.01),
+			"the first low reading has not been folded yet")
+
+		second, _, _, ok := step(a, lower, now.Add(time.Minute+15*time.Second))
+		Expect(ok).To(BeTrue())
+		Expect(second).To(BeNumerically("~", occupancy, float64(occupancy)*0.01),
+			"one cycle of evidence is not enough to lower it")
+
+		third, _, _, ok := step(a, lower, now.Add(time.Minute+30*time.Second))
+		Expect(ok).To(BeTrue())
+		Expect(third).To(BeNumerically("~", 20_000, 200), "sustained, so it is adopted")
 	})
 
 	It("survives negative and NaN arrival rates", func() {
@@ -411,17 +511,14 @@ var _ = Describe("Rate-anchored k2", func() {
 		rm := atLimit()
 		rm.RequestRate = 0
 		for i := 0; i < 5; i++ {
-			_, _, src, ok := a.rateAnchoredK2(rm, "m", domain.RolePrefill, 1, k1, queueThreshold, now)
-			Expect(ok).To(BeTrue())
-			// The queue is real, so the limit is measured from it — but no service
-			// rate is ever learned, so nothing is inferred from a rate comparison.
-			Expect(src).To(BeElementOf(k2SrcRateBacklog, k2SrcRateAnchored))
+			a.serviceRates.BeginCycle(now.Add(time.Duration(i) * 15 * time.Second))
+			_, _, _, ok := a.rateAnchoredK2(rm, "m", domain.RolePrefill, 1, k1, queueThreshold,
+				now.Add(time.Duration(i)*15*time.Second))
+			// No completions means no service rate and no ceiling: there is nothing to
+			// measure a limit from, so the estimator declines rather than inventing one
+			// from a queue depth alone.
+			Expect(ok).To(BeFalse())
 		}
-
-		rm.QueueLength = 0
-		rm.ArrivalRate = 1
-		_, _, _, ok := a.rateAnchoredK2(rm, "m", domain.RolePrefill, 1, k1, queueThreshold, now)
-		Expect(ok).To(BeTrue(), "the ceiling measured under backlog still applies")
 	})
 })
 
@@ -433,11 +530,11 @@ var _ = Describe("Bucket store — bounded growth", func() {
 		// Fill past the prune threshold with buckets nobody has touched in a day.
 		old := now.Add(-2 * HistoryEvictionTimeout)
 		for i := 0; i < BucketPruneThreshold; i++ {
-			s.ObserveCeiling(fmt.Sprintf("stale-%d", i), 1000, old)
+			ceilingCycle(s, fmt.Sprintf("stale-%d", i), []float64{1000}, old)
 		}
 		Expect(s.entries).To(HaveLen(BucketPruneThreshold))
 
-		s.ObserveCeiling("fresh", 2000, now)
+		ceilingCycle(s, "fresh", []float64{2000}, now)
 		Expect(s.entries).To(HaveLen(1), "the stale buckets went with the insert")
 		_, ok := s.Ceiling("fresh", now)
 		Expect(ok).To(BeTrue())
@@ -505,7 +602,7 @@ var _ = Describe("Rate-anchored k2 at the current operating point", func() {
 
 	// cycle mirrors production: freeze the bucket's operating point, then compute.
 	cycle := func(a *SaturationAnalyzer, rm domain.ReplicaMetrics, at time.Time) (int64, int64, k2Source, bool) {
-		a.serviceRates.FreezeWork(at)
+		a.serviceRates.BeginCycle(at)
 		return a.rateAnchoredK2(rm, "m", "", 1, k1, queueThreshold, at)
 	}
 
@@ -523,9 +620,10 @@ var _ = Describe("Rate-anchored k2 at the current operating point", func() {
 		k2, src := run(a, atLimit(), start, 3)
 
 		// mu x W x tokensPerRequest equals the occupancy that set the ceiling, so
-		// engaging the scaling changes nothing at the point it was calibrated.
-		Expect(k2).To(Equal(int64(60_000)))
-		Expect(src).To(Equal(k2SrcRateBacklog), "still at its limit")
+		// engaging the scaling changes nothing at the point it was calibrated —
+		// whichever of the two the clamp happens to pick.
+		Expect(k2).To(BeNumerically("~", 60_000, 600))
+		Expect(src).To(BeElementOf(k2SrcRateBacklog, k2SrcRateResidence))
 	})
 
 	It("holds utilization flat when contention falls away", func() {
@@ -574,7 +672,7 @@ var _ = Describe("Rate-anchored k2 at the current operating point", func() {
 		// Siblings report slightly different residences; they must still scale by one
 		// number, because aggregateByVariant takes the MEDIAN of per-replica values.
 		at := start.Add(5 * interval)
-		a.serviceRates.FreezeWork(at)
+		a.serviceRates.BeginCycle(at)
 		first := drained()
 		second := drained()
 		second.PodName = siblingPod
@@ -586,17 +684,24 @@ var _ = Describe("Rate-anchored k2 at the current operating point", func() {
 		Expect(k2b).To(Equal(k2a))
 	})
 
-	It("holds at the ceiling until an operating point has been published", func() {
+	It("holds at the ceiling when there is no residence to scale by", func() {
 		a := NewSaturationAnalyzer(NewCapacityKnowledgeStore(), withRateAnchoredK2(true))
-		// No FreezeWork call at all: nothing has been published, so there is nothing
-		// to scale by and the estimator answers with the measured ceiling.
+		// A fleet whose latency metrics are not being collected: the limit is still
+		// measurable from backlog and occupancy, but there is no operating point to
+		// scale it to, so the estimator answers with the ceiling rather than guessing.
+		blind := atLimit()
+		blind.AvgTTFT, blind.AvgITL = 0, 0
+
 		var k2 int64
 		var src k2Source
-		for i := 0; i < 3; i++ {
-			k2, _, src, _ = a.rateAnchoredK2(atLimit(), "m", "", 1, k1, queueThreshold,
-				start.Add(time.Duration(i)*interval))
+		var ok bool
+		for i := 0; i < 5; i++ {
+			at := start.Add(time.Duration(i) * interval)
+			a.serviceRates.BeginCycle(at)
+			k2, _, src, ok = a.rateAnchoredK2(blind, "m", "", 1, k1, queueThreshold, at)
 		}
-		Expect(k2).To(Equal(int64(60_000)))
+		Expect(ok).To(BeTrue())
+		Expect(k2).To(BeNumerically("~", 60_000, 600))
 		Expect(src).NotTo(Equal(k2SrcRateResidence))
 	})
 })
@@ -629,7 +734,7 @@ var _ = Describe("Rate-anchored k2 operating point across siblings", func() {
 		a := NewSaturationAnalyzer(NewCapacityKnowledgeStore(), withRateAnchoredK2(true))
 		for i := 0; i < MinServiceRateSamples+1; i++ {
 			at := start.Add(time.Duration(i) * interval)
-			a.serviceRates.FreezeWork(at)
+			a.serviceRates.BeginCycle(at)
 			_, _, _, _ = a.rateAnchoredK2(atLimit(), "m", "", 1, k1, queueThreshold, at)
 		}
 
@@ -648,7 +753,7 @@ var _ = Describe("Rate-anchored k2 operating point across siblings", func() {
 		var ok bool
 		for i := 3; i < 43; i++ { // long enough for the smoothed value to settle
 			at := start.Add(time.Duration(i) * interval)
-			a.serviceRates.FreezeWork(at)
+			a.serviceRates.BeginCycle(at)
 			k2, _, src, ok = a.rateAnchoredK2(slow, "m", "", 1, k1, queueThreshold, at)
 			_, _, _, _ = a.rateAnchoredK2(fast, "m", "", 1, k1, queueThreshold, at)
 		}
@@ -670,7 +775,9 @@ var _ = Describe("Rate-anchored k2 ceiling measurement", func() {
 		rm := domain.ReplicaMetrics{
 			PodName:               "pod-a",
 			AcceleratorName:       "H100",
-			QueueLength:           12,
+			QueueLength:           12, // max_over_time: the last minute's peak
+			QueueLengthInstant:    12, // and still queueing right now
+			HasQueueLengthInstant: true,
 			RequestRate:           8.0,
 			TokensInUse:           120_000, // max_over_time: the last minute's peak
 			KvUsageInstant:        0.15,    // 60k: where it actually is now
@@ -678,16 +785,18 @@ var _ = Describe("Rate-anchored k2 ceiling measurement", func() {
 			AvgInputTokens:        1000,
 			AvgOutputTokens:       250,
 		}
-		for i := 0; i < MinServiceRateSamples+1; i++ {
-			_, _, _, _ = a.rateAnchoredK2(rm, "m", "", 1, 320_000, 5.0,
-				now.Add(time.Duration(i)*15*time.Second))
+		for i := 0; i <= MinServiceRateSamples+1; i++ {
+			at := now.Add(time.Duration(i) * 15 * time.Second)
+			a.serviceRates.BeginCycle(at)
+			_, _, _, _ = a.rateAnchoredK2(rm, "m", "", 1, 320_000, 5.0, at)
 		}
 
 		// The ceiling is a running minimum, so feeding it a peak biases it high in the
 		// one direction that costs replicas.
+		a.serviceRates.BeginCycle(now.Add(time.Minute))
 		k2, _, _, ok := a.rateAnchoredK2(rm, "m", "", 1, 320_000, 5.0, now.Add(time.Minute))
 		Expect(ok).To(BeTrue())
-		Expect(k2).To(BeNumerically("~", 60_000, 1))
+		Expect(k2).To(BeNumerically("~", 60_000, 600))
 	})
 
 	It("falls back to the averaged reading when no instantaneous one is collected", func() {
@@ -702,13 +811,15 @@ var _ = Describe("Rate-anchored k2 ceiling measurement", func() {
 			AvgInputTokens:        1000,
 			AvgOutputTokens:       250,
 		}
-		for i := 0; i < MinServiceRateSamples+1; i++ {
-			_, _, _, _ = a.rateAnchoredK2(rm, "m", "", 1, 320_000, 5.0,
-				now.Add(time.Duration(i)*15*time.Second))
+		for i := 0; i <= MinServiceRateSamples+1; i++ {
+			at := now.Add(time.Duration(i) * 15 * time.Second)
+			a.serviceRates.BeginCycle(at)
+			_, _, _, _ = a.rateAnchoredK2(rm, "m", "", 1, 320_000, 5.0, at)
 		}
+		a.serviceRates.BeginCycle(now.Add(time.Minute))
 		k2, _, _, ok := a.rateAnchoredK2(rm, "m", "", 1, 320_000, 5.0, now.Add(time.Minute))
 		Expect(ok).To(BeTrue())
-		Expect(k2).To(BeNumerically("~", 120_000, 1))
+		Expect(k2).To(BeNumerically("~", 120_000, 1200))
 	})
 })
 
@@ -744,7 +855,7 @@ var _ = Describe("Rate-anchored k2 responsiveness", func() {
 		a := NewSaturationAnalyzer(NewCapacityKnowledgeStore(), withRateAnchoredK2(true))
 		for i := 0; i < 5; i++ {
 			at := start.Add(time.Duration(i) * interval)
-			a.serviceRates.FreezeWork(at)
+			a.serviceRates.BeginCycle(at)
 			_, _, _, _ = a.rateAnchoredK2(base(), "m", "", 1, k1, queueThreshold, at)
 		}
 
@@ -757,7 +868,7 @@ var _ = Describe("Rate-anchored k2 responsiveness", func() {
 		ramp.AvgTTFT = 9.0 // W = 14 s, more than double
 
 		at := start.Add(5 * interval)
-		a.serviceRates.FreezeWork(at)
+		a.serviceRates.BeginCycle(at)
 		k2, _, _, ok := a.rateAnchoredK2(ramp, "m", "", 1, k1, queueThreshold, at)
 
 		Expect(ok).To(BeTrue())
@@ -772,7 +883,7 @@ var _ = Describe("Rate-anchored k2 responsiveness", func() {
 		s := newBucketStore()
 		at := start
 		s.ObserveWork("k", 7500, at)
-		s.FreezeWork(at)
+		s.BeginCycle(at)
 		peak, _ := s.FrozenWork("k", at)
 		Expect(peak).To(BeNumerically("~", 7500, 1))
 
@@ -783,7 +894,7 @@ var _ = Describe("Rate-anchored k2 responsiveness", func() {
 		for i := 1; i <= 3; i++ {
 			at = start.Add(time.Duration(i) * interval)
 			s.ObserveWork("k", 3750, at)
-			s.FreezeWork(at)
+			s.BeginCycle(at)
 			held, ok := s.FrozenWork("k", at)
 			Expect(ok).To(BeTrue())
 			Expect(held).To(BeNumerically("~", 7500, 1), "still inside the window")
@@ -791,7 +902,7 @@ var _ = Describe("Rate-anchored k2 responsiveness", func() {
 
 		at = start.Add(WorkWindow + interval)
 		s.ObserveWork("k", 3750, at)
-		s.FreezeWork(at)
+		s.BeginCycle(at)
 		stepped, ok := s.FrozenWork("k", at)
 		Expect(ok).To(BeTrue())
 		Expect(stepped).To(BeNumerically("~", 3750, 1), "the peak has aged out, as demand's has")
@@ -802,7 +913,7 @@ var _ = Describe("Rate-anchored k2 responsiveness", func() {
 		for i := 0; i < 200; i++ {
 			at := start.Add(time.Duration(i) * interval)
 			s.ObserveWork("k", 5000, at)
-			s.FreezeWork(at)
+			s.BeginCycle(at)
 		}
 		Expect(len(s.entries["k"].workSamples)).To(BeNumerically("<=",
 			int(WorkWindow/interval)+1), "bounded by the window, not by the run length")

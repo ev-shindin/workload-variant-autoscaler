@@ -132,10 +132,10 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input domain.AnalyzerI
 		rolesByVariant[vs.VariantName] = vs.Role
 	}
 
-	// Publish each bucket's operating point for this cycle before any replica reads
-	// it, so every replica of a bucket scales by the same number — see FreezeWork.
+	// Fold what last cycle observed and publish this cycle's operating point before
+	// any replica is looked at — see BeginCycle.
 	if a.serviceRates != nil {
-		a.serviceRates.FreezeWork(a.now())
+		a.serviceRates.BeginCycle(a.now())
 	}
 
 	// Phase 1: Per-replica capacity computation
@@ -251,7 +251,7 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 	// why anything per-replica or per-cycle was unusable downstream.
 	var rateReference int64
 	if rateK2, ref, rateSrc, ok := a.rateAnchoredK2(rm, modelID, role, gpuCount, k1, config.QueueLengthThreshold, a.now()); ok {
-		k2, k2Priority, rateReference = rateK2, rateSrc, ref
+		k2, rateReference, k2Priority = rateK2, ref, rateSrc
 	}
 
 	effectiveCapacity := k1

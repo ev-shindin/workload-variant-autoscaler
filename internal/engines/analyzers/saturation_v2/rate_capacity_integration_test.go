@@ -1,6 +1,7 @@
 package saturation_v2
 
 import (
+	"context"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -55,12 +56,15 @@ var _ = Describe("Rate-anchored k2 through computeReplicaCapacity", func() {
 
 	It("learns the measured limit into the capacity store", func() {
 		store := NewCapacityKnowledgeStore()
-		a := NewSaturationAnalyzer(store, withRateAnchoredK2(true))
+		clock := start
+		a := NewSaturationAnalyzer(store, withRateAnchoredK2(true), withClock(func() time.Time { return clock }))
 		cfg := scalingConfig()
 		rm := atLimit()
 
 		var rc *ReplicaCapacity
-		for i := 0; i < MinServiceRateSamples+1; i++ {
+		for i := 0; i <= MinServiceRateSamples+1; i++ {
+			clock = clock.Add(15 * time.Second)
+			a.serviceRates.BeginCycle(clock)
 			rc = a.computeReplicaCapacity(rm, cfg, modelID, namespace, 1, domain.RoleBoth)
 		}
 		Expect(rc).NotTo(BeNil())
@@ -117,7 +121,7 @@ var _ = Describe("Rate-anchored k2 through computeReplicaCapacity", func() {
 		off := NewSaturationAnalyzer(NewCapacityKnowledgeStore(), withClock(tick))
 		on := NewSaturationAnalyzer(NewCapacityKnowledgeStore(), withRateAnchoredK2(true), withClock(tick))
 		for i := 0; i < MinServiceRateSamples+1; i++ {
-			on.serviceRates.FreezeWork(clock)
+			on.serviceRates.BeginCycle(clock)
 			_ = off.computeReplicaCapacity(peak, cfg, modelID, namespace, 1, domain.RoleBoth)
 			_ = on.computeReplicaCapacity(peak, cfg, modelID, namespace, 1, domain.RoleBoth)
 		}
@@ -139,7 +143,7 @@ var _ = Describe("Rate-anchored k2 through computeReplicaCapacity", func() {
 
 		var occupancyBased, rateBased *ReplicaCapacity
 		for i := 0; i < 40; i++ { // the operating point is smoothed over about a minute
-			on.serviceRates.FreezeWork(clock)
+			on.serviceRates.BeginCycle(clock)
 			occupancyBased = off.computeReplicaCapacity(drained, cfg, modelID, namespace, 1, domain.RoleBoth)
 			rateBased = on.computeReplicaCapacity(drained, cfg, modelID, namespace, 1, domain.RoleBoth)
 		}
@@ -162,17 +166,25 @@ var _ = Describe("Rate-anchored k2 through computeReplicaCapacity", func() {
 		// and cross-variant estimation, where "what it is doing now" is meaningless.
 		rec := on.capacityStore.Get(namespace, modelID, variant)
 		Expect(rec).NotTo(BeNil())
-		Expect(rec.EffectiveCapacity).To(BeNumerically(">", rateBased.EffectiveCapacity))
+		// Exactly k1: the measured reference is above the memory bound here, so the
+		// clamp decides. Asserting only "> the scaled value" would pass just as
+		// happily on an unclamped 340k, or on the scaled value being stored.
+		Expect(rec.EffectiveCapacity).To(Equal(int64(0.8 * float64(kvCapacity))))
 	})
 
 	It("gives a backlogged replica and an idle sibling the same capacity", func() {
 		cfg := scalingConfig()
-		a := NewSaturationAnalyzer(NewCapacityKnowledgeStore(), withRateAnchoredK2(true))
+		clock := start
+		a := NewSaturationAnalyzer(NewCapacityKnowledgeStore(), withRateAnchoredK2(true),
+			withClock(func() time.Time { return clock }))
 
 		hot := atLimit()
-		for i := 0; i < MinServiceRateSamples+1; i++ {
+		for i := 0; i <= MinServiceRateSamples+1; i++ {
+			clock = clock.Add(15 * time.Second)
+			a.serviceRates.BeginCycle(clock)
 			_ = a.computeReplicaCapacity(hot, cfg, modelID, namespace, 1, domain.RoleBoth)
 		}
+		a.serviceRates.BeginCycle(clock.Add(15 * time.Second))
 		hotRC := a.computeReplicaCapacity(hot, cfg, modelID, namespace, 1, domain.RoleBoth)
 
 		cold := atLimit()
@@ -187,5 +199,90 @@ var _ = Describe("Rate-anchored k2 through computeReplicaCapacity", func() {
 		Expect(coldRC.EffectiveCapacity).To(Equal(hotRC.EffectiveCapacity))
 		// The idle replica is not itself saturated: its own demand is what differs.
 		Expect(coldRC.ReplicaDemand).To(BeNumerically("<", hotRC.ReplicaDemand))
+	})
+})
+
+// This one goes through Analyze rather than computeReplicaCapacity, because the
+// property it checks lives in the wiring: BeginCycle has to run at the top of the
+// cycle, before any replica is looked at. Drop that call, or move it after the
+// per-replica loop, and every other test in this file still passes.
+var _ = Describe("Rate-anchored k2 through Analyze", func() {
+	const (
+		kvCapacity = int64(400_000)
+		namespace  = "ns"
+		modelID    = "m"
+		variant    = "v1"
+	)
+	start := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
+
+	replica := func(pod string, queue int, tokens int64) domain.ReplicaMetrics {
+		return domain.ReplicaMetrics{
+			PodName:               pod,
+			VariantName:           variant,
+			ModelID:               modelID,
+			Namespace:             namespace,
+			AcceleratorName:       "H100",
+			QueueLength:           queue,
+			QueueLengthInstant:    float64(queue),
+			HasQueueLengthInstant: true,
+			RequestRate:           8.0,
+			ArrivalRate:           8.0,
+			KvCacheUsage:          float64(tokens) / float64(kvCapacity),
+			KvUsageInstant:        float64(tokens) / float64(kvCapacity),
+			TokensInUse:           tokens,
+			TotalKvCapacityTokens: kvCapacity,
+			AvgInputTokens:        1000,
+			AvgOutputTokens:       250,
+			AvgTTFT:               1.0,
+			AvgITL:                0.02,
+		}
+	}
+
+	It("gives a variant's replicas one capacity, cycle after cycle", func() {
+		clock := start
+		a := NewSaturationAnalyzer(NewCapacityKnowledgeStore(), withRateAnchoredK2(true),
+			withClock(func() time.Time { return clock }))
+		cfg := &config.SaturationScalingConfig{
+			KvCacheThreshold:     0.8,
+			QueueLengthThreshold: 5,
+			AnalyzerName:         "saturation",
+			ScaleUpThreshold:     0.75,
+			ScaleDownBoundary:    0.60,
+		}
+
+		// Three backlogged replicas of one variant, at different occupancies — which
+		// is the realistic case, and the one where a per-replica capacity would put
+		// three different numbers through aggregateByVariant's median.
+		input := domain.AnalyzerInput{
+			ModelID:   modelID,
+			Namespace: namespace,
+			ReplicaMetrics: []domain.ReplicaMetrics{
+				replica("pod-a", 12, 60_000),
+				replica("pod-b", 9, 66_000),
+				replica("pod-c", 14, 58_000),
+			},
+			VariantStates: []domain.VariantReplicaState{{
+				VariantName: variant, Role: domain.RoleBoth,
+				GPUsPerReplica: 1, CurrentReplicas: 3,
+			}},
+			Config: cfg,
+		}
+
+		var result *domain.AnalyzerResult
+		for i := 0; i < 4; i++ {
+			clock = start.Add(time.Duration(i) * 15 * time.Second)
+			var err error
+			result, err = a.Analyze(context.Background(), input)
+			Expect(err).NotTo(HaveOccurred())
+		}
+
+		Expect(result.VariantCapacities).To(HaveLen(1))
+		vc := result.VariantCapacities[0]
+		Expect(vc.PerReplicaCapacity).To(BeNumerically(">", 0))
+		// Supply is replicaCount x median(per-replica capacities), so equal values are
+		// what make that median a no-op. The lowest occupancy seen under backlog is
+		// 58k, and every replica must be reading it.
+		Expect(vc.TotalCapacity).To(BeNumerically("~", 3*vc.PerReplicaCapacity, 1))
+		Expect(vc.PerReplicaCapacity).To(BeNumerically("~", 58_000, 1_000))
 	})
 })

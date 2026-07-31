@@ -29,6 +29,7 @@ var engineSpecificReplicaQueries = []string{
 	registration.QueryAvgITL,
 	registration.QueryGenerationTokenRate,
 	registration.QueryKvUsageInstant,
+	registration.QueryQueueLengthInstant,
 	registration.QueryRequestRate,
 }
 

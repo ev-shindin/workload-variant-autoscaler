@@ -68,6 +68,21 @@ type ReplicaCapacity struct {
 //	"short"  — avgOutput in [0, 100)
 //	"medium" — avgOutput in [100, 500)
 //	"long"   — avgOutput >= 500
+
+// classifyInputLength buckets a prompt length. Separate from classifyOutputLength
+// because the two distributions differ by an order of magnitude — see the threshold
+// constants.
+func classifyInputLength(avgInputTokens float64) string {
+	switch {
+	case avgInputTokens < ShortInputThreshold:
+		return "short"
+	case avgInputTokens < MediumInputThreshold:
+		return "medium"
+	default:
+		return "long"
+	}
+}
+
 func classifyOutputLength(avgOutputTokens float64) string {
 	switch {
 	case avgOutputTokens < ShortOutputThreshold:

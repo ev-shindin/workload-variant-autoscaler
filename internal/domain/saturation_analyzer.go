@@ -144,6 +144,13 @@ type ReplicaMetrics struct {
 	// Zero when metrics are unavailable.
 	KvUsageInstant float64
 
+	// QueueLengthInstant is how many requests are waiting on this replica right now,
+	// as opposed to QueueLength, which is that count's peak over the last minute.
+	// HasQueueLengthInstant distinguishes a genuine zero from a metric that was not
+	// collected, which matters because the two call for opposite behaviour.
+	QueueLengthInstant    float64
+	HasQueueLengthInstant bool
+
 	// RequestRate is the engine-side request completion rate on this replica (req/s).
 	// Engine-agnostic: derived per pod from rate(vllm:request_generation_tokens_count[1m])
 	// for vLLM and rate(sglang:generation_tokens_histogram_count[1m]) for SGLang.
