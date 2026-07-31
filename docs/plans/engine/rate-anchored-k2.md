@@ -280,6 +280,42 @@ measured 140-deep queue and 7.58 s TTFT p99. With `scaleUpThreshold = 0.75` the 
 point of 2.09 was not "enough" — it was ρ ≈ 1, reported as 12.9% utilization because a request
 waiting in the queue holds no KV at all.
 
+### Reading the limit, and reading it early
+
+Two rules decide when a replica is at its limit, and they are read on one time base.
+`QueueLength` and `TokensInUse` are collected as `max_over_time(...[1m])`, so the peak
+latches for a minute; `QueryQueueLengthInstant` and `KvUsageInstant` are point samples.
+Pairing a latched gate with a point sample is what let a drained replica be recorded as
+its own limit, collapsing the ceiling to its floor. `limitEvidence` pairs them
+explicitly — instantaneous with instantaneous, or the one-minute peak of both.
+
+Only a replica that is both backlogged **and** completing work may define a ceiling,
+and lowering one takes `MinCeilingLowerCycles` consecutive cycles of agreement. A pod
+that has just become ready takes a routed burst before its cache fills; a stalled pod
+queues without completing anything. Either looks backlogged at almost zero occupancy,
+and since the ceiling is a minimum across the bucket, either would set capacity for
+every healthy sibling.
+
+Arrivals reaching the service rate is not a measurement of the limit — with no queue,
+low occupancy means the replica is keeping up — but it is a reliable signal that the
+limit has been reached. Capacity is then held at the current occupancy, so demand meets
+it and the fleet scales **before** a queue forms. That matters more than it looks: a
+replica takes about ninety seconds from decision to serving, so the backlog that builds
+during a scale-up is set by how early the decision was made, not by how fast the loop
+runs afterward.
+
+### The bucket key is a property of the variant
+
+The shape that keys a bucket is averaged across the variant's replicas. Replicas of one
+variant serve the same traffic, so their per-replica averages differ only by sampling
+noise — but that noise is enough to put two siblings either side of a threshold, where
+they learn independent ceilings and service rates. `aggregateByVariant` takes the MEDIAN
+of per-replica capacities, so those two figures get blended even though they measure
+different things, and a variant sitting near a threshold flips its estimate every cycle
+as replicas drift across it. Input and output thresholds are also separate now: prompts
+run an order of magnitude longer than generations, and bucketing input at the output
+thresholds put almost every real workload in one bucket.
+
 ### Residual risks
 
 - **Mixed time bases.** Demand still uses `TokensInUse`, a 1-minute peak, while capacity uses

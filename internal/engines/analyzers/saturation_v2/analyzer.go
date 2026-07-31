@@ -138,6 +138,10 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input domain.AnalyzerI
 		a.serviceRates.BeginCycle(a.now())
 	}
 
+	// The request shape that keys a workload bucket is a property of the variant, not
+	// of whichever replica happens to be reporting — see variantShape.
+	shapes := variantShapes(input.ReplicaMetrics)
+
 	// Phase 1: Per-replica capacity computation
 	replicaCapacities := make([]ReplicaCapacity, 0, len(input.ReplicaMetrics))
 	for _, rm := range input.ReplicaMetrics {
@@ -147,7 +151,8 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input domain.AnalyzerI
 		default:
 		}
 		gpuCount := gpusByVariant[rm.VariantName]
-		rc := a.computeReplicaCapacity(rm, satConfig, input.ModelID, input.Namespace, gpuCount, rolesByVariant[rm.VariantName])
+		rc := a.computeReplicaCapacity(rm, satConfig, input.ModelID, input.Namespace, gpuCount,
+			rolesByVariant[rm.VariantName], shapes[rm.VariantName])
 		if rc != nil {
 			replicaCapacities = append(replicaCapacities, *rc)
 		}
@@ -211,6 +216,7 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 	modelID, namespace string,
 	gpuCount int,
 	role string,
+	shape variantShape,
 ) *ReplicaCapacity {
 	if rm.TotalKvCapacityTokens <= 0 {
 		// TODO: implement proper demand estimation when vllm:cache_config_info is absent.
@@ -250,7 +256,8 @@ func (a *SaturationAnalyzer) computeReplicaCapacity(
 	// every replica of the variant and stable across cycles — see rateAnchoredK2 for
 	// why anything per-replica or per-cycle was unusable downstream.
 	var rateReference int64
-	if rateK2, ref, rateSrc, ok := a.rateAnchoredK2(rm, modelID, role, gpuCount, k1, config.QueueLengthThreshold, a.now()); ok {
+	if rateK2, ref, rateSrc, ok := a.rateAnchoredK2(rm, modelID, role, gpuCount, shape, k1,
+		config.QueueLengthThreshold, a.now()); ok {
 		k2, rateReference, k2Priority = rateK2, ref, rateSrc
 	}
 

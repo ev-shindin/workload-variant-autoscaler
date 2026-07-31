@@ -173,11 +173,39 @@ var _ = Describe("Bucket store — token ceiling", func() {
 	})
 
 	It("separates buckets by role and by input length", func() {
-		decode := serviceRateKey("m", "H100", domain.RoleDecode, 1, 1000, 250)
-		prefill := serviceRateKey("m", "H100", domain.RolePrefill, 1, 1000, 250)
-		shortIn := serviceRateKey("m", "H100", domain.RoleDecode, 1, 300, 250)
+		decode := serviceRateKey("m", "H100", domain.RoleDecode, 1, variantShape{1000, 250})
+		prefill := serviceRateKey("m", "H100", domain.RolePrefill, 1, variantShape{1000, 250})
+		shortIn := serviceRateKey("m", "H100", domain.RoleDecode, 1, variantShape{300, 250})
 		Expect(decode).NotTo(Equal(prefill))
-		Expect(decode).NotTo(Equal(shortIn))
+		Expect(decode).NotTo(Equal(shortIn),
+			"prompt lengths get their own thresholds; 300 and 1000 are different services")
+	})
+
+	It("keys on the variant's shape, so siblings cannot land in different buckets", func() {
+		// Two replicas of one variant, their averages a few tokens either side of the
+		// 500-token input threshold — sampling noise, not different workloads. Keyed
+		// per replica they would learn independent ceilings, and aggregateByVariant's
+		// median would then blend two figures that measure different things.
+		shapes := variantShapes([]domain.ReplicaMetrics{
+			{VariantName: "v1", AvgInputTokens: 498, AvgOutputTokens: 250},
+			{VariantName: "v1", AvgInputTokens: 506, AvgOutputTokens: 250},
+			{VariantName: "v2", AvgInputTokens: 4000, AvgOutputTokens: 250},
+		})
+		Expect(shapes).To(HaveLen(2))
+		Expect(shapes["v1"].avgInput).To(BeNumerically("~", 502, 0.01))
+
+		one := serviceRateKey("m", "H100", domain.RoleBoth, 1, shapes["v1"])
+		Expect(serviceRateKey("m", "H100", domain.RoleBoth, 1, shapes["v1"])).To(Equal(one))
+		Expect(serviceRateKey("m", "H100", domain.RoleBoth, 1, shapes["v2"])).NotTo(Equal(one))
+	})
+
+	It("ignores replicas reporting no shape at all", func() {
+		shapes := variantShapes([]domain.ReplicaMetrics{
+			{VariantName: "v1", AvgInputTokens: 1000, AvgOutputTokens: 250},
+			{VariantName: "v1"}, // scraped before it served anything
+		})
+		Expect(shapes["v1"].avgInput).To(BeNumerically("~", 1000, 0.01),
+			"a replica with no data must not halve the variant's shape")
 	})
 })
 
@@ -266,6 +294,7 @@ var _ = Describe("Rate-anchored k2", func() {
 		occupancy      = int64(64_000) // 16% of KV — the prefill-heavy regime
 	)
 	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+	shape := variantShape{avgInput: 1000, avgOutput: 250}
 
 	atLimit := func() domain.ReplicaMetrics {
 		return domain.ReplicaMetrics{
@@ -285,7 +314,7 @@ var _ = Describe("Rate-anchored k2", func() {
 	// observed, then look at the replica. Mirrors Analyze.
 	step := func(a *SaturationAnalyzer, rm domain.ReplicaMetrics, at time.Time) (int64, int64, k2Source, bool) {
 		a.serviceRates.BeginCycle(at)
-		return a.rateAnchoredK2(rm, "m", "", 1, k1, queueThreshold, at)
+		return a.rateAnchoredK2(rm, "m", "", 1, shape, k1, queueThreshold, at)
 	}
 
 	// learn drives enough cycles to establish both the service rate and the ceiling.
@@ -297,7 +326,7 @@ var _ = Describe("Rate-anchored k2", func() {
 
 	It("declines when the estimator is not enabled", func() {
 		a := NewSaturationAnalyzer(NewCapacityKnowledgeStore())
-		_, _, _, ok := a.rateAnchoredK2(atLimit(), "m", "", 1, k1, queueThreshold, now)
+		_, _, _, ok := a.rateAnchoredK2(atLimit(), "m", "", 1, shape, k1, queueThreshold, now)
 		Expect(ok).To(BeFalse())
 	})
 
@@ -334,7 +363,7 @@ var _ = Describe("Rate-anchored k2", func() {
 		cold.PodName = siblingPod
 		cold.QueueLength = 0
 		cold.ArrivalRate = 2.0
-		coldK2, _, coldSrc, ok := a.rateAnchoredK2(cold, "m", "", 1, k1, queueThreshold, now.Add(time.Minute))
+		coldK2, _, coldSrc, ok := a.rateAnchoredK2(cold, "m", "", 1, shape, k1, queueThreshold, now.Add(time.Minute))
 		Expect(ok).To(BeTrue())
 		Expect(coldSrc).To(Equal(k2SrcRateAnchored), "not at its limit: carrying the bucket's ceiling")
 		Expect(coldK2).To(Equal(hotK2), "the median across replicas must be a no-op")
@@ -350,7 +379,7 @@ var _ = Describe("Rate-anchored k2", func() {
 		for i, lambda := range []float64{8.0, 7.2, 8.6, 7.9, 8.3} {
 			rm.ArrivalRate = lambda
 			rm.QueueLength = 0
-			k2, _, _, ok := a.rateAnchoredK2(rm, "m", "", 1, k1, queueThreshold,
+			k2, _, _, ok := a.rateAnchoredK2(rm, "m", "", 1, shape, k1, queueThreshold,
 				now.Add(time.Duration(i)*15*time.Second))
 			Expect(ok).To(BeTrue())
 			seen = append(seen, k2)
@@ -372,15 +401,21 @@ var _ = Describe("Rate-anchored k2", func() {
 		// Queue drained but arrivals still at the service rate: the replica is at its
 		// limit, and the detector says so with no queue to go on.
 		rm.QueueLength = 0
+		rm.QueueLengthInstant, rm.HasQueueLengthInstant = 0, true
 		rm.TokensInUse = 48_000
-		k2, _, src, ok := step(a, rm, now.Add(time.Minute))
+		rm.KvUsageInstant = 48_000 / float64(kvCapacity)
+		k2, ref, src, ok := step(a, rm, now.Add(time.Minute))
 		Expect(ok).To(BeTrue())
 		Expect(src).To(Equal(k2SrcRateBacklog), "the arrivals path fired without a queue")
-		// The lower occupancy must NOT become the new ceiling. With no queue it is
-		// evidence the replica is keeping up, not evidence its limit has fallen —
-		// recording it would ratchet capacity down on evidence of health. (Within a
-		// per-cent: an unrefreshed ceiling relaxes upward with age.)
-		Expect(k2).To(BeNumerically("~", occupancy, float64(occupancy)*0.01))
+
+		// Capacity is held at what the replica is holding right now, so demand meets it
+		// and the fleet scales before a queue forms. Waiting for the queue would put
+		// the ~90 s a replica takes to start on top of a backlog already building.
+		Expect(k2).To(BeNumerically("~", 48_000, 1))
+
+		// The learned ceiling itself is untouched: with no queue, a lower occupancy is
+		// evidence the replica is keeping up, not evidence its limit has fallen.
+		Expect(ref).To(BeNumerically("~", occupancy, float64(occupancy)*0.01))
 	})
 
 	It("uses completions as arrivals when there is no EPP and no queue", func() {
@@ -403,7 +438,7 @@ var _ = Describe("Rate-anchored k2", func() {
 		rm := atLimit()
 		rm.QueueLength = 0
 		rm.ArrivalRate = 1.0
-		_, _, _, ok := a.rateAnchoredK2(rm, "m", "", 1, k1, queueThreshold, now)
+		_, _, _, ok := a.rateAnchoredK2(rm, "m", "", 1, shape, k1, queueThreshold, now)
 		Expect(ok).To(BeFalse())
 	})
 
@@ -411,7 +446,7 @@ var _ = Describe("Rate-anchored k2", func() {
 		a := NewSaturationAnalyzer(NewCapacityKnowledgeStore(), withRateAnchoredK2(true))
 		rm := atLimit()
 		rm.TokensInUse = 0 // just became ready, KV still empty
-		_, _, _, ok := a.rateAnchoredK2(rm, "m", "", 1, k1, queueThreshold, now)
+		_, _, _, ok := a.rateAnchoredK2(rm, "m", "", 1, shape, k1, queueThreshold, now)
 		Expect(ok).To(BeFalse())
 	})
 
@@ -420,7 +455,7 @@ var _ = Describe("Rate-anchored k2", func() {
 		rm := atLimit()
 		rm.QueueLength = 1 // arrival jitter, not a limit
 		for i := 0; i < 5; i++ {
-			_, _, _, ok := a.rateAnchoredK2(rm, "m", "", 1, k1, queueThreshold, now)
+			_, _, _, ok := a.rateAnchoredK2(rm, "m", "", 1, shape, k1, queueThreshold, now)
 			Expect(ok).To(BeFalse())
 		}
 	})
@@ -479,7 +514,7 @@ var _ = Describe("Rate-anchored k2", func() {
 			rm.QueueLength = 0
 			rm.ArrivalRate = bad
 			rm.RequestRate = 0
-			k2, _, _, ok := a.rateAnchoredK2(rm, "m", "", 1, k1, queueThreshold, now)
+			k2, _, _, ok := a.rateAnchoredK2(rm, "m", "", 1, shape, k1, queueThreshold, now)
 			if ok {
 				Expect(k2).To(BeNumerically(">", 0))
 			}
@@ -492,7 +527,7 @@ var _ = Describe("Rate-anchored k2", func() {
 		dec := atLimit()
 		dec.RequestRate, dec.ArrivalRate = 20, 20
 		for i := 0; i < MinServiceRateSamples+1; i++ {
-			_, _, _, _ = a.rateAnchoredK2(dec, "m", domain.RoleDecode, 1, k1, queueThreshold, now)
+			_, _, _, _ = a.rateAnchoredK2(dec, "m", domain.RoleDecode, 1, shape, k1, queueThreshold, now)
 		}
 
 		// A prefill replica of the same model on the same accelerator must not
@@ -501,7 +536,7 @@ var _ = Describe("Rate-anchored k2", func() {
 		pre.PodName = "pod-p"
 		pre.QueueLength = 0
 		pre.ArrivalRate = 3
-		_, _, _, ok := a.rateAnchoredK2(pre, "m", domain.RolePrefill, 1, k1, queueThreshold, now)
+		_, _, _, ok := a.rateAnchoredK2(pre, "m", domain.RolePrefill, 1, shape, k1, queueThreshold, now)
 		Expect(ok).To(BeFalse())
 	})
 
@@ -512,7 +547,7 @@ var _ = Describe("Rate-anchored k2", func() {
 		rm.RequestRate = 0
 		for i := 0; i < 5; i++ {
 			a.serviceRates.BeginCycle(now.Add(time.Duration(i) * 15 * time.Second))
-			_, _, _, ok := a.rateAnchoredK2(rm, "m", domain.RolePrefill, 1, k1, queueThreshold,
+			_, _, _, ok := a.rateAnchoredK2(rm, "m", domain.RolePrefill, 1, shape, k1, queueThreshold,
 				now.Add(time.Duration(i)*15*time.Second))
 			// No completions means no service rate and no ceiling: there is nothing to
 			// measure a limit from, so the estimator declines rather than inventing one
@@ -568,6 +603,7 @@ var _ = Describe("Rate-anchored k2 at the current operating point", func() {
 		interval       = 15 * time.Second
 	)
 	start := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
+	shape := variantShape{avgInput: 1000, avgOutput: 250}
 
 	// The numbers are Little's-law consistent, or the arithmetic below would be a
 	// coincidence rather than the property under test: a replica serving mu = 8 req/s
@@ -603,7 +639,7 @@ var _ = Describe("Rate-anchored k2 at the current operating point", func() {
 	// cycle mirrors production: freeze the bucket's operating point, then compute.
 	cycle := func(a *SaturationAnalyzer, rm domain.ReplicaMetrics, at time.Time) (int64, int64, k2Source, bool) {
 		a.serviceRates.BeginCycle(at)
-		return a.rateAnchoredK2(rm, "m", "", 1, k1, queueThreshold, at)
+		return a.rateAnchoredK2(rm, "m", "", 1, shape, k1, queueThreshold, at)
 	}
 
 	run := func(a *SaturationAnalyzer, rm domain.ReplicaMetrics, from time.Time, n int) (int64, k2Source) {
@@ -679,8 +715,8 @@ var _ = Describe("Rate-anchored k2 at the current operating point", func() {
 		second.AvgTTFT = 0.9
 		second.AvgITL = 0.03 // a materially longer W than pod-a's
 
-		k2a, _, _, _ := a.rateAnchoredK2(first, "m", "", 1, k1, queueThreshold, at)
-		k2b, _, _, _ := a.rateAnchoredK2(second, "m", "", 1, k1, queueThreshold, at)
+		k2a, _, _, _ := a.rateAnchoredK2(first, "m", "", 1, shape, k1, queueThreshold, at)
+		k2b, _, _, _ := a.rateAnchoredK2(second, "m", "", 1, shape, k1, queueThreshold, at)
 		Expect(k2b).To(Equal(k2a))
 	})
 
@@ -698,7 +734,7 @@ var _ = Describe("Rate-anchored k2 at the current operating point", func() {
 		for i := 0; i < 5; i++ {
 			at := start.Add(time.Duration(i) * interval)
 			a.serviceRates.BeginCycle(at)
-			k2, _, src, ok = a.rateAnchoredK2(blind, "m", "", 1, k1, queueThreshold, at)
+			k2, _, src, ok = a.rateAnchoredK2(blind, "m", "", 1, shape, k1, queueThreshold, at)
 		}
 		Expect(ok).To(BeTrue())
 		Expect(k2).To(BeNumerically("~", 60_000, 600))
@@ -713,6 +749,7 @@ var _ = Describe("Rate-anchored k2 operating point across siblings", func() {
 		interval       = 15 * time.Second
 	)
 	start := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
+	shape := variantShape{avgInput: 1000, avgOutput: 250}
 
 	atLimit := func() domain.ReplicaMetrics {
 		return domain.ReplicaMetrics{
@@ -735,7 +772,7 @@ var _ = Describe("Rate-anchored k2 operating point across siblings", func() {
 		for i := 0; i < MinServiceRateSamples+1; i++ {
 			at := start.Add(time.Duration(i) * interval)
 			a.serviceRates.BeginCycle(at)
-			_, _, _, _ = a.rateAnchoredK2(atLimit(), "m", "", 1, k1, queueThreshold, at)
+			_, _, _, _ = a.rateAnchoredK2(atLimit(), "m", "", 1, shape, k1, queueThreshold, at)
 		}
 
 		// One cycle, two replicas with materially different residences: 3 s and 1.2 s,
@@ -754,8 +791,8 @@ var _ = Describe("Rate-anchored k2 operating point across siblings", func() {
 		for i := 3; i < 43; i++ { // long enough for the smoothed value to settle
 			at := start.Add(time.Duration(i) * interval)
 			a.serviceRates.BeginCycle(at)
-			k2, _, src, ok = a.rateAnchoredK2(slow, "m", "", 1, k1, queueThreshold, at)
-			_, _, _, _ = a.rateAnchoredK2(fast, "m", "", 1, k1, queueThreshold, at)
+			k2, _, src, ok = a.rateAnchoredK2(slow, "m", "", 1, shape, k1, queueThreshold, at)
+			_, _, _, _ = a.rateAnchoredK2(fast, "m", "", 1, shape, k1, queueThreshold, at)
 		}
 
 		Expect(ok).To(BeTrue())
@@ -769,6 +806,7 @@ var _ = Describe("Rate-anchored k2 operating point across siblings", func() {
 
 var _ = Describe("Rate-anchored k2 ceiling measurement", func() {
 	now := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
+	shape := variantShape{avgInput: 1000, avgOutput: 250}
 
 	It("measures the limit from the instantaneous reading, not the minute's peak", func() {
 		a := NewSaturationAnalyzer(NewCapacityKnowledgeStore(), withRateAnchoredK2(true))
@@ -788,13 +826,13 @@ var _ = Describe("Rate-anchored k2 ceiling measurement", func() {
 		for i := 0; i <= MinServiceRateSamples+1; i++ {
 			at := now.Add(time.Duration(i) * 15 * time.Second)
 			a.serviceRates.BeginCycle(at)
-			_, _, _, _ = a.rateAnchoredK2(rm, "m", "", 1, 320_000, 5.0, at)
+			_, _, _, _ = a.rateAnchoredK2(rm, "m", "", 1, shape, 320_000, 5.0, at)
 		}
 
 		// The ceiling is a running minimum, so feeding it a peak biases it high in the
 		// one direction that costs replicas.
 		a.serviceRates.BeginCycle(now.Add(time.Minute))
-		k2, _, _, ok := a.rateAnchoredK2(rm, "m", "", 1, 320_000, 5.0, now.Add(time.Minute))
+		k2, _, _, ok := a.rateAnchoredK2(rm, "m", "", 1, shape, 320_000, 5.0, now.Add(time.Minute))
 		Expect(ok).To(BeTrue())
 		Expect(k2).To(BeNumerically("~", 60_000, 600))
 	})
@@ -814,10 +852,10 @@ var _ = Describe("Rate-anchored k2 ceiling measurement", func() {
 		for i := 0; i <= MinServiceRateSamples+1; i++ {
 			at := now.Add(time.Duration(i) * 15 * time.Second)
 			a.serviceRates.BeginCycle(at)
-			_, _, _, _ = a.rateAnchoredK2(rm, "m", "", 1, 320_000, 5.0, at)
+			_, _, _, _ = a.rateAnchoredK2(rm, "m", "", 1, shape, 320_000, 5.0, at)
 		}
 		a.serviceRates.BeginCycle(now.Add(time.Minute))
-		k2, _, _, ok := a.rateAnchoredK2(rm, "m", "", 1, 320_000, 5.0, now.Add(time.Minute))
+		k2, _, _, ok := a.rateAnchoredK2(rm, "m", "", 1, shape, 320_000, 5.0, now.Add(time.Minute))
 		Expect(ok).To(BeTrue())
 		Expect(k2).To(BeNumerically("~", 120_000, 1200))
 	})
@@ -830,6 +868,7 @@ var _ = Describe("Rate-anchored k2 responsiveness", func() {
 		interval       = 15 * time.Second
 	)
 	start := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
+	shape := variantShape{avgInput: 1000, avgOutput: 250}
 
 	base := func() domain.ReplicaMetrics {
 		return domain.ReplicaMetrics{
@@ -856,7 +895,7 @@ var _ = Describe("Rate-anchored k2 responsiveness", func() {
 		for i := 0; i < 5; i++ {
 			at := start.Add(time.Duration(i) * interval)
 			a.serviceRates.BeginCycle(at)
-			_, _, _, _ = a.rateAnchoredK2(base(), "m", "", 1, k1, queueThreshold, at)
+			_, _, _, _ = a.rateAnchoredK2(base(), "m", "", 1, shape, k1, queueThreshold, at)
 		}
 
 		// Load steps up: more queued, more resident, and a longer residence because
@@ -869,7 +908,7 @@ var _ = Describe("Rate-anchored k2 responsiveness", func() {
 
 		at := start.Add(5 * interval)
 		a.serviceRates.BeginCycle(at)
-		k2, _, _, ok := a.rateAnchoredK2(ramp, "m", "", 1, k1, queueThreshold, at)
+		k2, _, _, ok := a.rateAnchoredK2(ramp, "m", "", 1, shape, k1, queueThreshold, at)
 
 		Expect(ok).To(BeTrue())
 		// Clamped at the measured ceiling: an inflated residence is queueing time, and

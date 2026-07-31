@@ -587,10 +587,56 @@ func smoothingTau(rm domain.ReplicaMetrics) float64 {
 // property of the request shape, and 1000-token prompts and 300-token prompts are
 // different services on the same hardware. Keying only by output length would
 // average them.
-func serviceRateKey(modelID, accelerator, role string, gpuCount int, avgInput, avgOutput float64) string {
+func serviceRateKey(modelID, accelerator, role string, gpuCount int, shape variantShape) string {
 	return fmt.Sprintf("%s|%s|%s|%d|in:%s|out:%s",
 		modelID, accelerator, canonicalRole(role), gpuCount,
-		classifyInputLength(avgInput), classifyOutputLength(avgOutput))
+		classifyInputLength(shape.avgInput), classifyOutputLength(shape.avgOutput))
+}
+
+// variantShape is the request shape of a variant as a whole, averaged over its live
+// replicas.
+//
+// The shape has to come from the variant, not from each replica, even though the
+// metrics are per-replica. Replicas of one variant serve the same traffic, so their
+// averages differ only by sampling noise — but that noise is enough to put two
+// siblings either side of a bucket threshold, and then they learn independent
+// ceilings and service rates. aggregateByVariant takes the MEDIAN of per-replica
+// capacities, so the two figures get blended even though they measure different
+// things, and a variant whose average sits near a threshold flips its whole estimate
+// every cycle as replicas drift across it. Keying on the variant makes the boundary a
+// property of the workload rather than of individual scrapes.
+type variantShape struct {
+	avgInput  float64
+	avgOutput float64
+}
+
+// variantShapes averages the request shape across each variant's replicas.
+func variantShapes(metrics []domain.ReplicaMetrics) map[string]variantShape {
+	type acc struct {
+		in, out float64
+		n       float64
+	}
+	sums := make(map[string]*acc, len(metrics))
+	for _, rm := range metrics {
+		if rm.AvgInputTokens <= 0 && rm.AvgOutputTokens <= 0 {
+			continue
+		}
+		a, ok := sums[rm.VariantName]
+		if !ok {
+			a = &acc{}
+			sums[rm.VariantName] = a
+		}
+		a.in += rm.AvgInputTokens
+		a.out += rm.AvgOutputTokens
+		a.n++
+	}
+	shapes := make(map[string]variantShape, len(sums))
+	for variant, a := range sums {
+		if a.n > 0 {
+			shapes[variant] = variantShape{avgInput: a.in / a.n, avgOutput: a.out / a.n}
+		}
+	}
+	return shapes
 }
 
 // rateAnchoredK2 returns the compute-bound capacity in KV tokens for this
@@ -616,6 +662,7 @@ func (a *SaturationAnalyzer) rateAnchoredK2(
 	modelID string,
 	role string,
 	gpuCount int,
+	shape variantShape,
 	k1 int64,
 	queueThreshold float64,
 	now time.Time,
@@ -624,7 +671,7 @@ func (a *SaturationAnalyzer) rateAnchoredK2(
 		return 0, 0, 0, false
 	}
 
-	key := serviceRateKey(modelID, rm.AcceleratorName, role, gpuCount, rm.AvgInputTokens, rm.AvgOutputTokens)
+	key := serviceRateKey(modelID, rm.AcceleratorName, role, gpuCount, shape)
 
 	// Detector and measurement, read at the same instant — see limitEvidence.
 	backlogged, occupancy := limitEvidence(rm, queueThreshold)
@@ -673,6 +720,20 @@ func (a *SaturationAnalyzer) rateAnchoredK2(
 	if scaled, ok := a.residenceScaledCapacity(key, ceiling, now); ok {
 		capacity = clampCeiling(scaled, k1)
 		src = k2SrcRateResidence
+	}
+
+	// Arrivals have caught up with the service rate while nothing has queued yet. The
+	// replica is at its limit, and reporting capacity above what it is already holding
+	// would hide that until a queue forms. Waiting for the queue is what this cannot
+	// afford: a replica takes about ninety seconds from decision to serving, so the
+	// backlog that accumulates while one starts is set by how early the decision was
+	// made. Capacity is held at the current occupancy, which reads as fully utilized
+	// without claiming the replica is over its limit.
+	//
+	// One direction only, and floored by clampCeiling, so a mis-scraped arrival rate
+	// cannot drive capacity toward zero.
+	if atLimit && !backlogged && occupancy > 0 && occupancy < float64(capacity) {
+		capacity = clampCeiling(occupancy, k1)
 	}
 	return capacity, reference, src, true
 }

@@ -24,6 +24,7 @@ var _ = Describe("Rate-anchored k2 through computeReplicaCapacity", func() {
 	)
 
 	start := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
+	shape := variantShape{avgInput: 1000, avgOutput: 250}
 
 	scalingConfig := func() *config.SaturationScalingConfig {
 		return &config.SaturationScalingConfig{
@@ -65,7 +66,7 @@ var _ = Describe("Rate-anchored k2 through computeReplicaCapacity", func() {
 		for i := 0; i <= MinServiceRateSamples+1; i++ {
 			clock = clock.Add(15 * time.Second)
 			a.serviceRates.BeginCycle(clock)
-			rc = a.computeReplicaCapacity(rm, cfg, modelID, namespace, 1, domain.RoleBoth)
+			rc = a.computeReplicaCapacity(rm, cfg, modelID, namespace, 1, domain.RoleBoth, shape)
 		}
 		Expect(rc).NotTo(BeNil())
 		Expect(rc.K2Priority).To(BeElementOf(k2SrcRateBacklog, k2SrcRateAnchored))
@@ -86,13 +87,13 @@ var _ = Describe("Rate-anchored k2 through computeReplicaCapacity", func() {
 		Expect(off.serviceRates).To(BeNil(), "guards the default of EnableRateAnchoredK2")
 		Expect(off.arrivals).To(BeNil())
 
-		baseline := off.computeReplicaCapacity(rm, cfg, modelID, namespace, 1, domain.RoleBoth)
+		baseline := off.computeReplicaCapacity(rm, cfg, modelID, namespace, 1, domain.RoleBoth, shape)
 		Expect(baseline).NotTo(BeNil())
 		Expect(baseline.K2Priority).NotTo(Equal(k2SrcRateAnchored))
 		Expect(baseline.K2Priority).NotTo(Equal(k2SrcRateBacklog))
 
 		again := NewSaturationAnalyzer(NewCapacityKnowledgeStore())
-		repeat := again.computeReplicaCapacity(rm, cfg, modelID, namespace, 1, domain.RoleBoth)
+		repeat := again.computeReplicaCapacity(rm, cfg, modelID, namespace, 1, domain.RoleBoth, shape)
 		Expect(repeat.EffectiveCapacity).To(Equal(baseline.EffectiveCapacity))
 		Expect(repeat.MemoryBoundCapacity).To(Equal(baseline.MemoryBoundCapacity))
 		Expect(repeat.ComputeBoundCapacity).To(Equal(baseline.ComputeBoundCapacity))
@@ -122,8 +123,8 @@ var _ = Describe("Rate-anchored k2 through computeReplicaCapacity", func() {
 		on := NewSaturationAnalyzer(NewCapacityKnowledgeStore(), withRateAnchoredK2(true), withClock(tick))
 		for i := 0; i < MinServiceRateSamples+1; i++ {
 			on.serviceRates.BeginCycle(clock)
-			_ = off.computeReplicaCapacity(peak, cfg, modelID, namespace, 1, domain.RoleBoth)
-			_ = on.computeReplicaCapacity(peak, cfg, modelID, namespace, 1, domain.RoleBoth)
+			_ = off.computeReplicaCapacity(peak, cfg, modelID, namespace, 1, domain.RoleBoth, shape)
+			_ = on.computeReplicaCapacity(peak, cfg, modelID, namespace, 1, domain.RoleBoth, shape)
 		}
 
 		// Queue drained and contention with it: residence falls to 6 s, so occupancy
@@ -144,8 +145,8 @@ var _ = Describe("Rate-anchored k2 through computeReplicaCapacity", func() {
 		var occupancyBased, rateBased *ReplicaCapacity
 		for i := 0; i < 40; i++ { // the operating point is smoothed over about a minute
 			on.serviceRates.BeginCycle(clock)
-			occupancyBased = off.computeReplicaCapacity(drained, cfg, modelID, namespace, 1, domain.RoleBoth)
-			rateBased = on.computeReplicaCapacity(drained, cfg, modelID, namespace, 1, domain.RoleBoth)
+			occupancyBased = off.computeReplicaCapacity(drained, cfg, modelID, namespace, 1, domain.RoleBoth, shape)
+			rateBased = on.computeReplicaCapacity(drained, cfg, modelID, namespace, 1, domain.RoleBoth, shape)
 		}
 
 		// The occupancy path answers from its inflated history and reports abundant
@@ -182,16 +183,16 @@ var _ = Describe("Rate-anchored k2 through computeReplicaCapacity", func() {
 		for i := 0; i <= MinServiceRateSamples+1; i++ {
 			clock = clock.Add(15 * time.Second)
 			a.serviceRates.BeginCycle(clock)
-			_ = a.computeReplicaCapacity(hot, cfg, modelID, namespace, 1, domain.RoleBoth)
+			_ = a.computeReplicaCapacity(hot, cfg, modelID, namespace, 1, domain.RoleBoth, shape)
 		}
 		a.serviceRates.BeginCycle(clock.Add(15 * time.Second))
-		hotRC := a.computeReplicaCapacity(hot, cfg, modelID, namespace, 1, domain.RoleBoth)
+		hotRC := a.computeReplicaCapacity(hot, cfg, modelID, namespace, 1, domain.RoleBoth, shape)
 
 		cold := atLimit()
 		cold.PodName = siblingPod
 		cold.QueueLength = 0
 		cold.ArrivalRate = 2.0
-		coldRC := a.computeReplicaCapacity(cold, cfg, modelID, namespace, 1, domain.RoleBoth)
+		coldRC := a.computeReplicaCapacity(cold, cfg, modelID, namespace, 1, domain.RoleBoth, shape)
 
 		// aggregateByVariant takes the MEDIAN of per-replica capacities. Equal values
 		// make that median a no-op, so an idle sibling cannot lift variant capacity
