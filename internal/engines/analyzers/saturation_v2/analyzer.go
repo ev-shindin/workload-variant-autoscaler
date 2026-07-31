@@ -549,7 +549,11 @@ func (a *SaturationAnalyzer) aggregateByVariant(
 			if rm.ArrivalRate > 0 {
 				arrivals += rm.ArrivalRate
 			} else {
-				arrivals += rm.RequestRate
+				// Same role-aware choice the service rate makes: a prefill replica
+				// completes few or no generations, so falling back to the generation
+				// rate would read its arrivals as zero and silently disable the floor
+				// for the role that needs it most.
+				arrivals += completionRate(rm, vs.Role)
 			}
 		}
 		var requiredServiceRate float64
