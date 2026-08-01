@@ -329,6 +329,39 @@ as replicas drift across it. Input and output thresholds are also separate now: 
 run an order of magnitude longer than generations, and bucketing input at the output
 thresholds put almost every real workload in one bucket.
 
+### Residence must be service time
+
+The operating point is `mu x W x tokensPerRequest`, and `W` has to be the time a request
+spends *being served*. Reading it as `TTFT + outputTokens x ITL` does not give that:
+TTFT is measured from arrival at the engine, so it carries time queued.
+
+The validation runs made the consequence visible. `RATE-W` — the only label under which
+capacity is scaled below the learned ceiling, and so the only mechanism that can prevent
+the post-drain shed — fired **once in thirty-five minutes** on prefill-heavy traffic
+against **twenty-seven times** on symmetric traffic in the same build. Under backlog the
+inflated `W` pushes `mu x W x tokensPerRequest` past the ceiling, the clamp holds capacity
+there, and the ceiling on that workload is measured while a one or two replica fleet sits
+at near-full KV — so it lands at the memory bound, which is what the occupancy path
+already returns. ON and OFF producing the same numbers follows from that.
+
+The decode half was never contaminated: inter-token latency contains no queue wait. Only
+prefill is, and it can be measured directly, because during a cycle with nothing queued
+TTFT *is* prefill. Buckets learn it then and reuse it when the queue is deep, retaining it
+for the bucket's lifetime rather than the service-rate window — prefill is a property of
+model, hardware and prompt length, all of which are in the bucket key, and it can only be
+observed in the unqueued cycles a busy fleet does not have.
+
+Where vLLM publishes `request_inference_time_seconds` (time in the RUNNING phase, queue
+wait already excluded) that is preferred outright, since the derived prefill is sampled
+uncontended while real prefill grows under load. SGLang publishes no equivalent among its
+seventeen metrics, so it takes the derived path, which needs nothing not already
+collected.
+
+Worth knowing where the derived form is weakest: long prompts with short generations,
+where prefill dominates residence rather than being a couple of per cent of it. It
+understates residence there, therefore understates capacity, therefore asks for more
+replicas rather than fewer — the tolerable direction, and the case the vLLM metric covers.
+
 ### The scale-down floor
 
 Capacity estimation alone cannot make a scale-down safe, because the decision is a

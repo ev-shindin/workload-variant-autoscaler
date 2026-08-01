@@ -157,6 +157,11 @@ type ReplicaMetrics struct {
 	// generations.
 	PromptTokenRate float64
 
+	// AvgInferenceTime is the average seconds a request spends being served on this
+	// replica, with time queued excluded. Published by vLLM; 0 on engines that do not
+	// expose it, where the analyzer derives the same quantity instead.
+	AvgInferenceTime float64
+
 	// RequestRate is the engine-side request completion rate on this replica (req/s).
 	// Engine-agnostic: derived per pod from rate(vllm:request_generation_tokens_count[1m])
 	// for vLLM and rate(sglang:generation_tokens_histogram_count[1m]) for SGLang.

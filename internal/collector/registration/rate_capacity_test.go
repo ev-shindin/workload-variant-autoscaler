@@ -22,7 +22,8 @@ var _ = Describe("RegisterRateCapacityQueries", func() {
 		registry *source.SourceRegistry
 	)
 
-	shared := []string{QueryKvUsageInstant, QueryQueueLengthInstant, QueryRequestRate}
+	shared := []string{QueryKvUsageInstant, QueryQueueLengthInstant, QueryRequestRate,
+		QueryPromptTokenRate, QueryInferenceTime}
 
 	withPrometheus := func() *source.QueryList {
 		metricsSource := prometheus.NewPrometheusSource(ctx, &mockPrometheusAPI{},
@@ -43,9 +44,14 @@ var _ = Describe("RegisterRateCapacityQueries", func() {
 		for _, name := range shared {
 			Expect(queryList.Get(name)).NotTo(BeNil(), name)
 		}
-		for _, name := range []string{QueryKvUsageInstant, QueryQueueLengthInstant, QueryRequestRate} {
+		for _, name := range []string{QueryKvUsageInstant, QueryQueueLengthInstant,
+			QueryRequestRate, QueryPromptTokenRate} {
 			Expect(queryList.Get(EngineQuery(inferenceengine.EngineSGLang, name))).NotTo(BeNil(), name)
 		}
+		// Deliberately vLLM-only: SGLang publishes nothing that measures time in the
+		// running phase, so the bare query returns nothing there and the analyzer
+		// derives the value instead.
+		Expect(IsEngineSpecific(QueryInferenceTime)).To(BeFalse())
 	})
 
 	It("tolerates the throughput analyzer registering first", func() {

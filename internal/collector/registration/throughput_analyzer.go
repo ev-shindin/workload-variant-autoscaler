@@ -62,6 +62,10 @@ const (
 	// service rate of a prefill replica.
 	QueryPromptTokenRate = "prompt_token_rate"
 
+	// QueryInferenceTime is the query name for average time a request spends being
+	// served, excluding time queued. vLLM only — see inferenceTimeQuery.
+	QueryInferenceTime = "inference_time"
+
 	// QueryRequestRate is the query name for the engine-side request completion
 	// rate per pod (req/s), derived from the generation tokens histogram count.
 	// It is engine-agnostic: the vLLM variant reads

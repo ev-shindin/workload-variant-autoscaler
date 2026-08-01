@@ -72,6 +72,11 @@ const (
 	// Five minutes is responsive within a load stage without chasing a single scrape.
 	ServiceRateSmoothingWindow = 5 * time.Minute
 
+	// PrefillSmoothingWindow is the time constant over which a bucket learns how long
+	// prefill takes when nothing is waiting. Long, because the observations are sparse
+	// by construction: only unqueued cycles qualify.
+	PrefillSmoothingWindow = 10 * time.Minute
+
 	// WorkWindow is the window the bucket's operating point is held over, and it
 	// mirrors the demand side exactly: TokensInUse and QueueLength are collected as
 	// max_over_time(...[1m]), so the operating point is the MAXIMUM of what replicas
@@ -173,6 +178,12 @@ type bucketEntry struct {
 	ceilingHas    bool
 	pendingLower  float64 // a lower reading waiting to be confirmed by another cycle
 	pendingCycles int
+
+	prefill      float64 // time to first token with nothing queued, in seconds
+	prefillKnown bool
+	prefillSeen  time.Time
+	prefillSum   float64
+	prefillCount int
 
 	workSeen    time.Time
 	workSamples []workSample // one per cycle, held for WorkWindow
@@ -358,6 +369,46 @@ func (s *bucketStore) ObserveWork(key string, work float64, now time.Time) {
 	e.workCount++
 }
 
+// ObservePrefill records a time-to-first-token measured while nothing was waiting.
+//
+// Callers must only pass readings taken with an empty queue. That is the whole point:
+// TTFT is measured from arrival at the engine, so it carries queue wait, and under
+// backlog it is inflated several-fold. Sampled with no queue it is prefill alone.
+func (s *bucketStore) ObservePrefill(key string, ttft float64, now time.Time) {
+	if !(ttft > 0) || math.IsInf(ttft, 0) {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	e := s.entry(key, now)
+	e.prefillSum += ttft
+	e.prefillCount++
+}
+
+// Prefill returns the bucket's uncontended prefill time, and false when none has been
+// observed or it has gone stale.
+func (s *bucketStore) Prefill(key string, now time.Time) (float64, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	e, ok := s.entries[key]
+	if !ok || !e.prefillKnown || e.prefill <= 0 {
+		return 0, false
+	}
+	// Retained for the bucket's lifetime rather than the service-rate window. Prefill
+	// time is a property of the model, the hardware and the prompt length, all of
+	// which are in the bucket key, so it does not drift the way a service rate does.
+	// And it can only be observed while nothing is queued — precisely the cycles a
+	// busy fleet does not have. Expiring it after thirty minutes would mean a
+	// sustained overload silently reverting to the queue-contaminated residence at
+	// the worst possible moment.
+	if now.Sub(e.prefillSeen) > HistoryEvictionTimeout {
+		return 0, false
+	}
+	return e.prefill, true
+}
+
 // FrozenWork returns the work-per-request every replica of the bucket scales by
 // this cycle, and false when none has been frozen yet.
 func (s *bucketStore) FrozenWork(key string, now time.Time) (float64, bool) {
@@ -412,6 +463,18 @@ func (s *bucketStore) BeginCycle(now time.Time) {
 		if e.ceilingHas {
 			e.applyCeiling(e.ceilingSum, now)
 			e.ceilingSum, e.ceilingHas = 0, false
+		}
+
+		if e.prefillCount > 0 {
+			sample := e.prefillSum / float64(e.prefillCount)
+			e.prefillSum, e.prefillCount = 0, 0
+			if e.prefillKnown {
+				e.prefill = ewmaStep(e.prefill, sample, now.Sub(e.prefillSeen).Seconds(),
+					PrefillSmoothingWindow.Seconds())
+			} else {
+				e.prefill, e.prefillKnown = sample, true
+			}
+			e.prefillSeen = now
 		}
 
 		if e.workCount > 0 {
@@ -533,6 +596,60 @@ func (s *arrivalSmoother) EvictStale(timeout time.Duration, now time.Time) int {
 		}
 	}
 	return removed
+}
+
+// queueIsEmpty reports whether nothing is waiting on this replica right now. The
+// instantaneous reading is required: QueueLength is a one-minute peak and latches, so
+// it would keep claiming a queue for a minute after the last one cleared.
+func queueIsEmpty(rm domain.ReplicaMetrics) bool {
+	return rm.HasQueueLengthInstant && rm.QueueLengthInstant == 0
+}
+
+// serviceResidence is how long a request occupies the replica while it is being
+// served — excluding time spent waiting to be scheduled.
+//
+// This is the quantity Little's law needs to turn a service rate into a token count.
+// The obvious reading, TTFT + outputTokens x ITL, is not it: TTFT is measured from
+// arrival at the engine, so under backlog it carries queue wait and inflates several
+// fold. Capacity computed from it then exceeds the learned ceiling, the clamp holds it
+// there, and on a queueing workload the estimator spends the entire run reporting the
+// ceiling — which is measured at near-full KV and lands at the memory bound. That is
+// visible in the validation runs as RATE-W firing once in thirty-five minutes on
+// prefill-heavy traffic against twenty-seven times on symmetric traffic.
+//
+// The decode half is already clean: inter-token latency contains no queue wait. Only
+// the prefill half is contaminated, and it can be measured directly — during cycles
+// with nothing queued, TTFT *is* prefill. So the bucket learns it then and reuses it
+// when the queue is deep.
+//
+// Falls back to the contaminated form when no unqueued cycle has been seen yet, which
+// is no worse than the previous behaviour and still bounded by the clamp. vLLM
+// publishes request_inference_time_seconds, which measures this directly and would be
+// authoritative where available; SGLang has no equivalent, and deriving it works for
+// both engines from metrics already collected.
+func (a *SaturationAnalyzer) serviceResidence(rm domain.ReplicaMetrics, key string, now time.Time) float64 {
+	// Measured directly where the engine publishes it. Preferred over the derived
+	// form because the derived prefill is sampled while nothing is queued, and real
+	// prefill grows under contention — an error that matters most where prefill is a
+	// large share of the residence, which is exactly where this metric is worth having.
+	if rm.AvgInferenceTime > 0 && rm.AvgInferenceTime <= MaxResidenceSeconds {
+		return rm.AvgInferenceTime
+	}
+	prefill, ok := a.serviceRates.Prefill(key, now)
+	if !ok {
+		return residenceSeconds(rm)
+	}
+	if rm.AvgITL <= 0 || rm.AvgOutputTokens <= 0 {
+		return residenceSeconds(rm)
+	}
+	w := prefill + rm.AvgOutputTokens*rm.AvgITL
+	if w <= 0 || math.IsNaN(w) || math.IsInf(w, 0) {
+		return residenceSeconds(rm)
+	}
+	if w > MaxResidenceSeconds {
+		return MaxResidenceSeconds
+	}
+	return w
 }
 
 // residenceSeconds estimates how long a request occupies the replica: time to the
@@ -700,7 +817,13 @@ func (a *SaturationAnalyzer) rateAnchoredK2(
 	// Every cycle, at the limit or not, contributes to the bucket's work-per-request.
 	// It is the operating point, not a measurement of the limit, so it is recorded
 	// unconditionally — the whole point is to know how far below the limit we sit.
-	if residence := residenceSeconds(rm); residence > 0 {
+	// With nothing queued, time to first token is prefill and nothing else. Learning
+	// it here is what lets the operating point be computed from service time when the
+	// queue is deep and TTFT no longer can be.
+	if !backlogged && queueIsEmpty(rm) && rm.AvgTTFT > 0 {
+		a.serviceRates.ObservePrefill(key, rm.AvgTTFT, now)
+	}
+	if residence := a.serviceResidence(rm, key, now); residence > 0 {
 		a.serviceRates.ObserveWork(key, residence*tokensPerRequest(rm), now)
 	}
 

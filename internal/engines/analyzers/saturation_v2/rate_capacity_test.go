@@ -958,3 +958,113 @@ var _ = Describe("Rate-anchored k2 responsiveness", func() {
 			int(WorkWindow/interval)+1), "bounded by the window, not by the run length")
 	})
 })
+
+// The validation runs showed RATE-W — the only label where capacity is scaled below
+// the learned ceiling — firing once in thirty-five minutes on prefill-heavy traffic
+// against twenty-seven times on symmetric traffic. The cause is that TTFT carries
+// queue wait, so under backlog the residence it implies is several times the real
+// service time and the clamp holds capacity at the ceiling for the whole run.
+var _ = Describe("Service residence under a deep queue", func() {
+	const (
+		k1             = int64(320_000)
+		queueThreshold = 5.0
+		interval       = 15 * time.Second
+	)
+	start := time.Date(2026, 8, 1, 9, 0, 0, 0, time.UTC)
+	shape := variantShape{avgInput: 1000, avgOutput: 250}
+
+	// Uncontended: nothing queued, so TTFT is prefill and nothing else.
+	quiet := func() domain.ReplicaMetrics {
+		return domain.ReplicaMetrics{
+			PodName:               "pod-a",
+			AcceleratorName:       "H100",
+			QueueLength:           0,
+			QueueLengthInstant:    0,
+			HasQueueLengthInstant: true,
+			RequestRate:           8.0,
+			ArrivalRate:           8.0,
+			TokensInUse:           60_000,
+			KvUsageInstant:        0.15,
+			TotalKvCapacityTokens: 400_000,
+			AvgInputTokens:        1000,
+			AvgOutputTokens:       250,
+			AvgTTFT:               0.10, // prefill only
+			AvgITL:                0.02, // service residence = 0.1 + 5 = 5.1 s
+		}
+	}
+
+	It("uses prefill learned while idle instead of a queue-inflated TTFT", func() {
+		a := NewSaturationAnalyzer(NewCapacityKnowledgeStore(), withRateAnchoredK2(true))
+		at := start
+
+		// Calibrate: a few quiet cycles teach the bucket what prefill costs, then a
+		// backlogged stretch teaches it the service rate and the ceiling.
+		for i := 0; i < 6; i++ {
+			a.serviceRates.BeginCycle(at)
+			_, _, _, _ = a.rateAnchoredK2(quiet(), "m", "", 1, shape, k1, queueThreshold, at)
+			at = at.Add(interval)
+		}
+		hot := quiet()
+		hot.QueueLength, hot.QueueLengthInstant = 140, 140
+		hot.AvgTTFT = 8.0 // queue wait dominates: TTFT is now 80x prefill
+		hot.TokensInUse = 300_000
+		hot.KvUsageInstant = 0.75
+		for i := 0; i < 4; i++ {
+			a.serviceRates.BeginCycle(at)
+			_, _, _, _ = a.rateAnchoredK2(hot, "m", "", 1, shape, k1, queueThreshold, at)
+			at = at.Add(interval)
+		}
+
+		a.serviceRates.BeginCycle(at)
+		k2, _, src, ok := a.rateAnchoredK2(hot, "m", "", 1, shape, k1, queueThreshold, at)
+		Expect(ok).To(BeTrue())
+
+		// mu x W_service x tokensPerRequest = 8 x 5.1 x 1250 = 51k, well under the
+		// ceiling, so the scaling engages and capacity reflects what the replica can
+		// actually serve. Read from TTFT the residence would be 13 s, the product
+		// 130k, and the clamp would have returned the ceiling instead.
+		Expect(src).To(Equal(k2SrcRateResidence))
+		Expect(k2).To(BeNumerically("~", 51_000, 5_000))
+		Expect(k2).To(BeNumerically("<", 130_000), "not the queue-inflated figure")
+	})
+
+	It("falls back to the plain residence until an idle cycle has been seen", func() {
+		a := NewSaturationAnalyzer(NewCapacityKnowledgeStore(), withRateAnchoredK2(true))
+		hot := quiet()
+		hot.QueueLength, hot.QueueLengthInstant = 140, 140
+		hot.AvgTTFT = 8.0
+
+		at := start
+		for i := 0; i < 4; i++ {
+			a.serviceRates.BeginCycle(at)
+			_, _, _, _ = a.rateAnchoredK2(hot, "m", "", 1, shape, k1, queueThreshold, at)
+			at = at.Add(interval)
+		}
+		_, ok := a.serviceRates.Prefill(serviceRateKey("m", "H100", "", 1, shape), at)
+		Expect(ok).To(BeFalse(), "a backlogged TTFT must never be recorded as prefill")
+
+		// And the estimator still answers, from the contaminated residence, exactly as
+		// it did before — no worse, and still bounded by the clamp.
+		_, _, _, answered := a.rateAnchoredK2(hot, "m", "", 1, shape, k1, queueThreshold, at)
+		Expect(answered).To(BeTrue())
+	})
+})
+
+var _ = Describe("Learned prefill retention", func() {
+	now := time.Date(2026, 8, 1, 9, 0, 0, 0, time.UTC)
+
+	It("outlives the service-rate window", func() {
+		s := newBucketStore()
+		s.ObservePrefill("k", 0.1, now)
+		s.BeginCycle(now)
+
+		// A sustained overload has no unqueued cycles to refresh this, and expiring it
+		// would drop the estimator back to the queue-contaminated residence exactly
+		// when the queue is deep.
+		_, ok := s.Prefill("k", now.Add(ServiceRateWindow+time.Minute))
+		Expect(ok).To(BeTrue())
+
+		_, ok = s.Prefill("k", now.Add(HistoryEvictionTimeout+time.Minute))
+		Expect(ok).To(BeFalse(), "but not past the bucket's own lifetime")
+	})
+})

@@ -32,6 +32,7 @@ func RegisterRateCapacityQueries(sourceRegistry *source.SourceRegistry) {
 	registerIfAbsent(registry, queueLengthInstantQuery())
 	registerIfAbsent(registry, requestRateQuery())
 	registerIfAbsent(registry, promptTokenRateQuery())
+	registerIfAbsent(registry, inferenceTimeQuery())
 	registerForEngineIfAbsent(registry, inferenceengine.EngineSGLang, sglangKvUsageInstantQuery())
 	registerForEngineIfAbsent(registry, inferenceengine.EngineSGLang, sglangQueueLengthInstantQuery())
 	registerForEngineIfAbsent(registry, inferenceengine.EngineSGLang, sglangRequestRateQuery())
@@ -141,6 +142,27 @@ func sglangPromptTokenRateQuery() source.QueryTemplate {
 		Template:    `sum by (instance, pod, llm_d_ai_variant) (rate(sglang:prompt_tokens_histogram_count{namespace="{{.namespace}}",model_name="{{.modelID}}"}[1m]))`,
 		Params:      []string{source.ParamNamespace, source.ParamModelID},
 		Description: "Prompts processed per pod (req/s); service rate of a prefill replica (SGLang)",
+	}
+}
+
+// inferenceTimeQuery is the average seconds a request spends in the RUNNING phase —
+// being served, with time queued excluded.
+//
+// This is the residence Little's law needs, measured rather than derived. It is
+// deliberately NOT in EngineSpecificQueries and has no SGLang form, because SGLang
+// publishes nothing equivalent: its seventeen metrics expose end-to-end latency, time
+// to first token and time per output token, all of which either include queue wait or
+// cover only part of the request. Left engine-agnostic, the bare query simply returns
+// nothing on an SGLang fleet and serviceResidence derives the figure instead.
+func inferenceTimeQuery() source.QueryTemplate {
+	return source.QueryTemplate{
+		Name: QueryInferenceTime,
+		Type: source.QueryTypePromQL,
+		Template: `max by (instance, pod, llm_d_ai_variant) (` +
+			`rate(vllm:request_inference_time_seconds_sum{namespace="{{.namespace}}",model_name="{{.modelID}}"}[1m]) / ` +
+			`rate(vllm:request_inference_time_seconds_count{namespace="{{.namespace}}",model_name="{{.modelID}}"}[1m]))`,
+		Params:      []string{source.ParamNamespace, source.ParamModelID},
+		Description: "Seconds per request in the RUNNING phase, queue wait excluded (vLLM only)",
 	}
 }
 

@@ -422,6 +422,7 @@ func (c *ReplicaMetricsCollector) collectReplicaMetrics(
 		kvUsageInstant      float64
 		queueLengthInstant  float64
 		promptTokenRate     float64
+		inferenceTime       float64
 		hasQueueInstant     bool
 		requestRate         float64
 	}
@@ -840,6 +841,21 @@ func (c *ReplicaMetricsCollector) collectReplicaMetrics(
 		}
 	}
 
+	// Process time-in-RUNNING per request (s) — residence with queue wait excluded
+	if result := results[registration.QueryInferenceTime]; result != nil {
+		if !result.HasError() {
+			for _, value := range result.Values {
+				instanceKey, _, _ := c.buildInstanceKey(ctx, namespace, value.Labels)
+				if instanceKey == "" || podData[instanceKey] == nil {
+					continue
+				}
+				if !math.IsNaN(value.Value) && !math.IsInf(value.Value, 0) && value.Value > 0 {
+					podData[instanceKey].inferenceTime = value.Value
+				}
+			}
+		}
+	}
+
 	// Process prompt-processing rate (req/s) — service rate of a prefill replica
 	if result := results[registration.QueryPromptTokenRate]; result != nil {
 		if !result.HasError() {
@@ -1037,6 +1053,7 @@ func (c *ReplicaMetricsCollector) collectReplicaMetrics(
 			KvUsageInstant:        data.kvUsageInstant,
 			QueueLengthInstant:    data.queueLengthInstant,
 			PromptTokenRate:       data.promptTokenRate,
+			AvgInferenceTime:      data.inferenceTime,
 			HasQueueLengthInstant: data.hasQueueInstant,
 			RequestRate:           data.requestRate,
 			Metadata: &domain.ReplicaMetricsMetadata{
