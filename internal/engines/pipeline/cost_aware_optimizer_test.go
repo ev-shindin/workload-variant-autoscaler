@@ -1126,7 +1126,7 @@ var _ = Describe("Service-rate floor on scale-down", func() {
 	}
 
 	shed := func(variants []domain.VariantCapacity, targets map[string]int, want int) map[string]int {
-		scaleDownVariantSet(context.Background(), variants, targets, nil,
+		scaleDownVariantSet(context.Background(), variants, targets, nil, honorRateFloor,
 			func(vc domain.VariantCapacity) int { return want },
 			func(vc domain.VariantCapacity, n int) {})
 		return targets
@@ -1179,6 +1179,18 @@ var _ = Describe("Service-rate floor on scale-down", func() {
 			map[string]int{"known": 2, "unknown": 2}, 1)
 		Expect(targets["known"]).To(Equal(1))
 		Expect(targets["unknown"]).To(Equal(1))
+	})
+
+	It("yields to GPU rebalancing, which is what prioritisation means", func() {
+		// Same state the first case holds at two replicas — but this caller is
+		// reclaiming GPUs for a model that needs them more, and the floor is a safety
+		// net for a decision nobody asked for, not a veto over one that was.
+		targets := map[string]int{"v1": 2}
+		scaleDownVariantSet(context.Background(),
+			[]domain.VariantCapacity{variant("v1", 19.5, 24/0.6)}, targets, nil, overrideRateFloor,
+			func(vc domain.VariantCapacity) int { return 1 },
+			func(vc domain.VariantCapacity, n int) {})
+		Expect(targets["v1"]).To(Equal(1))
 	})
 
 	It("does nothing when the estimator is off", func() {

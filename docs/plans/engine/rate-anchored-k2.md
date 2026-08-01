@@ -363,6 +363,12 @@ side is understated while its arrivals still count, which would hold replicas th
 not needed. Partial knowledge is therefore treated as no knowledge and the constraint is
 skipped.
 
+GPU rebalancing overrides the floor. A reclaim happens because another model needs the
+GPUs more, and a variant refusing to give one up because its own traffic wants it is
+precisely the argument prioritisation exists to settle. The floor is a safety net for a
+scale-down nobody asked for, not a veto over one that was — so `reclaimRole` passes
+`overrideRateFloor` and the routine optimizer passes `honorRateFloor`.
+
 For P/D, both roles see the same request stream and each gets its own constraint. A
 prefill replica completes few or no generations, so its service rate comes from prompts
 processed (`vllm:request_prompt_tokens_count`, `sglang:prompt_tokens_histogram_count`)

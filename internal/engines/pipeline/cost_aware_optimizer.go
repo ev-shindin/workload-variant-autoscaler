@@ -104,6 +104,21 @@ func costGreedyRolePick(
 	return "", 0
 }
 
+// rateFloorPolicy says whether a scale-down must respect the service-rate floor.
+//
+// The routine optimizer honours it: shedding into a state arrivals cannot sustain is
+// the failure it exists to prevent. GPU rebalancing overrides it, because the whole
+// point of reclaiming a replica is that some other model needs the GPU more — a
+// variant refusing to give one up because its own traffic wants it is the argument
+// prioritisation exists to settle. The floor is a safety net for a decision nobody
+// asked for, not a veto over one that was.
+type rateFloorPolicy bool
+
+const (
+	honorRateFloor    rateFloorPolicy = true
+	overrideRateFloor rateFloorPolicy = false
+)
+
 // scaleDownVariantSet sheds replicas from sortedVariants (PRE-SORTED cost-desc,
 // cheapest last). minReplicas floor and cheapest-at-1 protection are enforced
 // here. maxRemovable returns how many replicas of vc the caller permits to remove;
@@ -113,11 +128,16 @@ func scaleDownVariantSet(
 	sortedVariants []domain.VariantCapacity,
 	targets map[string]int,
 	states map[string]domain.VariantReplicaState,
+	floorPolicy rateFloorPolicy,
 	maxRemovable func(vc domain.VariantCapacity) int,
 	onRemove func(vc domain.VariantCapacity, n int),
 ) {
 	logger := ctrl.LoggerFrom(ctx)
-	available, required, rateKnown := roleServiceRate(sortedVariants, targets)
+	var available, required float64
+	var rateKnown bool
+	if floorPolicy == honorRateFloor {
+		available, required, rateKnown = roleServiceRate(sortedVariants, targets)
+	}
 	for i, vc := range sortedVariants {
 		if vc.PerReplicaCapacity <= 0 {
 			continue
@@ -484,7 +504,7 @@ func scaleDownRoleIterated(
 			continue
 		}
 		sorted := sortVariantsForScaleDown(s, roleVCs)
-		scaleDownVariantSet(ctx, sorted, targets, states,
+		scaleDownVariantSet(ctx, sorted, targets, states, honorRateFloor,
 			func(vc domain.VariantCapacity) int {
 				return safeRemovalReplicasForRole(s, vc.VariantName, role)
 			},
