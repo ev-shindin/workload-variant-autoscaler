@@ -163,8 +163,7 @@ func (a *SaturationAnalyzer) Analyze(ctx context.Context, input domain.AnalyzerI
 	}
 
 	// Phase 2: Per-variant aggregation
-	variantCapacities := a.aggregateByVariant(replicaCapacities, input.ReplicaMetrics, input.VariantStates, input.ModelID, input.Namespace, satConfig.KvCacheThreshold,
-		satConfig.ScaleDownBoundary)
+	variantCapacities := a.aggregateByVariant(replicaCapacities, input.ReplicaMetrics, input.VariantStates, input.ModelID, input.Namespace, satConfig.KvCacheThreshold)
 
 	// Phase 3: Model-level aggregation via shared helpers (enforces linearity invariant).
 	totalSupply := aggregation.SumTotalSupply(variantCapacities)
@@ -443,7 +442,6 @@ func (a *SaturationAnalyzer) aggregateByVariant(
 	variantStates []domain.VariantReplicaState,
 	modelID, namespace string,
 	kvCacheThreshold float64,
-	scaleDownBoundary float64,
 ) []domain.VariantCapacity {
 	// Group replicas by variant
 	byVariant := make(map[string][]ReplicaCapacity)
@@ -556,11 +554,8 @@ func (a *SaturationAnalyzer) aggregateByVariant(
 				arrivals += completionRate(rm, vs.Role)
 			}
 		}
-		var requiredServiceRate float64
-		if serviceRatePerReplica > 0 && arrivals > 0 && scaleDownBoundary > 0 {
-			requiredServiceRate = arrivals / scaleDownBoundary
-		} else {
-			serviceRatePerReplica = 0
+		if serviceRatePerReplica <= 0 || arrivals <= 0 {
+			serviceRatePerReplica, arrivals = 0, 0
 		}
 
 		totalCapacity := float64(replicaCount) * perReplicaCapacity
@@ -572,7 +567,7 @@ func (a *SaturationAnalyzer) aggregateByVariant(
 
 		result = append(result, domain.VariantCapacity{
 			ServiceRatePerReplica: serviceRatePerReplica,
-			RequiredServiceRate:   requiredServiceRate,
+			ArrivalRate:           arrivals,
 
 			VariantName:        vs.VariantName,
 			AcceleratorName:    accelerator,

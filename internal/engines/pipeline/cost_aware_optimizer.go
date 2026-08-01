@@ -129,6 +129,7 @@ func scaleDownVariantSet(
 	targets map[string]int,
 	states map[string]domain.VariantReplicaState,
 	floorPolicy rateFloorPolicy,
+	boundary float64,
 	maxRemovable func(vc domain.VariantCapacity) int,
 	onRemove func(vc domain.VariantCapacity, n int),
 ) {
@@ -136,7 +137,7 @@ func scaleDownVariantSet(
 	var available, required float64
 	var rateKnown bool
 	if floorPolicy == honorRateFloor {
-		available, required, rateKnown = roleServiceRate(sortedVariants, targets)
+		available, required, rateKnown = roleServiceRate(sortedVariants, targets, boundary)
 	}
 	for i, vc := range sortedVariants {
 		if vc.PerReplicaCapacity <= 0 {
@@ -200,7 +201,12 @@ func scaleDownVariantSet(
 // contributes nothing to the available side while its traffic still counts on the
 // required side, which would understate the role and hold replicas that are not
 // needed. Partial knowledge is treated as no knowledge.
-func roleServiceRate(variants []domain.VariantCapacity, targets map[string]int) (available, required float64, known bool) {
+func roleServiceRate(variants []domain.VariantCapacity, targets map[string]int,
+	boundary float64) (available, required float64, known bool) {
+	if boundary <= 0 {
+		return 0, 0, false
+	}
+	var arrivals float64
 	for _, vc := range variants {
 		n := targets[vc.VariantName]
 		if n <= 0 {
@@ -210,9 +216,22 @@ func roleServiceRate(variants []domain.VariantCapacity, targets map[string]int) 
 			return 0, 0, false
 		}
 		available += float64(n) * vc.ServiceRatePerReplica
-		required += vc.RequiredServiceRate
+		arrivals += vc.ArrivalRate
 	}
-	return available, required, required > 0
+	return available, arrivals / boundary, arrivals > 0
+}
+
+// scaleDownBoundaryOf returns the resolved scale-down boundary the engine used. It is
+// taken from the analyzer results rather than from configuration because a per-analyzer
+// override makes the global value the wrong one, and the resolved figure is what
+// produced the spare-capacity numbers this loop is acting on.
+func scaleDownBoundaryOf(s []NamedAnalyzerResult) float64 {
+	for _, nr := range s {
+		if nr.ScaleDownBoundary > 0 {
+			return nr.ScaleDownBoundary
+		}
+	}
+	return 0
 }
 
 // sortVariantsForScaleDown orders a role's variants for cost-greedy scale-down:
@@ -504,7 +523,7 @@ func scaleDownRoleIterated(
 			continue
 		}
 		sorted := sortVariantsForScaleDown(s, roleVCs)
-		scaleDownVariantSet(ctx, sorted, targets, states, honorRateFloor,
+		scaleDownVariantSet(ctx, sorted, targets, states, honorRateFloor, scaleDownBoundaryOf(s),
 			func(vc domain.VariantCapacity) int {
 				return safeRemovalReplicasForRole(s, vc.VariantName, role)
 			},

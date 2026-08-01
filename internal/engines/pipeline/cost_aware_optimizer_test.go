@@ -1115,18 +1115,18 @@ var _ = Describe("namespace constraint merge helpers", func() {
 // tokens is measured at the current replica count and does not survive the removal
 // being evaluated.
 var _ = Describe("Service-rate floor on scale-down", func() {
-	variant := func(name string, mu, required float64) domain.VariantCapacity {
+	variant := func(name string, mu, lambda float64) domain.VariantCapacity {
 		return domain.VariantCapacity{
 			VariantName:           name,
 			Role:                  domain.RoleBoth,
 			PerReplicaCapacity:    320_000,
 			ServiceRatePerReplica: mu,
-			RequiredServiceRate:   required,
+			ArrivalRate:           lambda,
 		}
 	}
 
 	shed := func(variants []domain.VariantCapacity, targets map[string]int, want int) map[string]int {
-		scaleDownVariantSet(context.Background(), variants, targets, nil, honorRateFloor,
+		scaleDownVariantSet(context.Background(), variants, targets, nil, honorRateFloor, 0.6,
 			func(vc domain.VariantCapacity) int { return want },
 			func(vc domain.VariantCapacity, n int) {})
 		return targets
@@ -1136,7 +1136,7 @@ var _ = Describe("Service-rate floor on scale-down", func() {
 		// lambda = 24 req/s, boundary 0.60, mu = 19.5 => the role needs 40 req/s of
 		// service rate, which two replicas (39) barely miss and one (19.5) misses by
 		// half. The token model asked for one; this must hold at two.
-		targets := shed([]domain.VariantCapacity{variant("v1", 19.5, 24/0.6)},
+		targets := shed([]domain.VariantCapacity{variant("v1", 19.5, 24)},
 			map[string]int{"v1": 2}, 1)
 		Expect(targets["v1"]).To(Equal(2))
 	})
@@ -1146,7 +1146,7 @@ var _ = Describe("Service-rate floor on scale-down", func() {
 		// and a replica is worth 19.5 — so exactly one can go. Two would leave 39,
 		// under the requirement, and the floor stops at one even though the caller
 		// asked for two.
-		targets := shed([]domain.VariantCapacity{variant("v1", 19.5, 24/0.6)},
+		targets := shed([]domain.VariantCapacity{variant("v1", 19.5, 24)},
 			map[string]int{"v1": 4}, 2)
 		Expect(targets["v1"]).To(Equal(3))
 	})
@@ -1155,9 +1155,9 @@ var _ = Describe("Service-rate floor on scale-down", func() {
 		// Two variants on different hardware serving one stream. Shedding from the
 		// expensive one is fine while the cheap one still covers the requirement —
 		// the cost ordering decides which, the floor only decides how many.
-		fast := variant("fast", 30, 30/0.6)
+		fast := variant("fast", 30, 30)
 		fast.Cost = 100
-		slow := variant("slow", 10, 10/0.6)
+		slow := variant("slow", 10, 10)
 		slow.Cost = 10
 		targets := shed([]domain.VariantCapacity{fast, slow},
 			map[string]int{"fast": 2, "slow": 2}, 2)
@@ -1173,7 +1173,7 @@ var _ = Describe("Service-rate floor on scale-down", func() {
 	It("does nothing when any variant holding replicas has no measured rate", func() {
 		// Partial knowledge understates what the role can serve, which would hold
 		// replicas that are not needed. Treated as no knowledge.
-		known := variant("known", 19.5, 24/0.6)
+		known := variant("known", 19.5, 24)
 		unknown := variant("unknown", 0, 0)
 		targets := shed([]domain.VariantCapacity{known, unknown},
 			map[string]int{"known": 2, "unknown": 2}, 1)
@@ -1187,7 +1187,7 @@ var _ = Describe("Service-rate floor on scale-down", func() {
 		// net for a decision nobody asked for, not a veto over one that was.
 		targets := map[string]int{"v1": 2}
 		scaleDownVariantSet(context.Background(),
-			[]domain.VariantCapacity{variant("v1", 19.5, 24/0.6)}, targets, nil, overrideRateFloor,
+			[]domain.VariantCapacity{variant("v1", 19.5, 24)}, targets, nil, overrideRateFloor, 0.6,
 			func(vc domain.VariantCapacity) int { return 1 },
 			func(vc domain.VariantCapacity, n int) {})
 		Expect(targets["v1"]).To(Equal(1))
