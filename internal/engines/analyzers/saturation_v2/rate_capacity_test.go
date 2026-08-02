@@ -1068,3 +1068,42 @@ var _ = Describe("Learned prefill retention", func() {
 		Expect(ok).To(BeFalse(), "but not past the bucket's own lifetime")
 	})
 })
+
+// The scale-down floor rests on arrivals being invariant to the replica count. The
+// measurement is not: ArrivalRate is a one-minute rate per pod, summed across pods, so
+// removing a pod drops its share from the sum at once while the survivors take a
+// minute to report their larger share. Left alone, each shed weakens the floor enough
+// to permit the next one — the cascade to a single replica, produced by the guard that
+// exists to prevent it.
+var _ = Describe("Arrival peak window", func() {
+	now := time.Date(2026, 8, 2, 9, 0, 0, 0, time.UTC)
+
+	It("holds the sum through the dip a scale-down produces", func() {
+		p := newPeakWindow()
+		Expect(p.Observe("v1", 24, now)).To(BeNumerically("~", 24, 0.01))
+
+		// A replica goes. Four of five pods still report their old per-pod share, so
+		// the sum reads a fifth low even though arrivals have not changed at all.
+		Expect(p.Observe("v1", 19.2, now.Add(15*time.Second))).To(BeNumerically("~", 24, 0.01))
+		Expect(p.Observe("v1", 19.2, now.Add(30*time.Second))).To(BeNumerically("~", 24, 0.01))
+
+		// And once the survivors catch up, the true figure is back on its own.
+		Expect(p.Observe("v1", 24, now.Add(75*time.Second))).To(BeNumerically("~", 24, 0.01))
+	})
+
+	It("lets a genuine drop through once the window has passed", func() {
+		p := newPeakWindow()
+		_ = p.Observe("v1", 24, now)
+		Expect(p.Observe("v1", 6, now.Add(ArrivalPeakWindow+time.Second))).
+			To(BeNumerically("~", 6, 0.01), "real load changes must not be held forever")
+	})
+
+	It("keeps its map bounded", func() {
+		p := newPeakWindow()
+		for i := 0; i < 200; i++ {
+			p.Observe(fmt.Sprintf("stale-%d", i), 10, now)
+		}
+		p.Observe("fresh", 10, now.Add(2*ArrivalPeakWindow))
+		Expect(len(p.entries)).To(BeNumerically("<=", BucketPruneThreshold+1))
+	})
+})

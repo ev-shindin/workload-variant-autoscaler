@@ -77,6 +77,16 @@ const (
 	// by construction: only unqueued cycles qualify.
 	PrefillSmoothingWindow = 10 * time.Minute
 
+	// ArrivalPeakWindow is how long a variant's summed arrival rate is held at its
+	// maximum. Arrivals do not change when replicas do — that invariance is the whole
+	// basis of the scale-down floor — but the *measurement* of them does: ArrivalRate
+	// is a one-minute rate per pod, summed across pods. Remove a pod and its share
+	// leaves the sum at once, while the survivors take a minute to report their larger
+	// share. The sum therefore dips by roughly 1/N after every shed, which weakens the
+	// floor, which permits the next shed. Two minutes outlasts both the rate window
+	// and the interval between drains.
+	ArrivalPeakWindow = 2 * time.Minute
+
 	// WorkWindow is the window the bucket's operating point is held over, and it
 	// mirrors the demand side exactly: TokensInUse and QueueLength are collected as
 	// max_over_time(...[1m]), so the operating point is the MAXIMUM of what replicas
@@ -514,6 +524,43 @@ func relaxCeiling(ceiling float64, age time.Duration) float64 {
 		return ceiling
 	}
 	return ceiling * math.Pow(CeilingRelaxPerWindow, age.Seconds()/ServiceRateWindow.Seconds())
+}
+
+// peakWindow holds a keyed value at its maximum over a window.
+type peakWindow struct {
+	mu      sync.Mutex
+	entries map[string][]workSample
+}
+
+func newPeakWindow() *peakWindow {
+	return &peakWindow{entries: make(map[string][]workSample)}
+}
+
+// Observe records a sample and returns the maximum still inside the window.
+func (p *peakWindow) Observe(key string, value float64, now time.Time) float64 {
+	if !(value > 0) || math.IsInf(value, 0) {
+		return value
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	kept := make([]workSample, 0, len(p.entries[key])+1)
+	kept = append(kept, p.entries[key]...)
+	kept = append(kept, workSample{at: now, value: value})
+	kept = slices.DeleteFunc(kept, func(w workSample) bool {
+		return now.Sub(w.at) > ArrivalPeakWindow
+	})
+	if len(p.entries) >= BucketPruneThreshold {
+		for k, samples := range p.entries {
+			if len(samples) == 0 || now.Sub(samples[len(samples)-1].at) > ArrivalPeakWindow {
+				delete(p.entries, k)
+			}
+		}
+	}
+	p.entries[key] = kept
+	return slices.MaxFunc(kept, func(a, b workSample) int {
+		return cmp.Compare(a.value, b.value)
+	}).value
 }
 
 // arrivalSmoother holds a per-replica exponentially-weighted arrival rate.

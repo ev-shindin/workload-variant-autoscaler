@@ -36,6 +36,10 @@ type SaturationAnalyzer struct {
 	// comparable with the completion-derived service rate. Allocated with
 	// serviceRates.
 	arrivals *arrivalSmoother
+	// arrivalPeaks holds each variant's summed arrival rate at its maximum over a
+	// short window, so the floor cannot be weakened by the measurement artefact a
+	// scale-down itself produces. Allocated with serviceRates.
+	arrivalPeaks *peakWindow
 	// clock is time.Now in production. The rate-anchored estimator weights its
 	// averages by the real gap between cycles, so tests that drive several cycles in
 	// a row need to advance time to exercise it at all.
@@ -54,6 +58,7 @@ func withRateAnchoredK2(enabled bool) Option { //nolint:unparam // tests pass tr
 		if enabled {
 			a.serviceRates = newBucketStore()
 			a.arrivals = newArrivalSmoother()
+			a.arrivalPeaks = newPeakWindow()
 		}
 	}
 }
@@ -85,6 +90,7 @@ func NewSaturationAnalyzer(store *CapacityKnowledgeStore, opts ...Option) *Satur
 	if EnableRateAnchoredK2 {
 		a.serviceRates = newBucketStore()
 		a.arrivals = newArrivalSmoother()
+		a.arrivalPeaks = newPeakWindow()
 	}
 	for _, opt := range opts {
 		opt(a)
@@ -519,8 +525,17 @@ func (a *SaturationAnalyzer) aggregateByVariant(
 				accelerator = replicas[0].AcceleratorName
 			}
 			capacityLabel = k2SourceLabel(replicas)
-			// Every replica of the bucket reports the same figure; take the first.
+			// The lowest figure across the variant's replicas, and zero if any replica
+			// has none. Taking whichever replica came first would have been
+			// order-dependent — ReplicaMetrics is built by ranging a map — and a
+			// replica reporting nothing means the variant is only partly measured,
+			// which the floor treats as not measured at all.
 			serviceRatePerReplica = replicas[0].ServiceRate
+			for _, rc := range replicas[1:] {
+				if rc.ServiceRate < serviceRatePerReplica {
+					serviceRatePerReplica = rc.ServiceRate
+				}
+			}
 		} else if rec := a.capacityStore.Get(namespace, modelID, vs.VariantName); rec != nil && rec.EffectiveCapacity > 0 {
 			// No ready replicas — use stored capacity, enhanced with k2 derivation
 			// for deployment-derived records when workload data is available.
@@ -553,6 +568,11 @@ func (a *SaturationAnalyzer) aggregateByVariant(
 				// for the role that needs it most.
 				arrivals += completionRate(rm, vs.Role)
 			}
+		}
+		// Held at its recent maximum: see ArrivalPeakWindow for why the sum dips
+		// precisely when a scale-down is in progress.
+		if a.arrivalPeaks != nil && arrivals > 0 {
+			arrivals = a.arrivalPeaks.Observe(namespace+"|"+modelID+"|"+vs.VariantName, arrivals, a.now())
 		}
 		if serviceRatePerReplica <= 0 || arrivals <= 0 {
 			serviceRatePerReplica, arrivals = 0, 0
