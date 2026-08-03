@@ -343,3 +343,54 @@ var _ = Describe("Commit 3 — disaggregated (P/D) optimizer goldens", func() {
 		expectDecisionSet(gs, want)
 	})
 })
+
+// Commit 4 — quota-constrained optimizer golden: scenario C1.
+//
+// CostAwareOptimizer ignores ResourceConstraints entirely (unlimited mode —
+// see its doc comment), so quota/GPU-limiting behavior only exists on
+// GreedyByScoreOptimizer. C1 is a GreedyByScoreOptimizer-only golden.
+var _ = Describe("Commit 4 — quota-constrained optimizer golden", func() {
+	var ctx context.Context
+
+	BeforeEach(func() { ctx = context.Background() })
+
+	It("C1: namespace quota caps a model's allocation below cluster-unconstrained demand", func() {
+		build := func() ModelScalingRequest {
+			r := &domain.AnalyzerResult{
+				ModelID:          "c1",
+				Namespace:        "team-a",
+				RequiredCapacity: 50000,
+				VariantCapacities: []domain.VariantCapacity{
+					{VariantName: "v", AcceleratorName: "A100", Cost: 5.0, ReplicaCount: 1, PerReplicaCapacity: 10000, Utilization: 0.9},
+				},
+			}
+			return withSatEntry(r, ModelScalingRequest{
+				ModelID:   "c1",
+				Namespace: "team-a",
+				Priority:  1,
+				VariantStates: []domain.VariantReplicaState{
+					{VariantName: "v", CurrentReplicas: 1, GPUsPerReplica: 2},
+				},
+			})
+		}
+		quotaConstraints := []*ResourceConstraints{
+			{
+				Pools:          map[string]ResourcePool{"A100": {Limit: 100}},
+				NamespacePools: map[string]map[string]ResourcePool{"team-a": {"A100": {Limit: 4, Used: 2}}},
+			},
+		}
+
+		// captured from main@9906dac5: team-a has 2 free GPUs (cap 4 - used 2) =
+		// room for exactly one more 2-GPU replica, well below cluster-unconstrained
+		// demand of ceil(50000/10000)=5 additional replicas.
+		want := map[string]goldenDecision{
+			"v": {Replicas: 2, RequiredCapacity: 50000, SpareCapacity: 0, Utilization: 0.9},
+		}
+		constrained := NewGreedyByScoreOptimizer().Optimize(ctx, []ModelScalingRequest{build()}, quotaConstraints)
+		unconstrained := NewGreedyByScoreOptimizer().Optimize(ctx, []ModelScalingRequest{build()}, unlimitedConstraints("A100"))
+
+		Expect(constrained[0].TargetReplicas).To(BeNumerically("<", unconstrained[0].TargetReplicas),
+			"non-vacuity: the namespace budget must actually bind below unconstrained demand")
+		expectDecisionSet(constrained, want)
+	})
+})
