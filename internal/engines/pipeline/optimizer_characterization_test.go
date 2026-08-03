@@ -239,3 +239,107 @@ var _ = Describe("Commit 2 — aggregated (RoleBoth) optimizer goldens", func() 
 		expectDecisionSet(gs, want)
 	})
 })
+
+// Commit 3 — disaggregated (P/D) optimizer goldens: scenarios B1-B2.
+var _ = Describe("Commit 3 — disaggregated (P/D) optimizer goldens", func() {
+	var ctx context.Context
+
+	BeforeEach(func() { ctx = context.Background() })
+
+	It("B1: paired scale-up — equal prefill/decode demand", func() {
+		build := func() ModelScalingRequest {
+			r := &domain.AnalyzerResult{
+				ModelID:          "b1",
+				Namespace:        "default",
+				RequiredCapacity: 20000,
+				VariantCapacities: []domain.VariantCapacity{
+					{VariantName: "prefill-v", Role: "prefill", AcceleratorName: "A100", Cost: 5.0, ReplicaCount: 1, PerReplicaCapacity: 10000, Utilization: 0.65},
+					{VariantName: "decode-v", Role: "decode", AcceleratorName: "A100", Cost: 5.0, ReplicaCount: 1, PerReplicaCapacity: 10000, Utilization: 0.45},
+				},
+				RoleCapacities: map[string]domain.RoleCapacity{
+					"prefill": {Role: "prefill", RequiredCapacity: 20000, TotalDemand: 20000},
+					"decode":  {Role: "decode", RequiredCapacity: 20000, TotalDemand: 20000},
+				},
+			}
+			return withSatEntry(r, ModelScalingRequest{
+				ModelID:       "b1",
+				Namespace:     "default",
+				Priority:      1,
+				Disaggregated: true,
+				VariantStates: []domain.VariantReplicaState{
+					{VariantName: "prefill-v", Role: "prefill", CurrentReplicas: 1, GPUsPerReplica: 2},
+					{VariantName: "decode-v", Role: "decode", CurrentReplicas: 1, GPUsPerReplica: 2},
+				},
+			})
+		}
+		// captured from main@9906dac5: alpha=20000/20000=1; n_P=ceil(20000/10000)=2;
+		// n_D=ceil(1x20000/10000)=2 -> both roles committed jointly (1+2 each).
+		wantCA := map[string]goldenDecision{
+			"prefill-v": {Replicas: 3, RequiredCapacity: 20000, SpareCapacity: 0, Utilization: 0.65},
+			"decode-v":  {Replicas: 3, RequiredCapacity: 20000, SpareCapacity: 0, Utilization: 0.45},
+		}
+		ca := NewCostAwareOptimizer().Optimize(ctx, []ModelScalingRequest{build()}, nil)
+		Expect(ca[0].TargetReplicas).To(BeNumerically(">", 1), "non-vacuity: scale-up must actually run")
+		expectDecisionSet(ca, wantCA)
+
+		// GreedyByScore distributes proportionally to per-role demand rather than
+		// jointly committing a paired (n_P, n_D) — a different algorithm, so it is
+		// pinned as its own golden rather than asserted equal to CostAware's.
+		wantGS := map[string]goldenDecision{
+			"prefill-v": {Replicas: 3, RequiredCapacity: 20000, SpareCapacity: 0, Utilization: 0.65},
+			"decode-v":  {Replicas: 3, RequiredCapacity: 20000, SpareCapacity: 0, Utilization: 0.45},
+		}
+		gs := NewGreedyByScoreOptimizer().Optimize(ctx, []ModelScalingRequest{build()}, unlimitedConstraints("A100"))
+		expectDecisionSet(gs, wantGS)
+	})
+
+	It("B2: role-scoped scale-down — expensive prefill fully removed, cheap prefill protected", func() {
+		build := func() ModelScalingRequest {
+			r := &domain.AnalyzerResult{
+				ModelID:       "b2",
+				Namespace:     "default",
+				SpareCapacity: 20000, // model-level; unused in the disaggregated path
+				VariantCapacities: []domain.VariantCapacity{
+					{VariantName: "cheap-p", Role: "prefill", AcceleratorName: "A100", Cost: 5.0, ReplicaCount: 2, PerReplicaCapacity: 10000, Utilization: 0.2},
+					{VariantName: "expensive-p", Role: "prefill", AcceleratorName: "H100", Cost: 15.0, ReplicaCount: 2, PerReplicaCapacity: 10000, Utilization: 0.1},
+					{VariantName: "decode-v", Role: "decode", AcceleratorName: "A100", Cost: 5.0, ReplicaCount: 3, PerReplicaCapacity: 10000, Utilization: 0.3},
+				},
+				RoleCapacities: map[string]domain.RoleCapacity{
+					"prefill": {Role: "prefill", SpareCapacity: 20000, TotalDemand: 10000},
+					"decode":  {Role: "decode", SpareCapacity: 10000, TotalDemand: 10000},
+				},
+			}
+			return withSatEntry(r, ModelScalingRequest{
+				ModelID:       "b2",
+				Namespace:     "default",
+				Priority:      1,
+				Disaggregated: true,
+				VariantStates: []domain.VariantReplicaState{
+					{VariantName: "cheap-p", Role: "prefill", CurrentReplicas: 2, GPUsPerReplica: 1},
+					{VariantName: "expensive-p", Role: "prefill", CurrentReplicas: 2, GPUsPerReplica: 1},
+					{VariantName: "decode-v", Role: "decode", CurrentReplicas: 3, GPUsPerReplica: 1},
+				},
+			})
+		}
+		// captured from main@9906dac5: prefill sheds cost-desc — expensive-p first,
+		// floor(20000/10000)=2 removes it fully; cheap-p is protected as the last
+		// prefill variant with replicas. decode sheds floor(10000/10000)=1.
+		want := map[string]goldenDecision{
+			"cheap-p":     {Replicas: 2, RequiredCapacity: 0, SpareCapacity: 20000, Utilization: 0.2},
+			"expensive-p": {Replicas: 0, RequiredCapacity: 0, SpareCapacity: 20000, Utilization: 0.1},
+			"decode-v":    {Replicas: 2, RequiredCapacity: 0, SpareCapacity: 10000, Utilization: 0.3},
+		}
+		ca := NewCostAwareOptimizer().Optimize(ctx, []ModelScalingRequest{build()}, nil)
+		gs := NewGreedyByScoreOptimizer().Optimize(ctx, []ModelScalingRequest{build()}, nil)
+
+		caTargets := make(map[string]int, len(ca))
+		for _, d := range ca {
+			caTargets[d.VariantName] = d.TargetReplicas
+		}
+		Expect(caTargets["expensive-p"]).To(BeNumerically("<", 2), "non-vacuity: prefill scale-down must actually run")
+		Expect(caTargets["decode-v"]).To(BeNumerically("<", 3), "non-vacuity: decode scale-down must actually run")
+
+		expectDecisionSet(ca, want)
+		expectDecisionSet(gs, want)
+	})
+})
