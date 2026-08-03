@@ -140,7 +140,11 @@ var _ = Describe("Commit 2 — aggregated (RoleBoth) optimizer goldens", func() 
 		}
 		ca := NewCostAwareOptimizer().Optimize(ctx, []ModelScalingRequest{build()}, nil)
 		gs := NewGreedyByScoreOptimizer().Optimize(ctx, []ModelScalingRequest{build()}, unlimitedConstraints("A100"))
-		Expect(ca[0].TargetReplicas).To(BeNumerically(">", 2), "non-vacuity: scale-up must actually run")
+		caTargets := make(map[string]int, len(ca))
+		for _, d := range ca {
+			caTargets[d.VariantName] = d.TargetReplicas
+		}
+		Expect(caTargets["v"]).To(BeNumerically(">", 2), "non-vacuity: scale-up must actually run")
 		expectDecisionSet(ca, want)
 		expectDecisionSet(gs, want)
 	})
@@ -171,7 +175,11 @@ var _ = Describe("Commit 2 — aggregated (RoleBoth) optimizer goldens", func() 
 		}
 		ca := NewCostAwareOptimizer().Optimize(ctx, []ModelScalingRequest{build()}, nil)
 		gs := NewGreedyByScoreOptimizer().Optimize(ctx, []ModelScalingRequest{build()}, nil)
-		Expect(ca[0].TargetReplicas).To(BeNumerically("<", 3), "non-vacuity: scale-down must actually run")
+		caTargets := make(map[string]int, len(ca))
+		for _, d := range ca {
+			caTargets[d.VariantName] = d.TargetReplicas
+		}
+		Expect(caTargets["v"]).To(BeNumerically("<", 3), "non-vacuity: scale-down must actually run")
 		expectDecisionSet(ca, want)
 		expectDecisionSet(gs, want)
 	})
@@ -279,7 +287,12 @@ var _ = Describe("Commit 3 — disaggregated (P/D) optimizer goldens", func() {
 			"decode-v":  {Replicas: 3, RequiredCapacity: 20000, SpareCapacity: 0, Utilization: 0.45},
 		}
 		ca := NewCostAwareOptimizer().Optimize(ctx, []ModelScalingRequest{build()}, nil)
-		Expect(ca[0].TargetReplicas).To(BeNumerically(">", 1), "non-vacuity: scale-up must actually run")
+		caTargets := make(map[string]int, len(ca))
+		for _, d := range ca {
+			caTargets[d.VariantName] = d.TargetReplicas
+		}
+		Expect(caTargets["prefill-v"]).To(BeNumerically(">", 1), "non-vacuity: prefill scale-up must actually run")
+		Expect(caTargets["decode-v"]).To(BeNumerically(">", 1), "non-vacuity: decode scale-up must actually run")
 		expectDecisionSet(ca, wantCA)
 
 		// GreedyByScore distributes proportionally to per-role demand rather than
