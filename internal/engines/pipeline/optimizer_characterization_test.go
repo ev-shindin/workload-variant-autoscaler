@@ -108,3 +108,134 @@ var _ = Describe("Anchor refactor characterization goldens (sat-v2-only)", func(
 		})
 	})
 })
+
+// Commit 2 — aggregated (RoleBoth) optimizer goldens: scenarios A1-A4.
+var _ = Describe("Commit 2 — aggregated (RoleBoth) optimizer goldens", func() {
+	var ctx context.Context
+
+	BeforeEach(func() { ctx = context.Background() })
+
+	It("A1: single-variant scale-up — demand exceeds capacity", func() {
+		build := func() ModelScalingRequest {
+			r := &domain.AnalyzerResult{
+				ModelID:          "a1",
+				Namespace:        "default",
+				RequiredCapacity: 15000,
+				VariantCapacities: []domain.VariantCapacity{
+					{VariantName: "v", AcceleratorName: "A100", Cost: 5.0, ReplicaCount: 2, PerReplicaCapacity: 10000, Utilization: 0.71},
+				},
+			}
+			return withSatEntry(r, ModelScalingRequest{
+				ModelID:   "a1",
+				Namespace: "default",
+				Priority:  1,
+				VariantStates: []domain.VariantReplicaState{
+					{VariantName: "v", CurrentReplicas: 2, GPUsPerReplica: 1},
+				},
+			})
+		}
+		// captured from main@9906dac5: ceil(15000/10000)=2 additional -> 2+2=4.
+		want := map[string]goldenDecision{
+			"v": {Replicas: 4, RequiredCapacity: 15000, SpareCapacity: 0, Utilization: 0.71},
+		}
+		ca := NewCostAwareOptimizer().Optimize(ctx, []ModelScalingRequest{build()}, nil)
+		gs := NewGreedyByScoreOptimizer().Optimize(ctx, []ModelScalingRequest{build()}, unlimitedConstraints("A100"))
+		Expect(ca[0].TargetReplicas).To(BeNumerically(">", 2), "non-vacuity: scale-up must actually run")
+		expectDecisionSet(ca, want)
+		expectDecisionSet(gs, want)
+	})
+
+	It("A2: single-variant scale-down — cheapest/only variant protected at 1", func() {
+		build := func() ModelScalingRequest {
+			r := &domain.AnalyzerResult{
+				ModelID:       "a2",
+				Namespace:     "default",
+				SpareCapacity: 30000,
+				VariantCapacities: []domain.VariantCapacity{
+					{VariantName: "v", AcceleratorName: "A100", Cost: 5.0, ReplicaCount: 3, PerReplicaCapacity: 10000, Utilization: 0.05},
+				},
+			}
+			return withSatEntry(r, ModelScalingRequest{
+				ModelID:   "a2",
+				Namespace: "default",
+				Priority:  1,
+				VariantStates: []domain.VariantReplicaState{
+					{VariantName: "v", CurrentReplicas: 3, GPUsPerReplica: 1},
+				},
+			})
+		}
+		// captured from main@9906dac5: floor(30000/10000)=3 would remove all
+		// replicas, but the sole (always-cheapest) variant is protected at 1.
+		want := map[string]goldenDecision{
+			"v": {Replicas: 1, RequiredCapacity: 0, SpareCapacity: 30000, Utilization: 0.05},
+		}
+		ca := NewCostAwareOptimizer().Optimize(ctx, []ModelScalingRequest{build()}, nil)
+		gs := NewGreedyByScoreOptimizer().Optimize(ctx, []ModelScalingRequest{build()}, nil)
+		Expect(ca[0].TargetReplicas).To(BeNumerically("<", 3), "non-vacuity: scale-down must actually run")
+		expectDecisionSet(ca, want)
+		expectDecisionSet(gs, want)
+	})
+
+	It("A3: no-op / at-target — no demand and no spare, nothing changes", func() {
+		build := func() ModelScalingRequest {
+			r := &domain.AnalyzerResult{
+				ModelID:   "a3",
+				Namespace: "default",
+				VariantCapacities: []domain.VariantCapacity{
+					{VariantName: "v1", AcceleratorName: "A100", Cost: 5.0, ReplicaCount: 2, PerReplicaCapacity: 10000, Utilization: 0.4},
+					{VariantName: "v2", AcceleratorName: "H100", Cost: 15.0, ReplicaCount: 1, PerReplicaCapacity: 20000, Utilization: 0.55},
+				},
+			}
+			return withSatEntry(r, ModelScalingRequest{
+				ModelID:   "a3",
+				Namespace: "default",
+				Priority:  1,
+				VariantStates: []domain.VariantReplicaState{
+					{VariantName: "v1", CurrentReplicas: 2, GPUsPerReplica: 1},
+					{VariantName: "v2", CurrentReplicas: 1, GPUsPerReplica: 1},
+				},
+			})
+		}
+		// This golden is *supposed* to be vacuous (every target == current) — that
+		// is the property being frozen: no spurious churn absent demand or spare.
+		want := map[string]goldenDecision{
+			"v1": {Replicas: 2, RequiredCapacity: 0, SpareCapacity: 0, Utilization: 0.4},
+			"v2": {Replicas: 1, RequiredCapacity: 0, SpareCapacity: 0, Utilization: 0.55},
+		}
+		expectDecisionSet(NewCostAwareOptimizer().Optimize(ctx, []ModelScalingRequest{build()}, nil), want)
+		expectDecisionSet(NewGreedyByScoreOptimizer().Optimize(ctx, []ModelScalingRequest{build()}, unlimitedConstraints("A100", "H100")), want)
+	})
+
+	It("A4: multi-variant cost tie-break — cheapest absorbs demand", func() {
+		build := func() ModelScalingRequest {
+			r := &domain.AnalyzerResult{
+				ModelID:          "a4",
+				Namespace:        "default",
+				RequiredCapacity: 5000,
+				VariantCapacities: []domain.VariantCapacity{
+					{VariantName: "cheap", AcceleratorName: "A100", Cost: 5.0, ReplicaCount: 2, PerReplicaCapacity: 10000, Utilization: 0.6},
+					{VariantName: "expensive", AcceleratorName: "H100", Cost: 15.0, ReplicaCount: 1, PerReplicaCapacity: 20000, Utilization: 0.3},
+				},
+			}
+			return withSatEntry(r, ModelScalingRequest{
+				ModelID:   "a4",
+				Namespace: "default",
+				Priority:  1,
+				VariantStates: []domain.VariantReplicaState{
+					{VariantName: "cheap", CurrentReplicas: 2, GPUsPerReplica: 1},
+					{VariantName: "expensive", CurrentReplicas: 1, GPUsPerReplica: 1},
+				},
+			})
+		}
+		// captured from main@9906dac5: cost-efficiency cheap=5/10000=0.0005 <
+		// expensive=15/20000=0.00075 -> cheap absorbs all demand: ceil(5000/10000)=1.
+		want := map[string]goldenDecision{
+			"cheap":     {Replicas: 3, RequiredCapacity: 5000, SpareCapacity: 0, Utilization: 0.6},
+			"expensive": {Replicas: 1, RequiredCapacity: 5000, SpareCapacity: 0, Utilization: 0.3},
+		}
+		ca := NewCostAwareOptimizer().Optimize(ctx, []ModelScalingRequest{build()}, nil)
+		gs := NewGreedyByScoreOptimizer().Optimize(ctx, []ModelScalingRequest{build()}, unlimitedConstraints("A100", "H100"))
+		expectDecisionSet(ca, want)
+		expectDecisionSet(gs, want)
+	})
+})
