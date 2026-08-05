@@ -320,6 +320,75 @@ var _ = Describe("analyzer helpers", func() {
 			Expect(ok).To(BeTrue(), "rescale must resolve a single accelerator type from the merged anchor")
 			Expect(accType).To(Equal("A100"))
 		})
+
+		// Test 4 — degenerate ballots produce no anchor (the per-model hold).
+		// bindingAnchor returns nil whenever nothing can bind; each optimizer's
+		// nil-anchor guard then holds the model (no decision this cycle) rather
+		// than indexing into an empty or unbindable ballot. These pin the three
+		// nil paths that back the "empty / no-live-analyzer ballot is graceful"
+		// behaviour: no index panic on an empty ballot, and a deliberate hold
+		// when no single analyzer can bind.
+		It("returns nil for an empty ballot", func() {
+			Expect(bindingAnchor(nil)).To(BeNil())
+			Expect(bindingAnchor([]NamedAnalyzerResult{})).To(BeNil())
+		})
+
+		It("returns nil when no enabled+live+informative analyzer is present", func() {
+			// Saturation and throughput are both present, enabled, and informative,
+			// but neither is live this cycle → no binder → hold the model.
+			sat := NamedAnalyzerResult{
+				Name:    domain.SaturationAnalyzerName,
+				Enabled: true,
+				Live:    false,
+				Result: &domain.AnalyzerResult{
+					AnalyzerName: domain.SaturationAnalyzerName,
+					VariantCapacities: []domain.VariantCapacity{
+						{VariantName: "v1", ReplicaCount: 1, PerReplicaCapacity: 100.0, Reason: "P1-obs"},
+					},
+				},
+			}
+			ta := NamedAnalyzerResult{
+				Name:    "throughput",
+				Enabled: true,
+				Live:    false,
+				Result: &domain.AnalyzerResult{
+					AnalyzerName: "throughput",
+					VariantCapacities: []domain.VariantCapacity{
+						{VariantName: "v1", PerReplicaCapacity: 200.0, Reason: "T1-ols"},
+					},
+				},
+			}
+			Expect(bindingAnchor([]NamedAnalyzerResult{sat, ta})).To(BeNil())
+		})
+
+		It("returns nil for an ambiguous multi-binder (two non-saturation live analyzers)", func() {
+			// No saturation entry; two distinct non-saturation analyzers are each
+			// enabled+live+informative. This PR does not define which one binds, so
+			// bindingAnchor refuses to guess and holds the model.
+			ta := NamedAnalyzerResult{
+				Name:    "throughput",
+				Enabled: true,
+				Live:    true,
+				Result: &domain.AnalyzerResult{
+					AnalyzerName: "throughput",
+					VariantCapacities: []domain.VariantCapacity{
+						{VariantName: "v1", PerReplicaCapacity: 200.0, Reason: "T1-ols"},
+					},
+				},
+			}
+			lat := NamedAnalyzerResult{
+				Name:    "latency",
+				Enabled: true,
+				Live:    true,
+				Result: &domain.AnalyzerResult{
+					AnalyzerName: "latency",
+					VariantCapacities: []domain.VariantCapacity{
+						{VariantName: "v1", PerReplicaCapacity: 150.0, Reason: "L1-obs"},
+					},
+				},
+			}
+			Expect(bindingAnchor([]NamedAnalyzerResult{ta, lat})).To(BeNil())
+		})
 	})
 
 	Describe("ResultIsInformative", func() {

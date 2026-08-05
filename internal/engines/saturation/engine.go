@@ -551,7 +551,10 @@ func (e *Engine) optimize(ctx context.Context) (retErr error) {
 	mode := modeLabelForAnalyzer(analyzerName)
 	switch analyzerName {
 	case domain.QueueingModelAnalyzerName:
-		allDecisions = e.optimizeQueueingModel(ctx, modelGroups, currentAllocations)
+		// Refuse the queueing-model path loudly and leave allDecisions empty; the
+		// unconditional applySaturationDecisions below then holds each model at its
+		// last-good replicas and still emits the scaling metric this cycle.
+		e.refuseQueueingModel(ctx, modelGroups)
 	case domain.SaturationAnalyzerName:
 		allDecisions = e.optimizeV2(ctx, modelGroups, currentAllocations)
 	default:
