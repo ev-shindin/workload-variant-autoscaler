@@ -83,6 +83,10 @@ func (e *Engine) optimizeQueueingModel(
 				Score:     1.0, // QM path: single analyzer, no per-entry score config
 				Remaining: result.RequiredCapacity,
 				Spare:     result.SpareCapacity,
+				// Enabled is statically true: the queueing-model path runs a single
+				// analyzer, so it is always the voting member and the anchor's
+				// binding/(a) carrier for this model.
+				Enabled: true,
 				// Live is statically true: the queueing-model path is not yet a
 				// per-analyzer-liveness participant (it doesn't run through
 				// updateLivenessAndSetLive), so it must not be caught by the

@@ -508,21 +508,26 @@ func applyUniversalThreshold(r *domain.AnalyzerResult, scaleUp, scaleDown float6
 func computeCurrentGPUUsage(requests []pipeline.ModelScalingRequest) map[string]int {
 	usage := make(map[string]int)
 	for _, req := range requests {
-		var satEntry *domain.AnalyzerResult
+		// The saturation result is the per-variant identity carrier (VariantName,
+		// AcceleratorName, topology) and is present in every ballot even when
+		// saturation does not vote. Current physical GPU usage is a topology lookup
+		// (CurrentReplicas × GPUs-per-replica), not a voting or ordering decision, so
+		// it reads that carrier directly by name.
+		var satCarrier *domain.AnalyzerResult
 		for _, e := range req.AnalyzerResults {
 			if e.Name == domain.SaturationAnalyzerName {
-				satEntry = e.Result
+				satCarrier = e.Result
 				break
 			}
 		}
-		if satEntry == nil {
+		if satCarrier == nil {
 			continue
 		}
 		stateMap := make(map[string]domain.VariantReplicaState, len(req.VariantStates))
 		for _, s := range req.VariantStates {
 			stateMap[s.VariantName] = s
 		}
-		for _, vc := range satEntry.VariantCapacities {
+		for _, vc := range satCarrier.VariantCapacities {
 			state := stateMap[vc.VariantName]
 			gpusPerReplica := state.GPUsPerReplica
 			if gpusPerReplica <= 0 {
@@ -547,21 +552,23 @@ func computeCurrentGPUUsageByNamespace(requests []pipeline.ModelScalingRequest) 
 			perType = make(map[string]int)
 			usage[req.Namespace] = perType
 		}
-		var satEntry *domain.AnalyzerResult
+		// Topology lookup of the always-present saturation identity carrier (see
+		// computeCurrentGPUUsage); not a voting or ordering decision.
+		var satCarrier *domain.AnalyzerResult
 		for _, e := range req.AnalyzerResults {
 			if e.Name == domain.SaturationAnalyzerName {
-				satEntry = e.Result
+				satCarrier = e.Result
 				break
 			}
 		}
-		if satEntry == nil {
+		if satCarrier == nil {
 			continue
 		}
 		stateMap := make(map[string]domain.VariantReplicaState, len(req.VariantStates))
 		for _, s := range req.VariantStates {
 			stateMap[s.VariantName] = s
 		}
-		for _, vc := range satEntry.VariantCapacities {
+		for _, vc := range satCarrier.VariantCapacities {
 			state := stateMap[vc.VariantName]
 			gpusPerReplica := state.GPUsPerReplica
 			if gpusPerReplica <= 0 {
