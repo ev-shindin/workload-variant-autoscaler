@@ -90,9 +90,13 @@ const analyzerLivenessStaleCycles = 3
 //
 // The engine applies applyUniversalThreshold to every analyzer (saturation and
 // all registered non-saturation analyzers) and collects the calibrated results
-// into a per-analyzer slice returned to the optimizer. Saturation is always the
-// first entry; it is the keeper of per-variant metadata (Cost, AcceleratorName,
-// Role) until a future pre-analysis-extraction PR separates that concern.
+// into a per-analyzer slice returned to the optimizer. Each entry is tagged with
+// its enablement (Enabled — whether it votes in the combine RC/SC math this
+// cycle) and liveness (Live). Order is not significant: the anchor is derived on
+// demand from the ballot (bindingAnchor), and combine math consumes only the
+// voting subset (votingResults). Saturation is always appended as the
+// identity/(a) carrier — it supplies per-variant metadata (Cost, AcceleratorName,
+// Role) for every configured variant — but it votes only when enabled.
 func (e *Engine) runAnalyzersAndScore(
 	ctx context.Context,
 	modelID, namespace string,
@@ -135,8 +139,18 @@ func (e *Engine) runAnalyzersAndScore(
 		ArrivalRate:    arrivalRate,
 	}
 
-	// Collect per-analyzer results. Saturation is first; each non-saturation
-	// analyzer is run, calibrated with its resolved thresholds, and appended.
+	// Whether saturation votes in the combine (RC/SC) math this cycle. It always
+	// votes in the default single-analyzer config (no explicit analyzer list) and
+	// otherwise votes only when its name is enabled. When it does not vote it is
+	// still appended below as the identity/(a) carrier — present in the ballot,
+	// but pruned from the voting subset by votingResults.
+	satVotes := len(config.Analyzers) == 0 || effectiveEnabled(domain.SaturationAnalyzerName, config)
+
+	// Collect per-analyzer results. Each entry carries its Enabled tag; order is
+	// not significant. Saturation is appended first purely as a code artifact (it
+	// is the (a) carrier), tagged Enabled: satVotes; each enabled non-saturation
+	// analyzer is run, calibrated with its resolved thresholds, and appended
+	// tagged Enabled: true.
 	namedResults := []pipeline.NamedAnalyzerResult{{
 		Name:              domain.SaturationAnalyzerName,
 		Result:            baseResult,
@@ -145,9 +159,13 @@ func (e *Engine) runAnalyzersAndScore(
 		Spare:             baseResult.SpareCapacity,
 		ScaleUpThreshold:  satUp,
 		ScaleDownBoundary: satDown,
+		Enabled:           satVotes,
 	}}
 	for _, entry := range e.analyzersSnapshot {
 		if entry.name == domain.SaturationAnalyzerName {
+			// Reuse guard, not a decision gate: saturation is already appended
+			// above (as the (a) carrier). Its vote is decided by satVotes there,
+			// not by skipping it here.
 			continue
 		}
 		if !effectiveEnabled(entry.name, config) {
@@ -167,6 +185,7 @@ func (e *Engine) runAnalyzersAndScore(
 			Spare:             result.SpareCapacity,
 			ScaleUpThreshold:  up,
 			ScaleDownBoundary: down,
+			Enabled:           true,
 		})
 	}
 	e.updateLivenessAndSetLive(ctx, namespace, modelID, namedResults)
