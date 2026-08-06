@@ -400,8 +400,10 @@ func resolveThresholds(analyzerName string, cfg config.SaturationScalingConfig) 
 // not yet defaulted). An analyzer registered in code but ABSENT from cfg.Analyzers
 // does NOT participate — this prevents a registered-but-unconfigured analyzer (e.g.
 // throughput) from returning SpareCapacity=0 and silently vetoing scale-down.
-// Saturation is exempt: it is guarded by the SaturationAnalyzerName check upstream
-// (engine_v2.go ~L136) before effectiveEnabled is ever called.
+// Saturation is handled separately: it is always appended as the identity/(a)
+// carrier, and whether it votes is decided by satVotes, which consults this
+// function for the saturation name. The per-analyzer loop skips the saturation
+// name as a reuse guard (so it is not appended twice), not as a decision gate.
 func effectiveEnabled(analyzerName string, cfg config.SaturationScalingConfig) bool {
 	for _, aw := range cfg.Analyzers {
 		if aw.EffectiveType() == analyzerName {
