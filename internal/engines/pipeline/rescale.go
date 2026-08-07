@@ -340,6 +340,15 @@ func (o *GreedyByScoreOptimizer) rescaleModelDecisions(
 	freeThisCycle *int,
 ) []domain.VariantDecision {
 	anchor := bindingAnchor(req.AnalyzerResults)
+	// applyRescale drops anchor-less requests before grouping, so this is
+	// unreachable today. Guard it anyway, as every other bindingAnchor call site
+	// does: the anchor is now derived per call rather than read from a stored
+	// field, and it returns nil for a stale, non-informative, or ambiguously bound
+	// ballot — a much wider set of inputs than the old "entry absent" case. A
+	// dereference here would panic the optimize goroutine.
+	if anchor == nil {
+		return nil
+	}
 	stateMap := buildStateMap(req.VariantStates)
 	vcMap := buildCapacityMap(anchor.VariantCapacities)
 	targets := initTargets(req.VariantStates)

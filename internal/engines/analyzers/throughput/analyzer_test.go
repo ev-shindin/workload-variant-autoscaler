@@ -2178,11 +2178,13 @@ var _ = Describe("ThroughputAnalyzer — scale-from-zero PRC-only complement", f
 		Expect(ok).To(BeTrue())
 		Expect(vc.PerReplicaCapacity).To(BeNumerically("~", persisted, 1e-9))
 		Expect(vc.Reason).To(Equal(itlReasonScaleFromZero))
-		// PRC only: identity fields (Cost/AcceleratorName/Role/ReplicaCount) are the
-		// anchor merge's job to source from the saturation analyzer, not TA's.
+		// PRC only: identity fields (Cost/AcceleratorName/ReplicaCount) are the anchor
+		// merge's job to source from the saturation analyzer, not TA's. Role is the
+		// exception — it is consumed by the role aggregation inside this same Analyze
+		// call, before any merge, so TA must carry it.
 		Expect(vc.Cost).To(Equal(0.0))
 		Expect(vc.AcceleratorName).To(Equal(""))
-		Expect(vc.Role).To(Equal(""))
+		Expect(vc.Role).To(Equal(domain.RoleBoth))
 		Expect(vc.ReplicaCount).To(Equal(0))
 	})
 
@@ -2206,5 +2208,101 @@ var _ = Describe("ThroughputAnalyzer — scale-from-zero PRC-only complement", f
 		result := analyzeAtZero("v1")
 		_, ok := capFor(result, "v1")
 		Expect(ok).To(BeFalse())
+	})
+
+	// A scale-from-zero entry on a disaggregated model must carry its real role.
+	// distributeDemandByRole and aggregateRoleCapacities both canonicalize an empty
+	// role to domain.RoleBoth, and they run on this same slice inside Analyze —
+	// before any anchor merge could fill the role in. A blank-role entry therefore
+	// manufactures a "both" bucket alongside prefill/decode, which (a) splits the
+	// model-level decode demand across one more role than exists, and (b) leaves the
+	// paired allocator with a role no anchor variant can satisfy.
+	Context("on a disaggregated (P/D) model", func() {
+		// makePreviouslyLiveWithRole is makePreviouslyLive for a variant whose role is
+		// not "both", so the persisted state carries that role into the zero cycle.
+		makePreviouslyLiveWithRole := func(variant, role string) {
+			injectWindowObs(analyzer, ctx, modelID, namespace, variant, il, ol, prefix, kvMax, B, kValues)
+			_, err := analyzer.Analyze(ctx, domain.AnalyzerInput{
+				ModelID:        modelID,
+				Namespace:      namespace,
+				ReplicaMetrics: []domain.ReplicaMetrics{liveReplica(variant, 5)},
+				ArrivalRate:    5,
+				VariantStates:  []domain.VariantReplicaState{{VariantName: variant, CurrentReplicas: 1, Role: role}},
+			})
+			Expect(err).NotTo(HaveOccurred())
+			st, ok := analyzer.VariantState(modelID, namespace, variant)
+			Expect(ok).To(BeTrue())
+			Expect(st.PerReplicaSupply).To(BeNumerically(">", 0))
+		}
+
+		It("emits the persisted role, so a zero-replica decode variant does not manufacture a phantom 'both' bucket", func() {
+			makePreviouslyLiveWithRole("v-decode", domain.RoleDecode)
+			makePreviouslyLiveWithRole("v-prefill", domain.RolePrefill)
+
+			// v-prefill stays live; v-decode drops to zero replicas this cycle.
+			result, err := analyzer.Analyze(ctx, domain.AnalyzerInput{
+				ModelID:        modelID,
+				Namespace:      namespace,
+				ReplicaMetrics: []domain.ReplicaMetrics{liveReplica("v-prefill", 5)},
+				ArrivalRate:    5,
+				VariantStates: []domain.VariantReplicaState{
+					{VariantName: "v-decode", CurrentReplicas: 0, Role: domain.RoleDecode},
+					{VariantName: "v-prefill", CurrentReplicas: 1, Role: domain.RolePrefill},
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			vc, ok := capFor(result, "v-decode")
+			Expect(ok).To(BeTrue())
+			Expect(vc.Reason).To(Equal(itlReasonScaleFromZero))
+			Expect(vc.Role).To(Equal(domain.RoleDecode))
+
+			// The role breakdown stays exactly {prefill, decode} — no "both" key.
+			Expect(result.RoleCapacities).NotTo(BeNil())
+			Expect(result.RoleCapacities).To(HaveKey(domain.RoleDecode))
+			Expect(result.RoleCapacities).NotTo(HaveKey(domain.RoleBoth))
+		})
+
+		It("does not dilute per-role decode demand when a decode variant is at zero replicas", func() {
+			makePreviouslyLiveWithRole("v-decode-a", domain.RoleDecode)
+			makePreviouslyLiveWithRole("v-decode-b", domain.RoleDecode)
+			makePreviouslyLiveWithRole("v-prefill", domain.RolePrefill)
+
+			analyzeWith := func(states []domain.VariantReplicaState, live []domain.ReplicaMetrics) *domain.AnalyzerResult {
+				result, err := analyzer.Analyze(ctx, domain.AnalyzerInput{
+					ModelID:        modelID,
+					Namespace:      namespace,
+					ReplicaMetrics: live,
+					ArrivalRate:    5,
+					VariantStates:  states,
+				})
+				Expect(err).NotTo(HaveOccurred())
+				return result
+			}
+
+			// Baseline: only the live decode variant is configured at all.
+			baseline := analyzeWith(
+				[]domain.VariantReplicaState{
+					{VariantName: "v-decode-a", CurrentReplicas: 1, Role: domain.RoleDecode},
+					{VariantName: "v-prefill", CurrentReplicas: 1, Role: domain.RolePrefill},
+				},
+				[]domain.ReplicaMetrics{liveReplica("v-decode-a", 5), liveReplica("v-prefill", 5)},
+			)
+
+			// Same traffic, but a second decode variant sits at zero replicas. It joins
+			// the decode role rather than adding a role, so decode's share is unchanged.
+			withZero := analyzeWith(
+				[]domain.VariantReplicaState{
+					{VariantName: "v-decode-a", CurrentReplicas: 1, Role: domain.RoleDecode},
+					{VariantName: "v-decode-b", CurrentReplicas: 0, Role: domain.RoleDecode},
+					{VariantName: "v-prefill", CurrentReplicas: 1, Role: domain.RolePrefill},
+				},
+				[]domain.ReplicaMetrics{liveReplica("v-decode-a", 5), liveReplica("v-prefill", 5)},
+			)
+
+			Expect(baseline.RoleCapacities[domain.RoleDecode].TotalDemand).To(BeNumerically(">", 0))
+			Expect(withZero.RoleCapacities[domain.RoleDecode].TotalDemand).To(
+				BeNumerically("~", baseline.RoleCapacities[domain.RoleDecode].TotalDemand, 1e-9))
+		})
 	})
 })

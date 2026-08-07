@@ -146,6 +146,20 @@ func (e *Engine) runAnalyzersAndScore(
 	// but pruned from the voting subset by votingResults.
 	satVotes := len(config.Analyzers) == 0 || effectiveEnabled(domain.SaturationAnalyzerName, config)
 
+	// An explicit analyzer list that omits saturation is a supported configuration,
+	// but it is also a real change in safety posture and easy to arrive at without
+	// meaning to. Saturation stops contributing to the combine, so it can no longer
+	// veto a scale-down: a demand-driven analyzer reading zero demand (EPP not
+	// scraped for a window, say) will shed replicas with nothing holding it back,
+	// even while saturation itself sees KV cache near capacity. Say so plainly
+	// rather than leaving it to the docs.
+	if !satVotes {
+		logger.Info("saturation analyzer is absent from the configured analyzer list: it will not vote and cannot veto scale-down for this model",
+			"modelID", modelID,
+			"namespace", namespace,
+		)
+	}
+
 	// Collect per-analyzer results. Each entry carries its Enabled tag; order is
 	// not significant. Saturation is appended first purely as a code artifact (it
 	// is the (a) carrier), tagged Enabled: satVotes; each enabled non-saturation

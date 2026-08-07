@@ -27,6 +27,14 @@ import (
 // model's last-good replica count and still emits the HPA/KEDA scaling metric
 // this cycle — affected models are held in place rather than dropped. To
 // re-enable the path later, restore the dispatch to optimizeQueueingModel.
+//
+// The hold is reported as well as logged: a Warning event is raised on every
+// held variant here, and the caller's refused flag drives
+// TypeOptimizationReady=False/OptimizationRefused on each one (vestigial today
+// — nothing reads that condition back, see applySaturationDecisions). Without
+// the event, a cluster that has stopped autoscaling entirely is
+// indistinguishable from a healthy idle one, with a repeating controller log
+// line as the only evidence.
 func (e *Engine) refuseQueueingModel(
 	ctx context.Context,
 	modelGroups map[string][]llmdVariantAutoscalingV1alpha1.VariantAutoscaling,
@@ -37,6 +45,7 @@ func (e *Engine) refuseQueueingModel(
 		"refusing to dispatch the queueing-model path; enable the saturation and/or throughput analyzers instead",
 		"modelGroups", len(modelGroups),
 	)
+	e.recordOptimizationRefusedEvent(modelGroups)
 }
 
 // optimizeQueueingModel and the two helpers below (runQueueingModelAnalysis,

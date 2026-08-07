@@ -390,13 +390,20 @@ func (a *ThroughputAnalyzer) Analyze(
 	// live before, emit a PRC-only capacity carrying its persisted last-good
 	// per-replica supply. That keeps a previously-live variant proactively selectable
 	// for scale-from-zero without fabricating a baseline for one TA has never sized.
-	// Cost, AcceleratorName, Role, and ReplicaCount are deliberately left unset: they
-	// are identity fields the anchor merge sources from the saturation entry for the
-	// same variant, not values TA is entitled to emit. A never-seen variant (no
-	// persisted supply) gets nothing, so its per-replica capacity stays zero and it is
-	// not proactively selectable; the reactive scale-from-zero engine covers genuine
-	// cold-starts. Persisted supply self-expires on the same idle window as the rest
-	// of the per-variant state, so a long-idle variant degrades to the never-seen case.
+	// Cost, AcceleratorName, and ReplicaCount are deliberately left unset: they are
+	// identity fields the anchor merge sources from the saturation entry for the same
+	// variant, not values TA is entitled to emit. Role is the exception and must be
+	// carried: this slice is consumed by distributeDemandByRole and
+	// aggregateRoleCapacities below, before any anchor merge runs, and both
+	// canonicalize an empty role to domain.RoleBoth. On a disaggregated model a
+	// blank-role entry would therefore manufacture a phantom "both" bucket — which
+	// dilutes each role's demand share and leaves the paired allocator unable to pick
+	// a variant for it — so the persisted role is emitted, exactly as the live loop
+	// above does. A never-seen variant (no persisted supply) gets nothing, so its
+	// per-replica capacity stays zero and it is not proactively selectable; the
+	// reactive scale-from-zero engine covers genuine cold-starts. Persisted supply
+	// self-expires on the same idle window as the rest of the per-variant state, so a
+	// long-idle variant degrades to the never-seen case.
 	for _, vs := range input.VariantStates {
 		if _, alreadyLive := byVariant[vs.VariantName]; alreadyLive {
 			continue
@@ -408,6 +415,7 @@ func (a *ThroughputAnalyzer) Analyze(
 		}
 		variantCapacities = append(variantCapacities, domain.VariantCapacity{
 			VariantName:        vs.VariantName,
+			Role:               st.role,
 			PerReplicaCapacity: st.lastPerReplicaSupply,
 			Reason:             itlReasonScaleFromZero,
 		})

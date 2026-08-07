@@ -186,10 +186,7 @@ func bindingAnchor(s []NamedAnalyzerResult) *domain.AnalyzerResult {
 	// Per-variant merge: iterate the (a) carrier's complete variant list (it emits
 	// every configured variant), take (a) from it and (b) from the binding
 	// analyzer for the same VariantName.
-	bByName := make(map[string]domain.VariantCapacity, len(binding.Result.VariantCapacities))
-	for _, vc := range binding.Result.VariantCapacities {
-		bByName[vc.VariantName] = vc
-	}
+	bByName := buildCapacityMap(binding.Result.VariantCapacities)
 	merged := make([]domain.VariantCapacity, 0, len(aCarrier.Result.VariantCapacities))
 	for _, a := range aCarrier.Result.VariantCapacities {
 		out := domain.VariantCapacity{
